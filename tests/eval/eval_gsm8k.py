@@ -1,7 +1,12 @@
 import argparse
 import json
 import time
+import sys
+import os
 from pathlib import Path
+
+# Add project root to sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 import numpy as np
 import torch
@@ -17,7 +22,7 @@ def download_and_cache_file(url: str) -> str:
     """Download and cache the GSM8K dataset"""
     import urllib.request
 
-    cache_dir = Path.home() / ".cache" / "tiny-llm-cuda"
+    cache_dir = Path.home() / ".cache" / "miniinfer"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     filename = cache_dir / "gsm8k_test.jsonl"
@@ -276,7 +281,7 @@ def main():
         "--prefill-step", type=int, default=256, help="Prefill step size"
     )
     parser.add_argument(
-        "--max-new-tokens", type=int, default=512, help="Maximum new tokens to generate"
+        "--max-new-tokens", type=int, default=1024, help="Maximum new tokens to generate"
     )
 
     # Output arguments

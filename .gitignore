@@ -8,3 +8,5 @@ __pycache__/
 build
 log
 node_modules/
+*.so
+*.egg*

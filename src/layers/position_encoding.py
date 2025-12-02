@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+from .triton_ops import apply_rotary_embedding
 
 class RotaryEmbedding(nn.Module):
     def __init__(
@@ -40,24 +40,25 @@ class RotaryEmbedding(nn.Module):
 
         # [B, S, D/2] or [1, S, D/2]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.traditional:
-            x = x.reshape(B, S, H, self.half_dims, 2)
-            x1 = x[..., 0]
-            x2 = x[..., 1]
-        else:
-            # Qwen2 style
-            x1 = x[..., 0 : self.half_dims]
-            x2 = x[..., self.half_dims : self.dims]
-        # [B, S, D/2] -> [B, S, 1, D/2]
-        cos = cos.reshape(-1, S, 1, self.half_dims)
-        sin = sin.reshape(-1, S, 1, self.half_dims)
-        # [B, S, H, D/2]
-        real = x1 * cos - x2 * sin
-        imag = x1 * sin + x2 * cos
-        if self.traditional:
-            y = torch.stack([real, imag], dim=-1)
-            y = y.reshape(B, S, H, D)
-        else:
-            y = torch.cat((real, imag), dim=-1)
-            y = y.reshape(B, S, H, D)
+        y = apply_rotary_embedding(x, cos, sin, interleaved=self.traditional)
+        # if self.traditional:
+        #     x = x.reshape(B, S, H, self.half_dims, 2)
+        #     x1 = x[..., 0]
+        #     x2 = x[..., 1]
+        # else:
+        #     # Qwen2 style
+        #     x1 = x[..., 0 : self.half_dims]
+        #     x2 = x[..., self.half_dims : self.dims]
+        # # [B, S, D/2] -> [B, S, 1, D/2]
+        # cos = cos.reshape(-1, S, 1, self.half_dims)
+        # sin = sin.reshape(-1, S, 1, self.half_dims)
+        # # [B, S, H, D/2]
+        # real = x1 * cos - x2 * sin
+        # imag = x1 * sin + x2 * cos
+        # if self.traditional:
+        #     y = torch.stack([real, imag], dim=-1)
+        #     y = y.reshape(B, S, H, D)
+        # else:
+        #     y = torch.cat((real, imag), dim=-1)
+        #     y = y.reshape(B, S, H, D)
         return y.type_as(x)

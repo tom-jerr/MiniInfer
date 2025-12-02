@@ -12,7 +12,7 @@ cuda_src = [os.path.join(this_dir, "ops", "vector_add.cu")]
 sources.extend(cuda_src)
 ext_modules = [
     CUDAExtension(
-        "tinyllm_ext._ext",
+        "miniinfer_ext._ext",
         sources=sources,
         include_dirs=[os.path.join(this_dir, "ops")],
     )
@@ -20,10 +20,10 @@ ext_modules = [
 
 
 setup(
-    name="tinyllm_ext",
+    name="miniinfer_ext",
     version="0.1.0",
-    packages=["tinyllm_ext"],
-    package_dir={"tinyllm_ext": "src/extensions/tinyllm_ext"},  # package located place
+    packages=["miniinfer_ext"],
+    package_dir={"miniinfer_ext": "miniinfer_ext"},  # package located place
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

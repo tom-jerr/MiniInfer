@@ -1,0 +1,1070 @@
+=== Example 0 (Prompt 0) ===
+60% of $5 is 0.60 * $5 = $3
+Kylar needs to pay $3 for the first 16 glasses
+For the next 16 - 1 = 15 glasses, he needs to pay 15 * $3 = $45
+Kylar needs to pay $45 for the 16 glasses and $3 for the 15 glasses
+#### 45
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 8
+
+=== Example 1 (Prompt 1) ===
+4 times as many sheep as Seattle means Charleston has 4*20 = 80 sheep.
+Toulouse has twice as many sheep as Charleston, meaning Toulouse has 2*80 = 160 sheep.
+Together, Toulouse, Charleston, and Seattle have 160+80+20 = 260 sheep.
+#### 260
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 193$ and $xy = 84$. We can solve this system of equations by first expressing $x$ and $y$ in terms of a common variable, say $z$,
+
+=== Example 2 (Prompt 2) ===
+200 GB is 200/1024 = 1.5 GB.
+She can download 1.5 GB in 1.5/2 = 0.75 minutes.
+After the restart, she has to download 1.5 GB in 20/20 = 1.5 minutes.
+So, the total load to download the file is 0.75 + 1.5 = 2.25 minutes.
+#### 2.25
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We
+
+=== Example 3 (Prompt 3) ===
+ John drives for 3 hours at a speed of 60 mph, so he covers a distance of 3 * 60 = 180 miles.
+He then realizes he forgot something and turns around, so he has 4 - 2 = 2 hours left to drive.
+In these 2 hours, he drives at a speed of 30 mph, so he covers a distance of 2 * 30 = 60 miles.
+He then spends the next half-hour driving at a speed of 30 mph, so he covers a distance of 0.5 * 30 =
+
+=== Example 4 (Prompt 4) ===
+1. Eliza's regular hourly rate is $10.
+2. Her overtime pay is 1.2 times her regular hourly rate, so her overtime pay is 1.2 * $10 = $12.
+3. Eliza worked for 45 hours this week, so her total earnings for the week are $10 + $12 = $22.
+#### 22
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite
+
+=== Example 5 (Prompt 5) ===
+60 downloads in the first month.
+In the second month, the downloads were three times as many as the first month, so 60*3 = 180 downloads.
+In the third month, the downloads were reduced by 30%, so 180*0.7 = 126 downloads.
+The total number of downloads over the three months is 60+180+126 = 366 downloads.
+#### 366
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 
+
+=== Example 6 (Prompt 6) ===
+3 dozen donuts cost 3*68 = $204
+2 dozen mini cupcakes cost 2*80 = $160
+6 dozen mini cheesecakes cost 6*55 = $330
+The total cost was 204+160+330 = $794
+#### 794
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation
+
+=== Example 7 (Prompt 7) ===
+7 lemons are grown each year, so 7*1.5 = $10.5
+The tree will cost $90 to plant, so it will take 90/10.5 = 8.571 years to earn money on the lemon tree.
+#### 8.571
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 -
+
+=== Example 8 (Prompt 8) ===
+2 more to the red house = 2 + 5 = 7 vacuum cleaners
+1/3 of 5 vacuum cleaners = 5/3 vacuum cleaners
+5 vacuum cleaners = 5/3 * 3 = 5 vacuum cleaners
+5 vacuum cleaners = 5 vacuum cleaners
+5 vacuum cleaners = 5 vacuum cleaners
+Melanie started with 5 vacuum cleaners.
+#### 5
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The 3 children who went on the Ferr
+
+=== Example 9 (Prompt 9) ===
+20% of the 20 students enrolled in contemporary dance, which is 20/100 * 20 = 4 students.
+So, the remaining students are 20 - 4 = 16 students.
+25% of the remaining students enrolled in jazz dance, which is 25/100 * 16 = 4 students.
+So, the rest of the students enrolled in hip-hop dance, which is 16 - 4 = 12 students.
+The percentage of the entire students enrolled in hip-hop dance is (12/20) * 100 = 60%
+#### 60
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the
+
+=== Example 10 (Prompt 10) ===
+2.5% of $5,000 is $500.
+1.2% of $8,000 is $96.
+The total increase in profit from the jewelry plan is $500 + $96 = $606.
+The total increase in profit from the electronic gadgets plan is $96 + $500 = $596.
+The merchant would make a profit of $606 - $596 = $10.
+#### 10
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum
+
+=== Example 11 (Prompt 11) ===
+80 miles + 150 miles = 230 miles
+
+230 miles / 2 = 115 miles
+
+115 miles / 2 = 57.5 miles
+
+So the distance covered by each train in the two days is 57.5 miles.
+#### 57.5
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The cost for the Ferris wheel is 3 * $5 = $15.
+The cost for the merry-go
+
+=== Example 12 (Prompt 12) ===
+35 hours a week as a teacher is 35*50 = 1750 hours
+15 hours a week as a coach is 15*50 = 750 hours
+In total, she works 1750+750 = 2500 hours a year
+Her total pay is 20*2500 = $50000
+#### 50000
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy
+
+=== Example 13 (Prompt 13) ===
+3 eggs are used for breakfast every morning, so in a week, she uses 3*7 = 21 eggs.
+In 4 weeks, she uses 21*4 = 84 eggs.
+Since 1 dozen is equal to 12, she will eat 84/12 = 7 dozens of eggs.
+#### 7
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 193$ and $xy = 84$. We want to find $x + y$.
+
+We can rewrite the equation $x^2 + y^2 = 193$ as $(x + y)^2 - 2xy = 193$. Sub
+
+=== Example 14 (Prompt 14) ===
+1 hour to walk the first 4 miles at a speed of 4 miles per hour gives her a total of 4 miles * 4 miles per hour = 16 miles.
+She then walked another 2 miles at a speed of 4 miles per hour, giving her a total of 2 miles * 4 miles per hour = 8 miles.
+So far, she has walked 16 miles + 8 miles = 24 miles.
+She still needs to walk 12 miles - 24 miles = 9 miles.
+At an average speed of 4 miles per hour, she needs to walk 9 miles / 4 miles per hour = 2.25 hours to complete the remaining 9 miles.
+#### 2.25
+
+Question: If the sum of the
+
+=== Example 15 (Prompt 15) ===
+10 liters of orange drink contain 10*2/3 = 6.667 liters of water.
+15 liters of pineapple drink contain 15*3/5 = 9 liters of water.
+So, the total amount of water in the 10 liters of orange drink is 6.667 liters.
+The total amount of water in the 15 liters of pineapple drink is 9 liters.
+The total amount of water in the 24 liters of drink is 6.667+9-24 = -1.333 liters.
+Since the amount of water cannot be negative, it means that the orange drink is not enough to make up the 24 liters of drink.
+#### 0
+
+Question: A farmer has 52 cows. Each
+
+=== Example 16 (Prompt 16) ===
+6 years before Samantha, Raymond was born 6+6 = 12 years old.
+Raymond's son is now 23 years old, so he was born 23-12 = 11 years ago.
+#### 11
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The 3 children who went on the Ferris wheel cost 3 * $5 = $15.
+The merry-go-round cost 5 * $3 = $15.
+Each child bought 2 ice cream cones, so 5 children
+
+=== Example 17 (Prompt 17) ===
+8 customers bought 1 customer 3 times, so 8*3 = 24 DVDs were sold to the first 3 customers.
+His next 2 customers bought 2 DVDs each, so 2*2 = 4 DVDs were sold to the next 2 customers.
+His last 3 customers didn't buy any DVDs, so 0*3 = 0 DVDs were sold to the last 3 customers.
+So in total, Billy sold 24+4+0 = 28 DVDs on Tuesday.
+#### 28
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^
+
+=== Example 18 (Prompt 18) ===
+1:00 PM to 5:00 PM is a period of 4 hours. The candle burns 2 centimeters every hour, so in 4 hours it will burn 2*4 = 8 centimeters.
+The answer is 8. The candle will be 8 centimeters shorter after burning from 1:00 PM to 5:00 PM.
+#### 8
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The cost for the Ferris wheel is 3 * $5 = $15.
+The cost for the merry-go
+
+=== Example 19 (Prompt 19) ===
+25% of $19.50 is (25/100) * $19.50 = $4.875
+So the original price of the book was $19.50 / $4.875 = $4
+#### 4
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation $x^2 + y^2 = 193$ as $(x + y)^2 - 2xy = 193$
+
+=== Example 20 (Prompt 20) ===
+1 chicken meal costs $12, so 5 packs of milk cost 5 * $3 = $15.
+4 apples cost $1.50 each, so 4 apples cost 4 * $1.50 = $6.
+So far, Marie has spent $12 + $15 + $6 = $33 on chicken meals, milk, and apples.
+If Marie paid a total of $50, then the cost of the boxes of pizza is $50 - $33 = $17.
+Each box of pizza costs $8.50, so Marie ordered $17 / $8.50 = 2 boxes of pizza.
+#### 2
+
+Question: If the sum of the squares of two positive integers is 193 and
+
+=== Example 21 (Prompt 21) ===
+3 pairs of shorts cost 3*16.50 = $<<3*16.50=49.50>>49.50
+3 pairs of pants cost 3*22.50 = $<<3*22.50=67.50>>67.50
+3 pairs of shoes cost 3*42 = $<<3*42=126>>126
+In total, Mishka spent 49.50+67.50+126 = $<<49.50+67.50+126=251.50>>251.50
+#### 251.50
+
+Question
+
+=== Example 22 (Prompt 22) ===
+15 servings of ice cream per day x 60 days = 900 servings of ice cream in total.
+900 servings of ice cream / 15 servings per carton = 60 cartons of ice cream.
+60 cartons of ice cream x $4.00 per carton = $240.00
+#### 240
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x
+
+=== Example 23 (Prompt 23) ===
+ Henry's first stop was 20 miles away from the beginning of his trip.
+His second stop was 15 miles away from the end of his trip.
+To find out how many miles he traveled between his first and second stops, we need to subtract the distance he traveled from the first stop from the distance he traveled from the end of his trip.
+So, the distance he traveled between his first and second stops is $60 - 20 - 15 = 25$ miles.
+#### 25
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193
+
+=== Example 24 (Prompt 24) ===
+ The cost of one pair of heels is $33.
+The other pair of heels costs twice as much as the first pair, so it costs 2 * $33 = $66.
+The total cost of the two pairs of heels is $33 + $66 = $109.
+The cost of the boots is $5 less than the cost of the heels, so it is $109 - $5 = $104.
+Therefore, the boots cost $104.
+#### 104
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x >
+
+=== Example 25 (Prompt 25) ===
+ Let's denote Darrell's age as \(D\) and Allen's age as \(A\). According to the problem, the ratio of Darrell's age to Allen's age is 7:11, which can be written as \(\frac{D}{A} = \frac{7}{11}\).
+
+We also know that the total age of Darrell and Allen now is 162, so we can write the equation:
+
+\[D + A = 162\]
+
+We can substitute the ratio into this equation:
+
+\[\frac{D}{A} = \frac{7}{11}\]
+
+To solve for \(A\), we can cross-multiply:
+
+\[11D = 7A\]
+
+Now, we can substitute the value of \(D\) from the first equation into this equation:
+
+\[11 \cdot 162 = 7A\]
+
+Solving for \(A
+
+=== Example 26 (Prompt 26) ===
+80 + 20 = 100
+100 * 1.25 = 125
+125 + 80 = 205
+205 / 3 = 68.333
+The average guess is 68.333
+#### 68.333
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 193$ and $xy = 84$. We can solve this system of equations by substitution or by
+
+=== Example 27 (Prompt 27) ===
+10 dogs x .5 hours/dog x 7 days = 35 hours a week
+#### 35
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy = 84$, we have $(x+y)^2 - 2(84) = 193$.
+Simplifying, we get $(x+y)^2 = 369$.
+Taking the square root of both sides, we
+
+=== Example 28 (Prompt 28) ===
+ Let's say the number of silver coins is $x$. Then the number of gold coins is $x + 30$.
+The total number of coins is the sum of the number of silver and gold coins, so we have the equation $x + (x + 30) = 110$.
+Combining like terms gives $2x + 30 = 110$.
+Subtracting 30 from both sides gives $2x = 80$.
+Dividing both sides by 2 gives $x = 40$.
+So the number of gold coins is $x + 30 = 40 + 30 = 70$.
+Therefore, Gretchen has 70 gold coins.
+#### 70
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the
+
+=== Example 29 (Prompt 29) ===
+40/2 + 5 = 35
+35 + 2 = 37
+37 * 2 = 74
+74 + 2 = 76
+Siobhan has 76 jewels.
+#### 76
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can solve this system of equations by substitution or elimination.
+Let's use elimination.
+Multiply the second equation by 2 to get $2xy = 168$.
+Then, add this to the first equation to get $x^2 +
+
+=== Example 30 (Prompt 30) ===
+40 minutes * 4 points = 160 points in the first 20 minutes
+20 minutes * 1.25 = 25 points in the second 20 minutes
+160 points + 25 points = 185 points
+#### 185
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation $x^2 + y^2 = 193$ as $(
+
+=== Example 31 (Prompt 31) ===
+2 yogurts cost $5.00 so 1 yogurt costs $5.00/2 = $2.50
+He eats 2 yogurts a day for 30 days so he eats 2*30 = 60 yogurts
+He spends $2.50 on each yogurt so he spends 2.50*60 = $150.00 over 30 days
+#### 150
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first
+
+=== Example 32 (Prompt 32) ===
+13 sets of lego cost 13*15=$<<13*15=195>>195
+He has 5 left after buying the video games, so he had 5+5=$<<5+5=10>>10
+He bought 8 video games for 20*8=$<<20*8=160>>160
+So he had 10-160=$<<10-160=-150>>-150
+He had 195-(-150)=<<195+150=345>>345
+He had 345 lego sets, but he ended up with 5, so he had 345
+
+=== Example 33 (Prompt 33) ===
+3 days a week, John runs 3*3=9 miles
+He runs 3/2*3=9 miles a week
+So he runs 9+9=18 miles a week
+So he runs 18/7=2.5 miles a day
+#### 2.5
+
+Question: A farmer has 52 cows. Each cow gives 5 liters of milk a day. How many liters of milk does the farmer get in a week?
+Answer: The farmer gets 52*5 = 260 liters of milk a day.
+So in a week, the farmer gets 260*7 = 1820 liters of milk.
+#### 1820
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child
+
+=== Example 34 (Prompt 34) ===
+1. Dana can run at a speed of 3 miles per hour, which is four times faster than she can walk. So, her walking speed is 3/4 = 0.75 miles per hour.
+2. Dana can skip at a rate of speed that is half as fast as she can run. So, her running speed is 0.75*2 = 1.5 miles per hour.
+3. If she spends one-third of the time running and two-thirds of the time walking, then she spends 1/3 + 2/3 = 1 hour running and 1/3 hour walking.
+4. If she skips at a rate of 3 miles per hour, then she can travel 3*1 = 3 miles in
+
+=== Example 35 (Prompt 35) ===
+1 year old = 10 years old
+If Suzy's iPhone is 1 year old, then Ben's iPhone is 2 * 10 = 20 years old
+If Brandon's iPhone is four times as old as Ben's iPhone, then Brandon's iPhone is 4 * 20 = 80 years old
+#### 80
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The cost for the Ferris wheel is 3 * $5 = $15.
+The cost for the merry-go-round is 5
+
+=== Example 36 (Prompt 36) ===
+ When Polly held the sapphire gemstone, she could throw the javelin three times farther than when not holding the gemstone. This means that when she holds the gemstone, she can throw the javelin 3 * 400 = 1200 feet.
+When she is not holding the gemstone, she can throw the javelin 400 feet.
+So, when she is holding the gemstone, she can throw the javelin 1200 - 40
+
+=== Example 37 (Prompt 37) ===
+5 pies x 8 pieces per pie = 40 pieces of pie
+40 pieces - 14 pieces = 26 pieces of pie were taken by the guests.
+#### 26
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation $x^2 + y^2 = 
+
+=== Example 38 (Prompt 38) ===
+300g of a 5-servings bag of chips has 300*5 = 1500 calories.
+If you have already consumed 1800 calories, you can eat 1800-1500 = 300 calories less.
+If you want to reach your daily target of 2000 calories, you can eat 2000-300 = 1700 calories.
+If each serving of chips has 250 calories, you can eat 1700/250 = 6.8 servings.
+Since you can't eat a fraction of a serving, you can eat 6 servings.
+#### 6
+
+Question: If the sum of the squares of two positive integers is 193 and their
+
+=== Example 39 (Prompt 39) ===
+ For every pound of beeswax, Charlie can make 10 tapered candles. So for 20 pounds of beeswax, he can make 20*10 = 200 tapered candles.
+If he sells each candle for $2.00, then his total revenue from selling the candles is 200*$2.00 = $400.00.
+If he spends $10.00 on supplies, then his net profit is $400.00 - $10.00 = $390.00.
+#### 390
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84
+
+=== Example 40 (Prompt 40) ===
+5 articles on Monday = 5 hours
+2/5 times more articles on Tuesday than on Monday = 5 + 2/5 * 5 = 5 + 2 = 7 articles on Tuesday
+2/5 times more articles on Tuesday than on Monday = 7 * 2 = 14 articles on Wednesday
+Total articles written in the three days = 5 + 7 + 14 = 26 articles
+Since each article takes an average of 4 hours to research and write, the total hours spent on articles = 26 * 4 = 104 hours
+#### 104
+
+Question: If the sum of
+
+=== Example 41 (Prompt 41) ===
+80 + 23 = 103 post-it notes were in her purse before she went to the store.
+220 - 103 = 117 post-it notes were in the package she purchased.
+#### 117
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We
+
+=== Example 42 (Prompt 42) ===
+ John bought twice as many red ties as blue ties, so he bought 2*40 = 80 red ties.
+The red ties cost 50% more than the blue ties, so each red tie costs 40 + (40 * 0.5) = $40 + $20 = $60.
+He spent $200 on blue ties, so he spent 200 / 40 = $5 on red ties.
+Therefore, he spent 5 * 80 = $400 on red ties.
+#### 400
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We
+
+=== Example 43 (Prompt 43) ===
+1 foot is equal to 12 inches. So, 4 feet is equal to 4*12 = 48 inches.
+If the wire was cut into pieces 6 inches long, then Tracy obtained 48/6 = 8 pieces of wire.
+#### 8
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy = 84$ into the equation, we get $(x+y)^2 - 2(84) =
+
+=== Example 44 (Prompt 44) ===
+15 floors * 8 units/floor = <<15*8=120>>120 units
+3/4 of the building is occupied, so 3/4 * 120 = <<3/4*120=90>>90 units are occupied
+So, the total number of occupied units is 120 - 90 = <<120-90=30>>30 units
+Therefore, the total number of unoccupied units is 120 - 30 = <<120-30=90>>90 units
+#### 90
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child).
+
+=== Example 45 (Prompt 45) ===
+252 eggs per day * $2 per dozen = $52 per day
+$52 per day * 7 days per week = $364 per week
+#### 364
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation $x^2 + y^2 = 193$ as $(x + y)^2 - 2xy = 193$.
+Substituting the value of $xy = 84$, we get $(x + y)^2 -
+
+=== Example 46 (Prompt 46) ===
+1 hour is 60 minutes, so Tom's ship travels 10 miles/hour * 60 minutes/hour = 600 miles in 1 hour.
+He travels 6 miles/hour * 60 minutes/hour = 360 miles in 1 hour.
+So, it takes him 600 miles / 360 miles/hour = 1.667 hours to get back.
+#### 1.667
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$
+
+=== Example 47 (Prompt 47) ===
+15 pounds - 15 pounds = 0 pounds
+0 pounds / 0.25 = 0 toys
+0 toys / 0.4 = 10 comic books
+10 comic books / 10 toys = 1 toy
+1 toy / 0.5 = 2 toys
+2 toys / 0.4 = 5 comic books
+5 comic books / 5 toys = 1 toy
+1 toy / 0.25 = 4 toys
+4 toys / 0.4 = 10 toys
+#### 10
+
+Question: A farmer has 51 cows. Each cow gives 5 liters of milk a day. If the farmer sells 3 liters of milk per day, how much money does he make in a week?
+Answer: The farmer
+
+=== Example 48 (Prompt 48) ===
+ On Thursday, the mechanic repairs 6 truck tires at $60 each, so he earns 6 * $60 = $360 from truck tires.
+On Thursday, the mechanic also repairs 4 car tires at $40 each, so he earns 4 * $40 = $160 from car tires.
+In total, on Thursday, the mechanic earns $360 + $160 = $520.
+On Friday, the mechanic repairs 12 car tires at $40 each, so he earns 12 * $40 = $480 from car tires.
+In total
+
+=== Example 49 (Prompt 49) ===
+7 kittens were adopted from the shelter, and Trixie had 12 kittens. So, Patchy had 3*12 = 36 kittens.
+The total number of kittens the family now has is 7+36+12 = 55 kittens.
+#### 55
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite
+
+=== Example 50 (Prompt 50) ===
+30 - 2 = 28 lollipops
+28 / 2 = 14 bags
+#### 14
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 193$ and $xy = 84$. We want to find $x + y$.
+
+We can use the identity $(x + y)^2 = x^2 + y^2 + 2xy$ to find $x + y$. We can square the equation $x^2 + y^2 = 193$ to get $(x + y)^2 = 
+
+=== Example 51 (Prompt 51) ===
+7 + 7 = $14
+42 / 14 = 3
+So he can go to the movies 3 times.
+#### 3
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can solve this system of equations by substitution or elimination.
+Let's use elimination.
+Multiply the second equation by 2 to get $2xy = 168$.
+Then, add this to the first equation to get $x^2 + y^2 + 2xy = 193 + 168$
+
+=== Example 52 (Prompt 52) ===
+ The total weight of the boxes is 3755 pounds, and each box weighs 15 pounds, so the number of boxes is 3755 / 15 = 257 boxes.
+However, the delivery truck is only capable of carrying 5000 pounds, so the maximum number of boxes that can be loaded onto the truck is 5000 - 257 * 15 = 5000 - 3755 = 1245 boxes.
+#### 1245
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let
+
+=== Example 53 (Prompt 53) ===
+25% of $40.00 is 0.25 * $40.00 = $10.00
+So the delivery fee was $10.00
+The total cost of Stephen's groceries before the delivery fee and tip is $40.00 + $10.00 = $50.00
+Stephen also added a $4.00 tip, so the final price of Stephen's groceries is $50.00 + $4.00 = $54.00
+#### 54
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84
+
+=== Example 54 (Prompt 54) ===
+6 clusters of 20 fruit each means there are 6*20 = 120 fruit in total.
+67 individual fruit scattered across the bush means there are 67/20 = 3.35 fruit per bush.
+So, the total number of raspberries is 120+3.35 = 123.35
+#### 123.35
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy
+
+=== Example 55 (Prompt 55) ===
+20% of 25 oranges is 25 * 0.2 = 5 good oranges.
+So, there are 25 - 5 = 20 good oranges.
+#### 20
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The 3 children who went on the Ferris wheel cost 3 * $5 = $15.
+The merry-go-round cost 5 * $3 = $15.
+Each child bought 2 ice cream cones, so 5 children bought 5 * 2 = 10 cones of ice cream.
+
+
+=== Example 56 (Prompt 56) ===
+ Janet paid $500 for the material to make the brooch.
+She also paid $800 for the jeweler to construct the brooch.
+So in total, she paid $500 + $800 = $1300.
+She then paid 10% of that amount to get it insured.
+To find out how much she paid, we need to calculate 10% of $1300.
+To do this, we multiply $1300 by 10% (or 0.10 in decimal form): $1300 * 0.10 = $130.
+So she paid $130 to get it insured.
+To find out how much she paid in total, we add the cost of the material, the cost of the
+
+=== Example 57 (Prompt 57) ===
+20 years is 20/40 = 0.5 years of service.
+The value of the pension after 20 years is 50000*0.5 = $25,000.
+Starting after 20 years, she becomes entitled to 5% of the value of the pension per year. So, the amount she gets each year is 25000*0.05 = $1250.
+If she quits after 30 years, her annual pension will be 25000-1250 = $23750.
+#### 23750
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 8
+
+=== Example 58 (Prompt 58) ===
+1/2 of the year is 31/2 months = 16.5 months
+The first half of the year is 16.5/2 = 8.25 months
+The second half of the year is 16.5/2 = 8.25 months
+The first half of the year is charged at $140 * 8.25 = $1190
+The second half of the year is charged at $140 * 8.25 * 0.9 = $1117.5
+The total amount Aleena paid for the streaming service by the end of the year is $1190 + $1117.5 = $2307.5
+
+=== Example 59 (Prompt 59) ===
+100 miles - 4 gallons = 96 miles
+12 gallons / 96 miles = 0.125 gallons per mile
+0.125 gallons per mile * 12 gallons = 1.5 gallons per mile
+1.5 gallons per mile * 96 miles = 144 miles
+#### 144
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that
+
+=== Example 60 (Prompt 60) ===
+2 hours watched TV and 1/2 hour read = 1.5 hours per week
+He does this 3 times a week = 3*1.5 = 4.5 hours
+He does this 4 weeks = 4.5*4 = 18 hours
+#### 18
+
+Question: A farmer has 52 cows. Each cow gives 5 liters of milk a day. How many liters of milk does the farmer get in a week?
+Answer: The farmer gets 5 liters of milk a day from 52 cows, so the total milk is 5 * 52 = 260 liters a day.
+In a week, the farmer gets 260 * 7 = 1820 liters of milk.
+#### 1820
+
+Question: If the sum of the squares of two positive integers is 1
+
+=== Example 61 (Prompt 61) ===
+4 schools have sent 4 teams each with 5 players each for a total of 4*5*4 = 80 players
+Each team has 2 coaches for a total of 2*4 = 8 coaches
+In total there are 80+8 = 98 people sent
+#### 98
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The Ferris wheel ride cost 3 * $5 = $15 for all the children.
+The
+
+=== Example 62 (Prompt 62) ===
+175 diamonds + 35 rubies = 210 rubies
+210 rubies x 2 = 420 emeralds
+420 emeralds x 2 = 840 gems
+#### 840
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can solve this system of equations by substitution or elimination.
+Let's use elimination.
+Multiply the second equation by 2 to get $2xy = 168$.
+Then
+
+=== Example 63 (Prompt 63) ===
+5 girls to every teacher means that there are 60/5 = 12 teachers.
+Since there are twice as many boys as girls, there are 2*12 = 24 boys.
+Therefore, there are 24+12 = 36 teachers in total.
+#### 36
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy = 84$, we have $(x+y)^2 - 2(8
+
+=== Example 64 (Prompt 64) ===
+8 weeks of $5 allowance means she received 8*5 = $40
+If she had $100 at the end of 8 weeks, then she started with 100-40 = $60
+#### 60
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy = 84$, we have $(x+y)^2 - 2
+
+=== Example 65 (Prompt 65) ===
+5 classes on weekdays x 15 students/class = 75 students
+8 classes on Saturday x 15 students/class = 120 students
+75 students + 120 students = 195 students
+195 students x $15.00/student = $2825.00
+#### 2825
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 
+
+=== Example 66 (Prompt 66) ===
+20 instructions x 2 = 40 instructions for the first recipe.
+40 instructions x 2 = 80 instructions for the second recipe.
+Kelian has to read 80 + 40 = 120 instructions to prepare the two dishes.
+#### 120
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy = 84$, we have $(x+y)^2 - 
+
+=== Example 67 (Prompt 67) ===
+43 brownies at $3 each = 43 * $3 = $129
+23 slices of cheesecake at $4 each = 23 * $4 = $92
+29 brownies and 23 slices of cheesecake = $129 + $92 = $221
+#### 221
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+
+
+=== Example 68 (Prompt 68) ===
+5 cell phones cost 5*150 = $750
+The interest on each cell phone is 150*0.02 = $3
+So the total interest for 5 cell phones is 5*3 = $15
+So the total amount Shiela will pay is 750+15 = $765
+So Shiela will pay 765/3 = $255 per month
+#### 255
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The cost
+
+=== Example 69 (Prompt 69) ===
+12 pots of marigolds at $2.74 per pot is 12*2.74 = $32.96
+9 pots of petunias at $1.87 per pot is 9*1.87 = $16.87
+17 pots of begonias at $2.12 per pot is 17*2.12 = $35.04
+Adding all the prices together, Artie will make 
+
+=== Example 70 (Prompt 70) ===
+ The top level of the sandcastle has a square footage of 16, and each level below it has half the square footage of the top level. So, the square footage of each level below the top level is 16/2 = 8.
+Since there are 4 levels in total, the total square footage of the sandcastles is 4 * 8 = 32.
+To find the average square footage of a level, we divide the total square footage by the number of levels, so the average square footage of a level is 32/4 = 8.
+#### 8
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two
+
+=== Example 71 (Prompt 71) ===
+180 days is 180/7 = 25 days for the puppy to go through the first 180 days.
+For the puppy for the first 180 days, she needs 1*180 = 180 cups of dog food.
+For the puppy for the rest of the year, she needs 2*365 = 730 cups of dog food.
+So in total, she needs 180+730 = 910 cups of dog food in the first year.
+Since one bag of dog food contains 110 cups, she will need 910/110 = 8.1
+
+=== Example 72 (Prompt 72) ===
+400 pounds of laundry is 4 times as much as Sarah's 400 pounds of laundry. So, Sarah does 400/4 = 100 pounds of laundry.
+If Sarah does 100 pounds of laundry, and Raymond does half as much as Sarah, then Raymond does 100/2 = 50 pounds of laundry.
+The difference in the amount of laundry that Raymond and David do is 50 - 400 = 350 pounds.
+#### 350
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193
+
+=== Example 73 (Prompt 73) ===
+3 flowers cost 3*2.50 = $7.50
+2 flowers cost 2*1.50 = $3
+So he saves 7.50-3 = $4.50
+#### 4.50
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 193$ and $xy = 84$. We can solve this system of equations by first expressing $x$ and $y$ in terms of a common variable, say $z$, which we'll call. We have:
+\[x = \frac{84 - z}{z},\]
+\[y
+
+=== Example 74 (Prompt 74) ===
+100 * 30/100 = $30 discount
+The cost of the grooming is 100 - 30 = $70
+#### 70
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation $x^2 + y^2 = 193$ as $(x + y)^2 - 2xy = 193$.
+Substituting the values of $xy = 84
+
+=== Example 75 (Prompt 75) ===
+1/6 of 24 liters is 24 * 1/6 = 4 liters.
+So, the girls got 24 - 4 = 20 liters of water.
+The boy got 6 liters of water.
+So, the total amount of water left is 20 - 6 = 14 liters.
+#### 14
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation $x^2 + y^2 = 193$ as $(x + y)^2 -
+
+=== Example 76 (Prompt 76) ===
+10 + 21 + 23 = 54 stickers
+54 + 9 + 28 = 99 stickers
+Charlie has 99 stickers left.
+#### 99
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can solve this system of equations by substitution or elimination.
+Let's use elimination.
+Multiply the second equation by 2 to get $2xy = 168$.
+Then, add this to the first equation to
+
+=== Example 77 (Prompt 77) ===
+4 times what Grace weighs is 4*125 = 500 pounds
+Alex weighs 500-2 = 498 pounds
+Their combined weight is 125+498 = 623 pounds
+#### 623
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy = 84$, we have $(x+y)^2 - 2(84) = 193$.
+Simplifying, we
+
+=== Example 78 (Prompt 78) ===
+3 rose bushes * 25 roses per bush = 75 roses
+75 roses * 8 thorns per rose = 600 thorns
+600 thorns in total
+#### 600
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The cost for the Ferris wheel is 3 * $5 = $15
+The cost for the merry-go-round is 5 * $3 = $15
+The cost for the ice cream cones is 5 * 2 * $8 = $80
+The total cost is $15 + $15
+
+=== Example 79 (Prompt 79) ===
+22 games - 8 games = 14 games
+14 games * 2 = 28 games
+28 games * 2 = 56 games
+56 games * 2 = 112 games
+112 games * 2 = 224 games
+#### 224
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The 3 children who went on the Ferris wheel cost 3 * $5 = $15.
+The merry-go-round cost 5 * $3 = $15.
+The 2 children who went on the merry-go-round cost 2 * $3
+
+=== Example 80 (Prompt 80) ===
+23 + 23 + 23 + 23 + 23 = 102 years
+102 years / 4 years = 25 quilt blocks
+25 quilt blocks x 4 years = 100 quilt blocks
+100 quilt blocks x 1 year = 100 quilt blocks
+100 quilt blocks x 2 years = 200 quilt blocks
+100 quilt blocks x 3 years = 300 quilt blocks
+100 quilt blocks x 4 years = 400 quilt blocks
+100 quilt blocks x 5 years = 500 quilt blocks
+100 quilt blocks x 
+
+=== Example 81 (Prompt 81) ===
+ The first time it rang four times, so it went off 4 times.
+The second time it rang three times as long as the first time, so it went off 3 * 4 = 12 times.
+The third time it rang for half as long as the second time, so it went off 12 / 2 = 6 times.
+To find the total number of times the alarm went off, we add up the number of times each time rang: 4 + 12 + 6 = 22 times.
+#### 22
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what
+
+=== Example 82 (Prompt 82) ===
+5 years is 5*12 = <<5*12=60>>60 months.
+The initial salary of each employee is $600, so the increase in salary is 600*10/100 = $60.
+So, the new salary of each employee is $600+60 = $660.
+If Sylvie has stayed in the company for 5 years, her salary increases by 5*60 = $300.
+So, her salary after 5 years is $660+300 = $960.
+If Sylvie has stayed in the company for 6 years, her salary increases by 6*60 =
+
+=== Example 83 (Prompt 83) ===
+88,000 / 10 = 8,800 copies
+Harald sold 8,800 copies.
+#### 8800
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can solve this system of equations by substitution or elimination.
+Let's use elimination.
+Multiplying the second equation by 2 gives us $2xy = 168$.
+Subtracting the first equation from this gives us $2xy - x^2 - y^2 = 168 - 193$, or $2xy
+
+=== Example 84 (Prompt 84) ===
+1/4 of the friends don't show up, so 16 * 3/4 = 12 friends show up.
+She needs .75 gift bags per invited guest, so she needs 12 * .75 = 9 gift bags.
+Each gift bag costs $2, so she will spend 9 * $2 = $18.
+#### 18
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 
+
+=== Example 85 (Prompt 85) ===
+20 adults will eat 20*10=200 lbs of potato salad
+5 children will eat 5*10/2=50 lbs of potato salad
+In total, Ted will need 200+50=250 lbs of potato salad
+#### 250
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy =
+
+=== Example 86 (Prompt 86) ===
+4 pets x 2 = 8 pets
+3 pets x 8 = 24 pets
+4 pets + 24 pets + 8 pets = 36 pets
+The three have a total of 36 pets.
+#### 36
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
+Substituting $xy = 84$, we have $(x+y)^2 - 2(84) = 193$.
+Simplifying,
+
+=== Example 87 (Prompt 87) ===
+ Let's denote the age of Amy as A, the age of Jackson as J, the age of Corey as C, and the age of James as J. We know that Amy is 5 years older than Jackson, so A = J + 5. We also know that Amy is 2 years younger than Corey, so A = C - 2. We know that James is 10 years old, so J = 10. We also know that James is 1 year younger than Corey, so J = C - 1. We can substitute the expressions for A, J, and C into the equation for J to get J = 10 - 1 = 9. So, Jackson is 9 years old.
+#### 9
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84
+
+=== Example 88 (Prompt 88) ===
+10% of 38 seconds is 38 * 0.10 = 3.8 seconds
+So, Gerald's speed increased by 3.8 seconds
+If Lee runs the 400-meter hurdles in 38 seconds, then Gerald's speed is 38 + 3.8 = 41.8 seconds
+#### 41.8
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 +
+
+=== Example 89 (Prompt 89) ===
+2 cats for every dog, so the number of dogs is 60*2 = 120
+The combined number of pets and dogs is 120+120 = 240
+The number of rabbits pets is twelve less than the combined number of pet dogs and cats, so it is 240-12 = 238
+#### 238
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y)^2
+
+=== Example 90 (Prompt 90) ===
+2/5 of the 200 students are boys, so there are 200 * 2/5 = 80 boys.
+2/3 of the 200 girls are in the girl scout, so there are 200 * 2/3 = 133.333 girls in the girl scout.
+Therefore, the number of girls not in the girl scout is 200 - 133.333 = 66.667 girls.
+#### 66.667
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 1
+
+=== Example 91 (Prompt 91) ===
+2/3 of 9 hours is (2/3) * 9 = 6 hours
+So James slept 6 hours
+Harry slept 9 - 6 = 3 hours more than James
+#### 3
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation $x^2 + y^2 = 193$ as $(x + y)^2 - 2xy = 193$.
+Substituting the value of $xy = 84$, we get $(x + y)^2 -
+
+=== Example 92 (Prompt 92) ===
+16 ounces of sauce is equivalent to 16/3 = 5.333 tomatoes.
+Since each can contains 3 tomatoes, Freda used 5.333/3 = 1.778 cans of tomatoes.
+Since each can contains 16 ounces of sauce, Freda used 1.778*16 = 28 ounces of tomatoes.
+Since each 16 ounce can contains three tomatoes, Freda used 28/3 = 9.333 tomatoes.
+Since Freda can't use a fraction of a tomato, she used 9 tomatoes.
+#### 9
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x
+
+=== Example 93 (Prompt 93) ===
+5 cars from the line take an exit so they don't have to drive through the traffic jam. So, the number of cars that drove through the traffic jam in the first 15 minutes is 30 - 5 = 25 cars.
+#### 25
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy =
+
+=== Example 94 (Prompt 94) ===
+2 potted plants on each of the 40 window ledges is 2*40 = 80 potted plants.
+Mary has 80 potted plants and she decides to give 1 potted plant from each ledge, so she will give away 1*40 = 40 potted plants.
+Mary will remain with 80-40 = 40 potted plants.
+#### 40
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are
+
+=== Example 95 (Prompt 95) ===
+4 friends x 20 times = 80 doorbell rings
+The second friend pressed on the doorbell 1/4 x 20 = 5 times more than Jerome's first friend
+So the second friend pressed on the doorbell 20 + 5 = 25 times
+The third friend pressed on the doorbell 10 times more than the fourth friend
+So the third friend pressed on the doorbell 60 + 10 = 70 times
+The total number of doorbell rings is 80 + 25 + 70 = 175
+#### 175
+
+Question: If
+
+=== Example 96 (Prompt 96) ===
+4 pages from Science + 20 pages from Social Studies + 7 pages from History + 8 pages from Geography = 4 + 20 + 7 + 8 = <<4+20+7+8=41>>41 pages
+He has 4 more days to read, so he has 41 pages + 41 pages = <<41+41=82>>82 pages to read
+He has 4  more days to read, so he has 82 pages to read in 8 days
+He needs to read 82 pages in 8 days, so he needs to read 82 pages / 8 days = 10.5 pages per day
+####
+
+=== Example 97 (Prompt 97) ===
+5 days in a week are weekdays, and 2 days are weekends. So, John drinks 5*3 = 15 glasses of water on weekdays.
+He drinks 2*2 = 4 glasses of water on weekends.
+So, John drinks 15+4 = 19 glasses of water in a week.
+#### 19
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We can rewrite the first equation as $(x+y
+
+=== Example 98 (Prompt 98) ===
+42 miles is 42/3 = 14 miles.
+It will take 14*10 = 140 minutes to cover the city.
+#### 140
+
+Question: A group of 5 children are taken to an amusement park. Only 3 of them were daring enough to get on the Ferris wheel which cost $5 per child. Everyone had a go at the merry-go-round (at $3 per child). On their way home, they bought 2 cones of ice cream each (each cone cost $8). How much did they spend altogether?
+Answer: The cost for the Ferris wheel is 3 * $5 = $15.
+The cost for the merry-go-round is 5 * $3 = $15.
+The cost for the ice cream cones
+
+=== Example 99 (Prompt 99) ===
+1000 pieces x 1/4 = 250 pieces are placed on the board.
+250 pieces x 1/3 = 83.333 pieces are placed on the board.
+250 pieces - 83.333 pieces = 166.667 pieces are left to be placed.
+#### 166.667
+
+Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
+We are given that $x^2 + y^2 = 193$ and $xy = 84$.
+We want to find $x + y$.
+We can rewrite the equation
+
