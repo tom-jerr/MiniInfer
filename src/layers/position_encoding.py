@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .triton_ops import apply_rotary_embedding
+from triton_ops.rotary_embedding import apply_rotary_embedding
 
 class RotaryEmbedding(nn.Module):
     def __init__(

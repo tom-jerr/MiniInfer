@@ -161,4 +161,3 @@ def apply_rotary_embedding(
     )
 
     return output
-   
