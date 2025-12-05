@@ -2,7 +2,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.models.qwen2 import Qwen2Model
+from src.models.fused_qwen2 import Qwen2Model
 from src.engine.kv_cache import TinyKvFullCache, BatchingKvCache
 from .utils import *
 
@@ -80,7 +80,7 @@ def helper_test_task_4(model_name: str, seq_len: int, iters: int = 1):
         for offset in range(seq_len):
             user_output, _ = model(
                 input_tensor[:, offset : offset + 1],
-                offset=offset,
+                offset=slice(offset, offset + 1),
                 cache=cache,
                 use_cache=True,
             )

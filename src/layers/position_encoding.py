@@ -30,7 +30,9 @@ class RotaryEmbedding(nn.Module):
         if offset is None:
             cos_sin = self.cos_sin_cache[:S].unsqueeze(0).to(x.device)
         elif isinstance(offset, slice):
-            assert offset.stop - offset.start == S, "Offset slice length must match sequence length"
+            start = offset.start if offset.start is not None else 0
+            stop = offset.stop if offset.stop is not None else start + S
+            assert stop - start == S, f"Offset slice length {stop - start} must match sequence length {S}"
             cos_sin = self.cos_sin_cache[offset].unsqueeze(0).to(x.device)
         elif isinstance(offset, list):
             assert len(offset) == B, "Number of slices in offset list must match batch size"

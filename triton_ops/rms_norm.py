@@ -63,9 +63,11 @@ def add_rms_norm_kernel(
     res_ptr,
     w_ptr,
     output_ptr,
+    x_new_ptr,
     stride_x_row,
     stride_res_row,
     stride_y_row,
+    stride_x_new_row,
     N,
     eps,
     BLOCK_SIZE: tl.constexpr,
@@ -83,6 +85,10 @@ def add_rms_norm_kernel(
     # Fused Add
     acc = x_vals + res_vals
     
+    # Store x_new
+    x_new_row_start_ptr = x_new_ptr + row_idx * stride_x_new_row
+    tl.store(x_new_row_start_ptr + offsets, acc, mask=mask)
+    
     # RMSNorm on acc
     acc_f32 = acc.to(tl.float32)
     mean_square = tl.sum(acc_f32 * acc_f32, axis=0) / N
@@ -95,11 +101,14 @@ def add_rms_norm_kernel(
     tl.store(output_row_start_ptr + offsets, output, mask=mask)
 
 def add_rms_norm_forward(x, residual, weight, eps=1e-5):
-    x = x.contiguous()
-    residual = residual.contiguous()
+    # translate to (Batch*SeqLen, HiddenDim)
+    orig_shape = x.shape
+    x = x.reshape(-1, orig_shape[-1]).contiguous()
+    residual = residual.reshape(-1, orig_shape[-1]).contiguous()
     weight = weight.contiguous()
     M, N = x.shape
     output = torch.empty_like(x)
+    x_new = torch.empty_like(x)
 
     MAX_FUSED_SIZE = 65536
     if N > MAX_FUSED_SIZE:
@@ -113,11 +122,11 @@ def add_rms_norm_forward(x, residual, weight, eps=1e-5):
         num_warps = 16
 
     add_rms_norm_kernel[grid](
-        x, residual, weight, output,
-        x.stride(0), residual.stride(0), output.stride(0),
+        x, residual, weight, output, x_new,
+        x.stride(0), residual.stride(0), output.stride(0), x_new.stride(0),
         N, eps,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=num_warps
     )
 
-    return output
+    return x_new.view(orig_shape), output.view(orig_shape)
