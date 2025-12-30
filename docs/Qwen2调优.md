@@ -1,11 +1,15 @@
 # Kernel-Fusion Benchmarks Report
 
 ## Baseline
+
 使用 Pytorch 原生 Attention 和相关函数，没有实现算子融合
+
 ```python
 python tests/profile/profile_qwen2.py --seq-len 128 --profile
 ```
+
 ### Result
+
 ```shell
 ========================================
 Benchmark Results (No Cache)
@@ -21,22 +25,26 @@ Est. Bandwidth (GB/s)  52.43
 ## First Optimization: Fused Qwen2
 
 ### Implemented Kernel Fusions and Triton Kernels
+
 **Triton Kernels**
+
 - RoPE triton kernel
 - SiluAndMul triton kernel
 - RmsNormAndAdd triton kernel
 
 **Fused Kernels**
+
 - RmsNorm + Add Fusion
 - Fused Gate+Up GEMM(x @ [W_gate | W_up])
-- SiluAndMul Kernel (SiLU(part1) * part2)
+- SiluAndMul Kernel (SiLU(part1) \* part2)
 - LayerNorm + Last iter Add Fusion
 
 ```python
 python tests/profile/profile_qwen2.py --seq-len 128 --profile
 ```
 
-### Result 
+### Result
+
 ```shell
 ========================================
 Benchmark Results (No Cache)
@@ -48,6 +56,7 @@ Benchmark Results (No Cache)
       Model Size (GB)  1.704
 Est. Bandwidth (GB/s)  60.81
 ```
+
 ![](img/cudalaunch.png)
 
 ### Analysis
@@ -55,9 +64,7 @@ Est. Bandwidth (GB/s)  60.81
 - 有很多小算子，考虑使用 torch.compile 进行优化
 - CUDA Launch 过多，考虑后续重构框架后分为 prefill 和 decode 两个阶段进行优化
 
-
 ## Second Optimization: Torch Compile with Max Autotune
-
 
 ### Result
 
@@ -83,8 +90,8 @@ Est. Bandwidth (GB/s)  65.03
 
 ## Third Optimization: Flash Attention
 
-
 ### Result
+
 ```shell
 ========================================
 Benchmark Results (No Cache)

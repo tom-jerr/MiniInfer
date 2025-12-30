@@ -3,4 +3,4 @@
 from .eval_gsm8k import main
 
 if __name__ == "__main__":
-    main()
+  main()

@@ -2,9 +2,9 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 [project]
-name = "tinyllm"
+name = "miniinfer"
 version = "0.1.0"
-description = "a lightweight vLLM implementation built from scratch"
+description = "a lightweight LLM inference framework implementation built from scratch"
 authors = [{ name = "lzy", email = "tomlzy213@gmail.com" }]
 requires-python = ">=3.10,<3.13"
 readme = "README.md"
@@ -16,13 +16,17 @@ dependencies = [
     "xxhash",
     "numpy>=2.2.4",
     "accelerate>=1.11.0",
-    "flash-attn>=2.8.3",
+    #"flash-attn>=2.8.3",
     "ruff>=0.11.6",
     "pre-commit>=4.0.0",
     "pandas",
     "matplotlib",
+    "pytest",
 ]
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
 pythonpath = "."
+
+#[tool.uv.extra-build-dependencies]
+#flash-attn = ["torch"]

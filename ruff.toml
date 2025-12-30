@@ -8,7 +8,7 @@ target-version = "py310"
 line-length = 100
 
 # 缩进宽度
-indent-width = 4
+indent-width = 2
 
 # 要检查的文件
 extend-include = ["*.ipynb"]

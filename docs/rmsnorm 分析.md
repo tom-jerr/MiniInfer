@@ -1,4 +1,5 @@
 # rmsnorm 分析与优化方案
+
 > rmsnorm 是 Memory Bound 算子
 
 在 Memory Bound 的场景下，性能主要受限于显存带宽。我们通过计算**显存访问次数（Memory Accesses）**的减少比例来估算收益。
@@ -8,26 +9,30 @@
 ## 原始方案 (Add + RMSNorm 分离):
 
 **Add Kernel: x = x + residual**
-  - 读 x: N
-  - 读 residual: N
-  - 写 x: N
-  - 小计: 3N 次访存
-**RMSNorm Kernel: y = rmsnorm(x)**
-  - 读 x: N
-  - 写 y: N
-  - 小计: 2N 次访存
-总计: 3N+2N=5N 次访存。
+
+- 读 x: N
+- 读 residual: N
+- 写 x: N
+- 小计: 3N 次访存
+  **RMSNorm Kernel: y = rmsnorm(x)**
+- 读 x: N
+- 写 y: N
+- 小计: 2N 次访存
+  总计: 3N+2N=5N 次访存。
+
 ## 融合方案 (Fused Add + RMSNorm):
 
 **Fused Kernel:**
+
 - 读 x: N
 - 读 residual: N
 - (计算 acc = x + residual，保存在寄存器/SRAM中)
 - (计算 y = rmsnorm(acc)，保存在寄存器/SRAM中)
 - 写 y: N
-总计: 3N 次访存。
+  总计: 3N 次访存。
 
 ## 理论优化结果
+
 **优化比例:**
 Bandwidth Savings: $\frac{5N - 3N}{5N}  = \frac{2N}{5N}= 40%$
 

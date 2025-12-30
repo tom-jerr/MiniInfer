@@ -53,7 +53,7 @@ The total number of downloads over the three months is 60+180+126 = 366 download
 #### 366
 
 Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
-Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 
+Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 =
 
 === Example 6 (Prompt 6) ===
 3 dozen donuts cost 3*68 = $204
@@ -408,7 +408,7 @@ Question: If the sum of the squares of two positive integers is 193 and their pr
 Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
 We are given that $x^2 + y^2 = 193$ and $xy = 84$.
 We want to find $x + y$.
-We can rewrite the equation $x^2 + y^2 = 
+We can rewrite the equation $x^2 + y^2 =
 
 === Example 38 (Prompt 38) ===
 300g of a 5-servings bag of chips has 300*5 = 1500 calories.
@@ -541,7 +541,7 @@ We can rewrite
 Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
 Answer: Let the two positive integers be $x$ and $y$, with $x > y$. We are given that $x^2 + y^2 = 193$ and $xy = 84$. We want to find $x + y$.
 
-We can use the identity $(x + y)^2 = x^2 + y^2 + 2xy$ to find $x + y$. We can square the equation $x^2 + y^2 = 193$ to get $(x + y)^2 = 
+We can use the identity $(x + y)^2 = x^2 + y^2 + 2xy$ to find $x + y$. We can square the equation $x^2 + y^2 = 193$ to get $(x + y)^2 =
 
 === Example 51 (Prompt 51) ===
 7 + 7 = $14
@@ -705,7 +705,7 @@ Substituting $xy = 84$, we have $(x+y)^2 - 2
 Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
 Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
 We are given that $x^2 + y^2 = 193$ and $xy = 84$.
-We can rewrite the first equation as $(x+y)^2 - 2xy = 
+We can rewrite the first equation as $(x+y)^2 - 2xy =
 
 === Example 66 (Prompt 66) ===
 20 instructions x 2 = 40 instructions for the first recipe.
@@ -717,7 +717,7 @@ Question: If the sum of the squares of two positive integers is 193 and their pr
 Answer: Let the two positive integers be $x$ and $y$, where $x > y$.
 We are given that $x^2 + y^2 = 193$ and $xy = 84$.
 We can rewrite the first equation as $(x+y)^2 - 2xy = 193$.
-Substituting $xy = 84$, we have $(x+y)^2 - 
+Substituting $xy = 84$, we have $(x+y)^2 -
 
 === Example 67 (Prompt 67) ===
 43 brownies at $3 each = 43 * $3 = $129
@@ -746,7 +746,7 @@ Answer: The cost
 12 pots of marigolds at $2.74 per pot is 12*2.74 = $32.96
 9 pots of petunias at $1.87 per pot is 9*1.87 = $16.87
 17 pots of begonias at $2.12 per pot is 17*2.12 = $35.04
-Adding all the prices together, Artie will make 
+Adding all the prices together, Artie will make
 
 === Example 70 (Prompt 70) ===
  The top level of the sandcastle has a square footage of 16, and each level below it has half the square footage of the top level. So, the square footage of each level below the top level is 16/2 = 8.
@@ -871,7 +871,7 @@ The 2 children who went on the merry-go-round cost 2 * $3
 100 quilt blocks x 3 years = 300 quilt blocks
 100 quilt blocks x 4 years = 400 quilt blocks
 100 quilt blocks x 5 years = 500 quilt blocks
-100 quilt blocks x 
+100 quilt blocks x
 
 === Example 81 (Prompt 81) ===
  The first time it rang four times, so it went off 4 times.
@@ -912,7 +912,7 @@ Each gift bag costs $2, so she will spend 9 * $2 = $18.
 Question: If the sum of the squares of two positive integers is 193 and their product is 84, what is the sum of the two integers?
 Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
 We are given that $x^2 + y^2 = 193$ and $xy = 84$.
-We can rewrite the first equation as $(x+y)^2 - 2xy = 
+We can rewrite the first equation as $(x+y)^2 - 2xy =
 
 === Example 85 (Prompt 85) ===
 20 adults will eat 20*10=200 lbs of potato salad
@@ -1067,4 +1067,3 @@ Answer: Let the two positive integers be $x$ and $y$, with $x > y$.
 We are given that $x^2 + y^2 = 193$ and $xy = 84$.
 We want to find $x + y$.
 We can rewrite the equation
-
