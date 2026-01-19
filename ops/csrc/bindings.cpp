@@ -1,6 +1,7 @@
 #include <torch/extension.h>
+#include <pybind11/pybind11.h>
 
-#include "vector_add.h"
+#include "ops/vector_add.h"
 
 torch::Tensor vector_add(torch::Tensor a, torch::Tensor b) {
   // 检查输入

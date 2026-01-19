@@ -1,9 +1,9 @@
 CompileFlags:
   Add:
     - -I/usr/local/cuda/include
-    - -I/sgl-workspace/tinyllm/.venv/lib/python3.12/site-packages/torch/include
-    - -I/sgl-workspace/tinyllm/.venv/lib/python3.12/site-packages/torch/include/torch/csrc/api/include
-    - -I/sgl-workspace/tinyllm/src/extensions/ops
+    - -I/MiniInfer-ws/MiniInfer/miniinfer/lib/python3.12/site-packages/torch/include
+    - -I/MiniInfer-ws/MiniInfer/miniinfer/lib/python3.12/site-packages/torch/include/torch/csrc/api/include
+    - -I/MiniInfer-ws/MiniInfer/miniinfer/src/extensions/ops
     - -std=c++17
     - -D__CUDACC__
   Remove:

@@ -1,67 +1,115 @@
 import torch
 import torch.nn as nn
-from triton_ops.rotary_embedding import apply_rotary_embedding
+from ops.triton.rotary_embedding import apply_rotary_embedding
+from typing import Union, Optional, Tuple
 
 
 class RotaryEmbedding(nn.Module):
-  def __init__(
-    self,
-    dims: int,
-    max_position_embeddings: int,
-    base: int = 10000,
-    traditional: bool = False,
-  ):
-    super().__init__()
-    assert dims % 2 == 0, "dims must be even"
-    self.dims = dims
-    self.half_dims = dims // 2
-    self.max_position_embeddings = max_position_embeddings
-    self.traditional = traditional
-    inv_freq = 1.0 / (base ** (torch.arange(0, dims, 2, dtype=torch.float32) / dims))
-    positions = torch.arange(max_position_embeddings, dtype=torch.float32)
-    freqs: torch.Tensor = torch.einsum("i,j->ij", positions, inv_freq)
-    cos = freqs.cos()
-    sin = freqs.sin()
-    cache = torch.cat((cos, sin), dim=-1)  # [seq_len, head_dim]
-    self.register_buffer("cos_sin_cache", cache, persistent=False)
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+        cache = self._compute_cos_sin_cache()
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        self._apply_rotary_emb_wrapped = _apply_rotary_emb
 
-  def forward(self, x: torch.Tensor, offset: list[slice] | slice | None = None) -> torch.Tensor:
-    B, S, H, D = x.shape
-    # [S, D] -> [1, S, D]
-    if offset is None:
-      cos_sin = self.cos_sin_cache[:S].unsqueeze(0).to(x.device)
-    elif isinstance(offset, slice):
-      start = offset.start if offset.start is not None else 0
-      stop = offset.stop if offset.stop is not None else start + S
-      assert stop - start == S, f"Offset slice length {stop - start} must match sequence length {S}"
-      cos_sin = self.cos_sin_cache[offset].unsqueeze(0).to(x.device)
-    elif isinstance(offset, list):
-      assert len(offset) == B, "Number of slices in offset list must match batch size"
-      cos_sin = torch.stack([self.cos_sin_cache[s] for s in offset], dim=0).to(x.device)
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device="cpu")
+                / self.rotary_dim
+            )
+        )
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        """Compute the cos and sin cache."""
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embeddings to query and key.
+        Args:
+            positions: [num_tokens], flatten batch and seq_len
+            query: [num_tokens, num_heads, head_size]
+            key: [num_tokens, num_heads, head_size]
+            offsets: Optional tensor to offset positions (for caching)
+        """
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        # maybe some model just apply rotary to part of the head dim
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = self._apply_rotary_emb_wrapped(
+            query_rot, cos, sin, self.is_neox_style
+        )
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
+
+
+def _apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    """
+    Args:
+        x: [num_tokens, num_heads, head_size]
+        cos: [num_tokens, head_size // 2]
+        sin: [num_tokens, head_size // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+    if is_neox_style:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
     else:
-      raise TypeError(f"Unsupported type for offset: {type(offset)}")
-
-    # [B, S, D/2] or [1, S, D/2]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    y = apply_rotary_embedding(x, cos, sin, interleaved=self.traditional)
-    # if self.traditional:
-    #     x = x.reshape(B, S, H, self.half_dims, 2)
-    #     x1 = x[..., 0]
-    #     x2 = x[..., 1]
-    # else:
-    #     # Qwen2 style
-    #     x1 = x[..., 0 : self.half_dims]
-    #     x2 = x[..., self.half_dims : self.dims]
-    # # [B, S, D/2] -> [B, S, 1, D/2]
-    # cos = cos.reshape(-1, S, 1, self.half_dims)
-    # sin = sin.reshape(-1, S, 1, self.half_dims)
-    # # [B, S, H, D/2]
-    # real = x1 * cos - x2 * sin
-    # imag = x1 * sin + x2 * cos
-    # if self.traditional:
-    #     y = torch.stack([real, imag], dim=-1)
-    #     y = y.reshape(B, S, H, D)
-    # else:
-    #     y = torch.cat((real, imag), dim=-1)
-    #     y = y.reshape(B, S, H, D)
-    return y.type_as(x)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    if is_neox_style:
+        return torch.cat((o1, o2), dim=-1)
+    else:
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
