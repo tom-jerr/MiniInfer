@@ -33,15 +33,15 @@ class ForwardBatch:
 
     # ============ kv cache related ============
     # The indices of requests in the req_to_token_pool
-    req_pool_indices: torch.Tensor
+    req_pool_indices: torch.Tensor = None
     # The indices of output tokens in the token_to_kv_pool
-    out_cache_loc: torch.Tensor
+    out_cache_loc: torch.Tensor = None
 
     # ============ some metadata ============
     # The sequence length
-    seq_lens: torch.Tensor
+    seq_lens: torch.Tensor = None
     # The sum of all sequence lengths
-    seq_lens_sum: int
+    seq_lens_sum: int = 0
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 

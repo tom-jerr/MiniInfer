@@ -3,9 +3,11 @@
     "*.cu": "cuda-cpp"
   },
   "C_Cpp.default.includePath": [
-    "${workspaceFolder}/src/extensions/ops",
+    "${workspaceFolder}/src/extensions/kernels",
     "/usr/local/cuda/include"
   ],
-  "C_Cpp.default.defines": ["__CUDACC__"],
+  "C_Cpp.default.defines": [
+    "__CUDACC__"
+  ],
   "C_Cpp.default.compilerPath": "/usr/local/cuda/bin/nvcc"
 }

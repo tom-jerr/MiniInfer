@@ -1,10 +1,12 @@
 import torch
 import pytest
 from transformers import Qwen2Config as HFQwen2Config, Qwen2Model as HFQwen2Model
-from src.models.fused_qwen2 import Qwen2Model
-from src.loader.weight import _merge_state_dict
-from src.config.model.qwen2 import Qwen2Config
-from .utils import assert_allclose
+from miniinfer.models.fused_qwen2 import Qwen2Model
+from miniinfer.loader.weight import _merge_state_dict
+from miniinfer.config.model.qwen2 import Qwen2Config
+from ..utils import assert_allclose
+
+
 @pytest.fixture
 def model_setup():
     # 1. 初始化配置 (使用小规模参数加速测试)
@@ -14,7 +16,7 @@ def model_setup():
         "intermediate_size": 1024,
         "num_hidden_layers": 2,
         "num_attention_heads": 8,
-        "num_key_value_heads": 2, # 测试 GQA 逻辑
+        "num_key_value_heads": 2,  # 测试 GQA 逻辑
         "max_position_embeddings": 512,
         "rms_norm_eps": 1e-6,
     }
@@ -37,6 +39,7 @@ def model_setup():
 
     return hf_model, custom_model, device
 
+
 def test_qwen2_load_weights_precision(model_setup):
     hf_model, custom_model, device = model_setup
 
@@ -49,4 +52,6 @@ def test_qwen2_load_weights_precision(model_setup):
         hf_output = hf_model(input_ids).last_hidden_state
         custom_output = custom_model(input_ids).last_hidden_state
 
-    assert_allclose(custom_output, hf_output, precision=torch.float16, rtol=0.05, atol=0.005)
+    assert_allclose(
+        custom_output, hf_output, precision=torch.float16, rtol=0.05, atol=0.005
+    )

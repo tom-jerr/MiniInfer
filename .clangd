@@ -3,7 +3,7 @@ CompileFlags:
     - -I/usr/local/cuda/include
     - -I/MiniInfer-ws/MiniInfer/miniinfer/lib/python3.12/site-packages/torch/include
     - -I/MiniInfer-ws/MiniInfer/miniinfer/lib/python3.12/site-packages/torch/include/torch/csrc/api/include
-    - -I/MiniInfer-ws/MiniInfer/miniinfer/src/extensions/ops
+    - -I/MiniInfer-ws/MiniInfer/miniinfer/src/extensions/kernels
     - -std=c++17
     - -D__CUDACC__
   Remove:

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from ops.triton.rotary_embedding import apply_rotary_embedding
+from kernels.triton.rotary_embedding import apply_rotary_embedding
 from typing import Union, Optional, Tuple
 
 
@@ -11,8 +11,8 @@ class RotaryEmbedding(nn.Module):
         rotary_dim: int,
         max_position_embeddings: int,
         base: int,
-        is_neox_style: bool,
-        dtype: torch.dtype,
+        is_neox_style: bool = True,
+        dtype: torch.dtype = torch.float16,
     ):
         super().__init__()
         self.head_size = head_size
@@ -39,7 +39,7 @@ class RotaryEmbedding(nn.Module):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device="cpu")
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -65,7 +65,16 @@ class RotaryEmbedding(nn.Module):
             positions = positions + offsets
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        # Ensure positions is on the same device as cos_sin_cache
+        positions_device = positions.device
+        if self.cos_sin_cache.device != positions_device:
+            # Move positions to cache's device for indexing, then move result back
+            positions_cpu = positions.cpu()
+            cos_sin = self.cos_sin_cache.index_select(0, positions_cpu).to(
+                positions_device
+            )
+        else:
+            cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)

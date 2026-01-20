@@ -16,8 +16,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.engine.llm_engine import LLMEngine
-from src.utils.sampling_params import SamplingParams
+from miniinfer.engine.llm_engine import LLMEngine
+from miniinfer.utils.sampling_params import SamplingParams
 
 
 def main():

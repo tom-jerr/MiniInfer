@@ -28,7 +28,7 @@ class Qwen2Config(PretrainedConfig):
         attention_dropout: 注意力 dropout 概率
         tie_word_embeddings: 是否共享输入输出词嵌入
         use_cache: 是否使用 KV cache
-        torch_dtype: 模型精度类型
+        dtype: 模型精度类型
     """
 
     model_type = "qwen2"
@@ -50,7 +50,7 @@ class Qwen2Config(PretrainedConfig):
         attention_dropout=0.0,
         tie_word_embeddings=False,
         use_cache=True,
-        torch_dtype="float32",
+        dtype="float32",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -75,7 +75,7 @@ class Qwen2Config(PretrainedConfig):
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             use_cache=use_cache,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             **kwargs,
         )
 
@@ -103,9 +103,9 @@ class Qwen2Config(PretrainedConfig):
             attention_dropout=getattr(hf_config, "attention_dropout", 0.0),
             tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", False),
             use_cache=getattr(hf_config, "use_cache", True),
-            torch_dtype=(
-                str(hf_config.torch_dtype).split(".")[-1]
-                if hasattr(hf_config, "torch_dtype")
+            dtype=(
+                str(hf_config.dtype).split(".")[-1]
+                if hasattr(hf_config, "dtype")
                 else "float32"
             ),
         )

@@ -4,7 +4,7 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/ops/csrc/ops",
+                "${workspaceFolder}/kernels/csrc/kernels",
                 "${env:HOME}/.local/lib/python3.*/site-packages/torch/include",
                 "${env:HOME}/.local/lib/python3.*/site-packages/torch/include/torch/csrc/api/include",
                 "/usr/local/cuda/include"
@@ -14,7 +14,7 @@
             "cStandard": "c17",
             "cppStandard": "c++17",
             "intelliSenseMode": "linux-gcc-x64",
-            "compileCommands": "${workspaceFolder}/ops/csrc/build/compile_commands.json"
+            "compileCommands": "${workspaceFolder}/kernels/csrc/build/compile_commands.json"
         }
     ],
     "version": 4

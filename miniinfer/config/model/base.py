@@ -19,12 +19,12 @@ class PretrainedConfig:
         self,
         tie_word_embeddings: bool = False,
         use_cache: bool = True,
-        torch_dtype: str = "float32",
+        dtype: str = "float32",
         **kwargs,
     ):
         self.tie_word_embeddings = tie_word_embeddings
         self.use_cache = use_cache
-        self.torch_dtype = torch_dtype
+        self.dtype = dtype
 
         # 存储额外的参数
         for key, value in kwargs.items():

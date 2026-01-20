@@ -178,6 +178,7 @@ def scaled_dot_product_attention_grouped(
     # 使用 float32 计算避免溢出
     query_f = query.float()
     key_f = key.float()
+    value_f = value.float()
     q_k = torch.matmul(
         query_f, key_f.transpose(-2, -1)
     )  # [B, H_kv, n_repeats, S_q, S_k]
@@ -200,7 +201,7 @@ def scaled_dot_product_attention_grouped(
                 mask = mask.reshape(*B, H_kv, n_repeats, S_q, S_k)
             scores = scores + mask.float()
     attn_weights = torch.softmax(scores, dim=-1)
-    output = torch.matmul(attn_weights, value.float())
+    output = torch.matmul(attn_weights, value_f)
 
     return output.reshape(expect_shape).to(query.dtype)
 
@@ -335,7 +336,6 @@ class AttentionImpl(nn.Module):
         layer_id: int,
         v_head_dim: int = -1,
         use_irope: bool = False,
-        prefix: str = "",
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -359,7 +359,7 @@ class AttentionImpl(nn.Module):
         k,
         v,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool = True,
+        save_kv_cache: bool = False,
         **kwargs,
     ):
 

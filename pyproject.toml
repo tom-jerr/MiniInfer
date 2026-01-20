@@ -28,5 +28,7 @@ dependencies = [
 addopts = ["--import-mode=importlib"]
 pythonpath = "."
 
+[tool.setuptools.packages.find]
+where = ["miniinfer"]
 #[tool.uv.extra-build-dependencies]
 #flash-attn = ["torch"]

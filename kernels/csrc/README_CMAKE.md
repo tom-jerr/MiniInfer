@@ -14,7 +14,7 @@ csrc/
 │   └── FindTorch.cmake     # PyTorch 查找模块
 ├── miniinfer_ext/
 │   └── __init__.py         # Python 包入口
-├── ops/
+├── kernels/
 │   ├── vector_add.h        # 头文件
 │   ├── vector_add.cu       # CUDA 实现
 │   └── rope.cu             # RoPE 实现 (待完成)
@@ -27,7 +27,7 @@ csrc/
 ### 方式一：CMake 构建 (推荐)
 
 ```bash
-cd ops/csrc
+cd kernels/csrc
 chmod +x build.sh
 ./build.sh
 
@@ -40,7 +40,7 @@ cmake --build . -j$(nproc)
 ### 方式二：pip 安装
 
 ```bash
-cd ops/csrc
+cd kernels/csrc
 pip install -e .
 ```
 
@@ -65,13 +65,13 @@ result = vector_add(a, b)
 ```python
 # 在 MiniInfer 的其他模块中
 import sys
-sys.path.append('/path/to/MiniInfer/ops/csrc')
+sys.path.append('/path/to/MiniInfer/kernels/csrc')
 from miniinfer_ext import vector_add
 ```
 
 ## 添加新的算子
 
-1. 在 `ops/` 目录下创建头文件 (`.h`) 和实现文件 (`.cu` 或 `.cpp`)
+1. 在 `kernels/` 目录下创建头文件 (`.h`) 和实现文件 (`.cu` 或 `.cpp`)
 2. 在 `CMakeLists.txt` 中添加源文件
 3. 在 `bindings.cpp` 中添加 Python 绑定
 4. 在 `miniinfer_ext/__init__.py` 中导出函数
@@ -79,7 +79,7 @@ from miniinfer_ext import vector_add
 ### 示例：添加新算子
 
 ```cpp
-// ops/my_op.h
+// kernels/my_op.h
 #pragma once
 #include <torch/torch.h>
 
@@ -87,7 +87,7 @@ void my_op_cuda(torch::Tensor input, torch::Tensor output);
 ```
 
 ```cpp
-// ops/my_op.cu
+// kernels/my_op.cu
 #include <torch/torch.h>
 #include "my_op.h"
 
@@ -125,7 +125,7 @@ python -c "import torch; print(torch.utils.cmake_prefix_path)"
 在 CMakeLists.txt 中修改 `CUDA_ARCHITECTURES`：
 
 ```cmake
-set_target_properties(miniinfer_ops PROPERTIES
+set_target_properties(miniinfer_kernels PROPERTIES
     CUDA_ARCHITECTURES "80"  # 根据你的 GPU 调整
 )
 ```
