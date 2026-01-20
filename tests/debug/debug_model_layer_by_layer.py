@@ -1,8 +1,4 @@
 import torch
-import sys
-import os
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from transformers import AutoModelForCausalLM
 from miniinfer.config.model.qwen2 import Qwen2Config
 from miniinfer.loader.weight import load_hf_weight

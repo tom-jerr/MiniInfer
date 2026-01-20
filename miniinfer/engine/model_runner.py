@@ -19,7 +19,7 @@ from loader.weight import load_hf_weight
 from config.model.qwen2 import Qwen2Config
 from config.model.base import PretrainedConfig
 from models.fused_qwen2 import Qwen2Model
-from layers.sampler import Sampler
+from layers.sample import Sampler
 
 
 class ModelRunner:

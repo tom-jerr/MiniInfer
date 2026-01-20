@@ -1,16 +1,16 @@
 import pytest
 import torch
 
-from miniinfer import (
+from miniinfer.models.fused_qwen2 import (
     Qwen2Attention as UserQwen2Attention,
-)
-from miniinfer import (
     Qwen2Config as UserConfig,
 )
-from miniinfer import (
+from miniinfer.layers.attention import (
     causal_mask,
     get_attention,
 )
+
+from miniinfer.loader.weight import load_hf_weight
 
 from ..utils import *
 
@@ -204,7 +204,14 @@ def test_task_3_qwen2_grouped_query_attention(
         rope_theta=theta,
         max_position_embeddings=max_seq_len,
     )
-
+    w_q = torch.rand(hidden_size, hidden_size, dtype=dtype, device=dev)
+    w_k = torch.rand(hidden_size, hidden_size, dtype=dtype, device=dev)
+    w_v = torch.rand(hidden_size, hidden_size, dtype=dtype, device=dev)
+    w_o = torch.rand(hidden_size, hidden_size, dtype=dtype, device=dev)
+    state_dict = {
+        "random.qkv_proj.weight": torch.cat([w_q, w_k, w_v], dim=0),
+        "random.o_proj.weight": w_o,
+    }
     config._attn_implementation = "sdpa"  # 这里可以使用causal mask
     rotary_emb = Qwen2RotaryEmbedding(config)
     torch_attention = Qwen2Attention(config, layer_idx=0).to(device=dev, dtype=dtype)
