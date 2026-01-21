@@ -1,11 +1,13 @@
+from __future__ import annotations
 import math
 from collections.abc import Callable
 
 import torch
 import torch.nn as nn
-
+from typing import TYPE_CHECKING
 from .linear import linear, softmax
-from engine.scheduler_batch import ForwardBatch
+if TYPE_CHECKING:
+    from engine.scheduler_batch import ForwardBatch
 
 
 def scaled_dot_product_attention_simple(

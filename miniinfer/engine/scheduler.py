@@ -5,89 +5,81 @@ Scheduler - 单机版调度器
 1. 管理请求队列 (waiting, running, finished)
 2. 组织 batch (prefill-only / decode-only / mixed)
 3. 调用 KVCacheManager 分配 KV Cache
+4. 增量流式解码
 """
 
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import torch
 
-from .seqeunce import Sequence, SequenceStatus
-from .engine_config import Config
-
-
-class BatchType(Enum):
-    """Batch 类型"""
-
-    PREFILL_ONLY = auto()
-    DECODE_ONLY = auto()
-    MIXED = auto()
-
-
-@dataclass
-class ScheduledBatch:
-    """调度后的 Batch"""
-
-    batch_type: BatchType = BatchType.MIXED
-    sequences: List[Sequence] = field(default_factory=list)
-    prefill_seqs: List[Sequence] = field(default_factory=list)
-    decode_seqs: List[Sequence] = field(default_factory=list)
-
-    # Batch 输入数据
-    input_ids: Optional[torch.Tensor] = None  # [total_tokens]
-    position_ids: Optional[torch.Tensor] = None  # [total_tokens]
-
-    # 用于区分 prefill 和 decode
-    prefill_lens: List[int] = field(default_factory=list)
-    decode_lens: List[int] = field(default_factory=list)
-
-    @property
-    def is_empty(self) -> bool:
-        return len(self.sequences) == 0
-
-    @property
-    def num_prefill_tokens(self) -> int:
-        return sum(self.prefill_lens)
-
-    @property
-    def num_decode_tokens(self) -> int:
-        return len(self.decode_seqs)
-
+from miniinfer.config.engine.config import EngineConfig
+from miniinfer.kvcache.kv_cache_manager import KVCacheManager
+from miniinfer.engine.scheduler_batch import (
+    Req,
+    ScheduledBatch,
+    ForwardBatch,
+    BatchResult,
+)
 
 class Scheduler:
-    """
-    单机版调度器
 
-    简化版实现，不使用 KVCacheManager，直接使用 per-request cache
-    """
+    def __init__(
+        self,
+        config: EngineConfig,
+        tokenizer: Any,
+        kv_cache_mgr: KVCacheManager,
+    ):
+        """
+        初始化调度器
 
-    def __init__(self, config: Config):
-        self.config = config
+        Args:
+            config: 引擎配置
+            tokenizer: 分词器
+            kv_cache_mgr: KV Cache 管理器
+        """
+        self.engine_config = config
+        self.tokenizer = tokenizer
+        self.kv_cache_mgr = kv_cache_mgr
         self.max_batch_size = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_num_batched_tokens = getattr(config, 'max_num_batched_tokens', config.max_total_tokens)
 
         # 请求队列
-        self.waiting_queue: List[Sequence] = []
-        self.running_queue: List[Sequence] = []
-        self.finished_queue: List[Sequence] = []
+        self.waiting_queue: List[Req] = []
+        self.running_batch: ScheduledBatch = ScheduledBatch(reqs=[])
+        self.cur_batch: Optional[ScheduledBatch] = None
+        self.last_batch: Optional[ScheduledBatch] = None
+        self.num_retracted_reqs: int = 0
 
-        # 请求 ID 映射
-        self.seq_map: Dict[int, Sequence] = {}
+        # 已完成的请求
+        self.finished_reqs: List[Req] = []
 
-    def add(self, seq: Sequence):
+        # EOS token id
+        self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+
+
+    def step(self):
+        batch = self.schedule()
+        self.cur_batch = batch
+
+        result = self.run_batch(batch)
+        output_texts = self.process_batch_result(batch, result)
+        return output_texts
+
+    def add(self, req: Req):
         """添加新请求到等待队列"""
-        self.waiting_queue.append(seq)
-        self.seq_map[seq.seq_id] = seq
+        self.waiting_queue.append(req)
 
     def has_unfinished(self) -> bool:
         """检查是否有未完成的请求"""
-        return len(self.waiting_queue) > 0 or len(self.running_queue) > 0
+        return len(self.waiting_queue) > 0 or len(self.running_batch.reqs) > 0
 
     def get_num_unfinished(self) -> int:
         """获取未完成请求数量"""
-        return len(self.waiting_queue) + len(self.running_queue)
+        return len(self.waiting_queue) + len(self.running_batch.reqs)
 
-    def schedule(self) -> ScheduledBatch:
+    def schedule(self, device: torch.device) -> ScheduledBatch:
         """
         调度一个 batch
 
@@ -95,148 +87,135 @@ class Scheduler:
         1. 优先处理 running queue 中的 decode 请求
         2. 然后从 waiting queue 添加 prefill 请求
         """
-        batch = ScheduledBatch()
-
-        # 1. 添加 decode 请求 (running queue)
-        for seq in self.running_queue:
-            if len(batch.sequences) >= self.max_batch_size:
+        # TODO(lzy): care about OOM
+        running_bs = len(self.running_batch.reqs)
+        can_run_list = []
+        for req in self.waiting_queue:
+            if running_bs >= self.max_batch_size:
                 break
-            batch.decode_seqs.append(seq)
-            batch.sequences.append(seq)
-            batch.decode_lens.append(1)  # decode 每次只生成 1 个 token
+            self.kv_cache_mgr.prefix_for_waiting_req(req)
+            can_run_list.append(req)
+        self.waiting_queue = [
+            req for req in self.waiting_queue if req not in can_run_list
+        ]
+        new_batch = ScheduledBatch.init_new(can_run_list, device=device)
+        self.kv_cache_mgr.prepare_for_extend(new_batch)
+        if new_batch is not None:
+            new_batch.debug_metadata()
+            return new_batch
+        # decode batch process
+        self._filter_batch(self.running_batch)
+        self.kv_cache_mgr.prepare_for_decode(self.running_batch)
+        self.running_batch.debug_metadata()
+        return self.running_batch if self.running_batch is not None else None
 
-        # 2. 添加 prefill 请求 (waiting queue)
-        prefill_budget = self.max_batch_size - len(batch.sequences)
-        token_budget = self.max_num_batched_tokens - batch.num_decode_tokens
+    def _filter_batch(self, batch: ScheduledBatch):
+        """过滤掉已完成的请求"""
+        batch.reqs = [req for req in batch.reqs if req.finished is False]
 
-        new_waiting = []
-        for seq in self.waiting_queue:
-            if len(batch.prefill_seqs) >= prefill_budget:
-                new_waiting.append(seq)
-                continue
+    def run_batch(self, batch: ScheduledBatch) -> Any:
+        forward_batch = ForwardBatch.init_new(batch)
+        out = self.modelrunner.forward(forward_batch)
+        logits_output = out.logits
+        next_token_ids = self.modelrunner.sample(logits_output, forward_batch)
 
-            prefill_len = seq.num_tokens - seq.num_cached_tokens
-            if batch.num_prefill_tokens + prefill_len > token_budget:
-                new_waiting.append(seq)
-                continue
+        return BatchResult(
+            logits=logits_output,
+            next_token_ids=next_token_ids,
+        )
 
-            batch.prefill_seqs.append(seq)
-            batch.sequences.append(seq)
-            batch.prefill_lens.append(prefill_len)
-            seq.status = SequenceStatus.RUNNING
-
-        self.waiting_queue = new_waiting
-
-        # 确定 batch 类型
-        if batch.prefill_seqs and not batch.decode_seqs:
-            batch.batch_type = BatchType.PREFILL_ONLY
-        elif batch.decode_seqs and not batch.prefill_seqs:
-            batch.batch_type = BatchType.DECODE_ONLY
-        else:
-            batch.batch_type = BatchType.MIXED
-
-        # 准备输入数据
-        if not batch.is_empty:
-            self._prepare_batch_inputs(batch)
-
-        return batch
-
-    def _prepare_batch_inputs(self, batch: ScheduledBatch):
-        """准备 batch 的输入 tensor"""
-        all_input_ids = []
-        all_position_ids = []
-
-        # Prefill 请求: 输入完整的 prompt tokens
-        for seq in batch.prefill_seqs:
-            start_pos = seq.num_cached_tokens
-            input_ids = seq.token_ids[start_pos:]
-            positions = list(range(start_pos, seq.num_tokens))
-
-            all_input_ids.extend(input_ids)
-            all_position_ids.extend(positions)
-
-        # Decode 请求: 只输入最后一个 token
-        for seq in batch.decode_seqs:
-            all_input_ids.append(seq.last_token)
-            all_position_ids.append(seq.num_tokens - 1)
-
-        if all_input_ids:
-            batch.input_ids = torch.tensor(all_input_ids, dtype=torch.long)
-            batch.position_ids = torch.tensor(all_position_ids, dtype=torch.long)
-
-    def update_after_step(
-        self,
-        batch: ScheduledBatch,
-        next_tokens: List[int],
-        eos_token_id: int,
-    ) -> List[Tuple[int, List[int]]]:
+    def process_batch_result(
+        self, batch: ScheduledBatch, result: BatchResult
+    ) -> List[str]:
         """
-        模型推理后更新状态
+        处理批次推理结果
+
+        对每个请求进行增量解码，更新请求状态，处理完成的请求。
 
         Args:
-            batch: 当前 batch
-            next_tokens: 生成的 token 列表
-            eos_token_id: EOS token ID
+            batch: 调度的批次
+            result: 批次推理结果，包含 logits 和 next_token_ids
+        """
+        if batch is None or len(batch.reqs) == 0:
+            return
+
+        next_token_ids = result.next_token_ids
+
+        # 确保 next_token_ids 在 CPU 上
+        if isinstance(next_token_ids, torch.Tensor):
+            next_token_ids = next_token_ids.cpu().tolist()
+
+        output_texts = []
+        # 处理每个请求
+        finished_req_ids = []
+        for i, req in enumerate(batch.reqs):
+            token_id = next_token_ids[i]
+
+            # 将新 token 添加到请求的输出
+            req.output_ids.append(token_id)
+
+            # 增量解码
+            delta_text, is_finished = self.incremental_decoder.decode(
+                req_id=req.req_id,
+                token_id=token_id,
+                eos_token_id=self.eos_token_id,
+            )
+            output_texts.append(delta_text)
+
+            # 检查是否达到最大 token 数
+            if len(req.output_ids) >= req.max_tokens:
+                is_finished = True
+                # 刷新剩余的 pending 文本
+                remaining = self.incremental_decoder.flush(req.req_id)
+                if remaining:
+                    output_texts[-1] += remaining
+
+            # 更新请求状态
+            if is_finished:
+                req.finished = True
+                if token_id == self.eos_token_id:
+                    req.finished_reason = "eos"
+                else:
+                    req.finished_reason = "max_tokens"
+                finished_req_ids.append(req.req_id)
+
+        # 处理完成的请求
+        self._handle_finished_requests(batch, finished_req_ids)
+        return output_texts
+
+    def _handle_finished_requests(
+        self, batch: ScheduledBatch, finished_req_ids: List[int]
+    ):
+        """
+        处理已完成的请求
+
+        将完成的请求从 running batch 移动到 finished 列表，
+        并清理相关的 KV cache 和解码状态。
+        """
+        if not finished_req_ids:
+            return
+
+        finished_req_id_set = set(finished_req_ids)
+
+        for req in batch.reqs:
+            if req.req_id in finished_req_id_set:
+                # 添加到完成列表
+                self.finished_reqs.append(req)
+
+                # 清理 KV cache
+                self.kv_cache_mgr.release_request(req)
+
+                # 清理解码状态
+                self.incremental_decoder.cleanup(req.req_id)
+
+    def get_request_output(self, req_id: int) -> Optional[str]:
+        """
+        获取指定请求的完整输出文本
+
+        Args:
+            req_id: 请求 ID
 
         Returns:
-            完成的请求列表 [(seq_id, token_ids), ...]
+            完整的输出文本，如果请求不存在则返回 None
         """
-        finished_outputs = []
-
-        # 分配 token 到对应的 sequence
-        token_idx = 0
-
-        # Prefill 请求: 移到 running queue
-        for seq in batch.prefill_seqs:
-            next_token = next_tokens[token_idx]
-            token_idx += 1
-
-            seq.append_token(next_token)
-            seq.num_cached_tokens = seq.num_tokens - 1  # 标记已缓存
-
-            # 检查是否完成
-            if self._check_finished(seq, next_token, eos_token_id):
-                seq.status = SequenceStatus.FINISHED
-                self.finished_queue.append(seq)
-                finished_outputs.append((seq.seq_id, seq.token_ids))
-            else:
-                self.running_queue.append(seq)
-
-        # Decode 请求: 更新并检查完成
-        new_running = []
-        for seq in batch.decode_seqs:
-            next_token = next_tokens[token_idx]
-            token_idx += 1
-
-            seq.append_token(next_token)
-            seq.num_cached_tokens = seq.num_tokens - 1
-
-            if self._check_finished(seq, next_token, eos_token_id):
-                seq.status = SequenceStatus.FINISHED
-                self.finished_queue.append(seq)
-                finished_outputs.append((seq.seq_id, seq.token_ids))
-                # 从 running queue 移除
-                self.running_queue.remove(seq)
-            # 否则保留在 running_queue
-
-        return finished_outputs
-
-    def _check_finished(self, seq: Sequence, token: int, eos_token_id: int) -> bool:
-        """检查请求是否完成"""
-        # 达到最大长度
-        if seq.num_completion_tokens >= seq.max_tokens:
-            return True
-
-        # 遇到 EOS (除非设置了 ignore_eos)
-        if token == eos_token_id and not seq.ignore_eos:
-            return True
-
-        return False
-
-    def get_finished(self) -> List[Sequence]:
-        """获取所有已完成的请求"""
-        return self.finished_queue.copy()
-
-    def clear_finished(self):
-        """清空已完成队列"""
-        self.finished_queue.clear()
+        return self.incremental_decoder.get_full_text(req_id)

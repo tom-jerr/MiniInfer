@@ -2,25 +2,24 @@ from typing import Any, Dict, Optional
 
 from engine.scheduler_batch import ForwardBatch
 
-from ..layers.embedding import VocabEmbedding
-from ..loader.weight import WeightLoaderMixin
 from .base import BaseModelOutput
 import torch
 import torch.nn as nn
 from kernels.triton.silu_mul import SiluAndMul
-from kernels.triton.rms_norm import rms_norm_forward, add_rms_norm_forward
-from ..layers.attention import AttentionImpl
+from miniinfer.layers.attention import AttentionImpl
 
-from ..layers import (
+from miniinfer.layers import (
+    AttentionImpl,
     LMHead,
     RMSNorm,
     RotaryEmbedding,
+    VocabEmbedding,
     get_activation,
     get_attention,
     linear,
 )
-from ..utils.quantize import dequantize_linear
-from ..config.model.qwen2 import Qwen2Config
+from miniinfer.config.model.qwen2 import Qwen2Config
+from miniinfer.loader.weight import WeightLoaderMixin
 
 
 class Qwen2Attention(nn.Module, WeightLoaderMixin):

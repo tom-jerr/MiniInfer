@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // 配置 1: 调试当前打开的 Python 文件
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args":[
+              "--model", "Qwen/Qwen2-0.5B-Instruct",
+            ],
+            "justMyCode": true
+        },
+        {
+            // 配置 2: 附加到正在运行的 Python 进程 (Attach by PID)
+            "name": "Python: Attach to Process",
+            "type": "debugpy",
+            "request": "attach",
+            "processId": "${command:pickProcess}",
+            "justMyCode": true
+        }
+    ]
+}

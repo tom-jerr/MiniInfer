@@ -49,7 +49,10 @@ class ITokenAllocator(ABC):
 
 class IRequestPool(ABC):
     """请求池接口"""
-
+    @abstractmethod
+    def req_to_token_pool(self)->Any:
+        pass
+    
     @abstractmethod
     def alloc(self, num_reqs: int) -> Optional[List[int]]:
         """分配请求槽位"""
@@ -80,8 +83,8 @@ class IPrefixCache(ABC):
         pass
 
     @abstractmethod
-    def insert(self, key: List[int], value=None):
-        """插入新的前缀"""
+    def insert(self, key: List[int], value=None)->int:
+        """插入新的前缀，返回新前缀长度"""
         pass
 
     @abstractmethod

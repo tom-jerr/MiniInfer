@@ -132,8 +132,6 @@ class RadixCache(IPrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def inc_lock_ref(self, node: TreeNode):
-        if self.disable:
-            return 0
 
         delta = 0
         while node != self.root_node:
@@ -146,8 +144,6 @@ class RadixCache(IPrefixCache):
         return delta
 
     def dec_lock_ref(self, node: TreeNode):
-        if self.disable:
-            return 0
 
         delta = 0
         while node != self.root_node:
@@ -281,16 +277,6 @@ class RadixCache(IPrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.evictable_size_ -= len(node.key)
-
-    def inc_lock_ref(self, node):
-        while node and node != self.root:
-            node.lock_ref += 1
-            node = node.parent
-
-    def dec_lock_ref(self, node):
-        while node and node != self.root:
-            node.lock_ref -= 1
-            node = node.parent
 
 
 if __name__ == "__main__":

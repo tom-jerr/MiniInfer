@@ -106,6 +106,9 @@ class RequestPool(IRequestPool):
         )
         self.free_slots = list(range(max_requests))
 
+    def req_to_token_pool(self):
+        return self.req_to_token
+    
     def alloc(self, num_reqs: int) -> Optional[List[int]]:
         if num_reqs > len(self.free_slots):
             return None

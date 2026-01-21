@@ -324,3 +324,4 @@ def create_simple_forward_batch(
     batch.attn_backend = NaiveAttnBackend(use_causal_mask=use_causal_mask)
 
     return batch
+
