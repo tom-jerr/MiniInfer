@@ -361,7 +361,7 @@ class AttentionImpl(nn.Module):
         k,
         v,
         forward_batch: ForwardBatch,
-        save_kv_cache: bool = False,
+        save_kv_cache: bool = True,
         **kwargs,
     ):
 

@@ -20,7 +20,7 @@ Usage:
 import atexit
 import logging
 import uuid
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from time import perf_counter
 from typing import List, Optional, Union, Dict, Any, Iterator, Generator
 from tqdm.auto import tqdm
@@ -34,6 +34,7 @@ from miniinfer.config.engine.config import EngineConfig
 from .model_runner import ModelRunner
 from .scheduler import Scheduler
 from .scheduler_batch import Req, ScheduledBatch, ForwardBatch, BatchResult
+
 # from .process_controller import ProcessController
 # from .ipc.zmq_channel import create_socket, send_pyobj, recv_pyobj
 # from .ipc.protocol import Request, Response, MessageType, GenerateRequest
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RequestOutput:
     """单个请求的输出结果"""
+
     request_id: int
     delta_text: str
     full_text: str
@@ -55,13 +57,17 @@ class RequestOutput:
     finish_reason: Optional[str] = None
 
 
-@dataclass 
+@dataclass
 class StepOutput:
     """单步推理的输出"""
+
     outputs: List[RequestOutput]
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
-    
+    # When this step runs a prefill/extend batch, expose per-request cache stats.
+    prefill_prefix_lens: Dict[int, int] = field(default_factory=dict)
+    prefill_extend_lens: Dict[int, int] = field(default_factory=dict)
+
     @property
     def has_output(self) -> bool:
         return len(self.outputs) > 0
@@ -95,15 +101,104 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = EngineConfig(model, **config_kwargs)
 
+        # Prompt formatting (chat template) config.
+        # - True: always use tokenizer.apply_chat_template when available
+        # - False: never use chat template (raw text completion)
+        # - "auto": enable for likely chat/instruct models
+        self.use_chat_template = kwargs.get("use_chat_template", "auto")
+        self.system_prompt = kwargs.get("system_prompt", "You are a helpful assistant.")
+        self.debug = bool(kwargs.get("debug", True))
+        self.debug_logit_topk = int(kwargs.get("debug_logit_topk", 5))
+
         self.use_multiprocess = use_multiprocess
         self._started = False
 
         if use_multiprocess:
-           pass 
+            pass
         else:
             self._init_single_process_mode()
 
         atexit.register(self.stop)
+
+    def _debug_print_topk_next_tokens(
+        self, logits: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        topk = self.debug_logit_topk
+        if topk <= 0:
+            return
+        if logits is None:
+            return
+
+        with torch.no_grad():
+            if forward_batch.forward_mode.is_extend():
+                extend_lens = forward_batch.extend_seq_lens_cpu or []
+                last_token_indices: List[int] = []
+                cumsum = 0
+                for length in extend_lens:
+                    last_token_indices.append(cumsum + int(length) - 1)
+                    cumsum += int(length)
+                if not last_token_indices:
+                    return
+                idx = torch.tensor(last_token_indices, device=logits.device)
+                logits_for_sampling = logits[idx]
+            else:
+                logits_for_sampling = logits
+
+            k = min(int(topk), int(logits_for_sampling.shape[-1]))
+            top_vals, top_ids = torch.topk(logits_for_sampling, k=k, dim=-1)
+
+            for i, req in enumerate(forward_batch.all_seqs):
+                candidates = []
+                for val, tid in zip(top_vals[i].tolist(), top_ids[i].tolist()):
+                    text = self.tokenizer.decode([int(tid)], skip_special_tokens=False)
+                    candidates.append((int(tid), val, repr(text)))
+                print(
+                    "req=%s top%d next_token candidates: %s", req.req_id, k, candidates
+                )
+
+    def _should_apply_chat_template(self) -> bool:
+        if self.use_chat_template is True:
+            return hasattr(self.tokenizer, "apply_chat_template")
+        if self.use_chat_template is False:
+            return False
+        # auto
+        if not hasattr(self.tokenizer, "apply_chat_template"):
+            return False
+        model_name = str(getattr(self.config, "model", "")).lower()
+        return ("instruct" in model_name) or ("chat" in model_name)
+
+    def _encode_prompt(self, prompt: str) -> List[int]:
+        """
+        Encode a user prompt into token ids.
+
+        For chat/instruct models, use the tokenizer chat template (when available)
+        so the model sees the expected system/user/assistant framing.
+        """
+        if self._should_apply_chat_template():
+            messages = []
+            if self.system_prompt:
+                messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            try:
+                encoded = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+                if isinstance(encoded, torch.Tensor):
+                    return encoded.tolist()
+                if isinstance(encoded, dict) and "input_ids" in encoded:
+                    ids = encoded["input_ids"]
+                    if isinstance(ids, torch.Tensor):
+                        return ids.tolist()
+                    return list(ids)
+                return list(encoded)
+            except Exception as e:
+                logger.warning(
+                    "apply_chat_template failed (%s); falling back to tokenizer.encode",
+                    e,
+                )
+        return self.tokenizer.encode(prompt)
 
     def _init_single_process_mode(self):
         """初始化单进程模式"""
@@ -126,9 +221,12 @@ class LLMEngine:
             max_requests=config.max_num_seqs,
             max_context_len=config.max_context_len,
             num_layers=config.hf_config.num_hidden_layers,
-            num_heads=config.hf_config.num_attention_heads,
+            num_heads=config.hf_config.num_key_value_heads,  # 使用 KV head 数量，支持 GQA
             head_dim=config.hf_config.hidden_size
             // config.hf_config.num_attention_heads,
+            # 传递显存预算相关配置
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            max_num_batched_tokens=config.max_num_batched_tokens,
         )
         # Model Runner (rank 0)
         self.model_runner = ModelRunner(self.config, self.kv_cache_mgr, 0, self.events)
@@ -147,13 +245,16 @@ class LLMEngine:
         self.config.eos = self.tokenizer.eos_token_id
 
         # Scheduler (传入 tokenizer 和 model_runner)
-        self.scheduler = Scheduler(
-            self.config, 
-            self.tokenizer, 
-            self.kv_cache_mgr
-        )
-        
+        self.scheduler = Scheduler(self.config, self.tokenizer, self.kv_cache_mgr)
+
         self._started = True
+
+        # 打印内存预算信息
+        logger.info(
+            f"Memory budget initialized: "
+            f"max_num_batched_tokens={config.max_num_batched_tokens}, "
+            f"gpu_memory_utilization={config.gpu_memory_utilization}"
+        )
 
     def start(self):
         """启动引擎 (多进程模式)"""
@@ -184,7 +285,7 @@ class LLMEngine:
         else:
             # 单进程模式
             if hasattr(self, "model_runner"):
-                self.model_runner.call("exit")
+                # ModelRunner currently has no IPC; just drop the reference
                 del self.model_runner
 
             for p in self.ps:
@@ -215,7 +316,7 @@ class LLMEngine:
             sampling_params = SamplingParams()
 
         if isinstance(prompt, str):
-            token_ids = self.tokenizer.encode(prompt)
+            token_ids = self._encode_prompt(prompt)
         else:
             token_ids = prompt
 
@@ -245,9 +346,10 @@ class LLMEngine:
 
         # 2. 执行 forward
         forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
-        model_output = self.model_runner.forward(forward_batch)
-        logits = model_output.logits
-
+        output = self.model_runner.forward(forward_batch)
+        logits = output.logits
+        # if self.debug_logit_topk > 0:
+        # self._debug_print_topk_next_tokens(logits, forward_batch)
         # 3. 采样
         next_tokens = self.model_runner.sample(logits, forward_batch)
 
@@ -258,21 +360,29 @@ class LLMEngine:
         # 5. 统计 token 数
         num_prefill = 0
         num_decode = 0
+        prefill_prefix_lens: Dict[int, int] = {}
+        prefill_extend_lens: Dict[int, int] = {}
         if batch.forward_mode.is_extend():
             num_prefill = sum(batch.extend_lens) if batch.extend_lens else 0
+            if batch.prefix_lens and batch.extend_lens:
+                for req, pre_len, ext_len in zip(
+                    batch.reqs, batch.prefix_lens, batch.extend_lens
+                ):
+                    prefill_prefix_lens[int(req.req_id)] = int(pre_len)
+                    prefill_extend_lens[int(req.req_id)] = int(ext_len)
         elif batch.forward_mode.is_decode():
             num_decode = len(batch.reqs)
-        
+
         return StepOutput(
             outputs=outputs,
             num_prefill_tokens=num_prefill,
             num_decode_tokens=num_decode,
+            prefill_prefix_lens=prefill_prefix_lens,
+            prefill_extend_lens=prefill_extend_lens,
         )
 
     def _process_step_result(
-        self, 
-        batch: ScheduledBatch, 
-        result: BatchResult
+        self, batch: ScheduledBatch, result: BatchResult
     ) -> List[RequestOutput]:
         """
         处理单步推理结果，返回每个请求的增量输出
@@ -292,21 +402,23 @@ class LLMEngine:
             req.output_ids.append(token_id)
 
             # 增量解码
-            delta_text, is_eos = self.scheduler.incremental_decoder.decode(
+            delta_text, is_eos = self.detokenizer.decode(
                 req_id=req.req_id,
                 token_id=token_id,
                 eos_token_id=self.scheduler.eos_token_id,
             )
 
             # 检查是否达到最大 token 数
+            if req.ignore_eos:
+                is_eos = False
             is_finished = is_eos or len(req.output_ids) >= req.max_tokens
             finish_reason = None
 
             if is_finished:
                 # 刷新剩余文本
-                remaining = self.scheduler.incremental_decoder.flush(req.req_id)
+                remaining = self.detokenizer.flush(req.req_id)
                 delta_text += remaining
-                
+
                 req.finished = True
                 if is_eos:
                     finish_reason = "eos"
@@ -317,17 +429,19 @@ class LLMEngine:
                 finished_req_ids.append(req.req_id)
 
             # 获取完整文本
-            full_text = self.scheduler.incremental_decoder.get_full_text(req.req_id)
+            full_text = self.detokenizer.get_full_text(req.req_id)
 
-            outputs.append(RequestOutput(
-                request_id=req.req_id,
-                delta_text=delta_text,
-                full_text=full_text,
-                token_id=token_id,
-                output_token_ids=req.output_ids.copy(),
-                finished=is_finished,
-                finish_reason=finish_reason,
-            ))
+            outputs.append(
+                RequestOutput(
+                    request_id=req.req_id,
+                    delta_text=delta_text,
+                    full_text=full_text,
+                    token_id=token_id,
+                    output_token_ids=req.output_ids.copy(),
+                    finished=is_finished,
+                    finish_reason=finish_reason,
+                )
+            )
 
         # 处理完成的请求
         self.scheduler._handle_finished_requests(batch, finished_req_ids)
@@ -342,7 +456,7 @@ class LLMEngine:
         """
         流式生成接口（生成器）
 
-        每次 yield 一个请求的增量输出。可以在生成过程中通过 
+        每次 yield 一个请求的增量输出。可以在生成过程中通过
         add_request() 添加新请求，新请求会被自动纳入调度。
 
         Args:
@@ -351,7 +465,7 @@ class LLMEngine:
 
         Yields:
             RequestOutput: 每个请求的增量输出
-        
+
         Example:
             >>> for output in engine.stream_generate(["Hello", "World"]):
             ...     print(f"[{output.request_id}] {output.delta_text}", end="")
@@ -364,7 +478,11 @@ class LLMEngine:
         # 归一化输入
         if isinstance(prompts, str):
             prompts = [prompts]
-        elif isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], int):
+        elif (
+            isinstance(prompts, list)
+            and len(prompts) > 0
+            and isinstance(prompts[0], int)
+        ):
             prompts = [prompts]  # 单个 token ids 列表
 
         if sampling_params is None:
@@ -379,7 +497,7 @@ class LLMEngine:
         # 持续推理直到所有请求完成
         while self.scheduler.has_unfinished():
             step_output = self.step()
-            
+
             for output in step_output.outputs:
                 yield output
 
@@ -416,7 +534,7 @@ class LLMEngine:
         # 收集结果
         results: Dict[int, Dict[str, Any]] = {}
         request_ids = []
-        
+
         prefill_throughput = decode_throughput = 0.0
 
         # 使用流式生成收集结果
@@ -453,9 +571,9 @@ class LLMEngine:
         """
         if request_id not in self._request_map:
             return {"status": "not_found", "request_id": request_id}
-        
+
         req = self._request_map[request_id]
-        
+
         if req.finished:
             status = "finished"
         elif req in self.scheduler.running_batch.reqs:
@@ -464,7 +582,7 @@ class LLMEngine:
             status = "waiting"
         else:
             status = "unknown"
-        
+
         return {
             "status": status,
             "request_id": request_id,

@@ -231,8 +231,12 @@ class Qwen2Model(nn.Module, WeightLoaderMixin):
         ).to(device)
 
         self.layers = nn.ModuleList()
-        for _ in range(config.num_hidden_layers):
-            layer = Qwen2TransformerBlock(config=config).to(device).to(precision)
+        for layer_id in range(config.num_hidden_layers):
+            layer = (
+                Qwen2TransformerBlock(config=config, layer_id=layer_id)
+                .to(device)
+                .to(precision)
+            )
             self.layers.append(layer)
 
         self.norm = RMSNorm(dim=config.hidden_size, eps=config.rms_norm_eps).to(device)
@@ -266,11 +270,18 @@ class Qwen2Model(nn.Module, WeightLoaderMixin):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.embedding(input_ids)
+        all_hidden_states = [] if return_hidden_states else None
 
         residual = None
         for layer in self.layers:
+            if return_hidden_states:
+                # Post-residual layer output: x2 = residual (x1) + mlp_out
+                all_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -282,6 +293,10 @@ class Qwen2Model(nn.Module, WeightLoaderMixin):
             hidden_states = self.norm(hidden_states + residual)
         else:
             hidden_states = self.norm(hidden_states)
+
+        if return_hidden_states:
+            # attention: do not contain the last layer hidden_states
+            return hidden_states, all_hidden_states
 
         return hidden_states
 
@@ -322,12 +337,12 @@ class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
 
     def load_weights(self, state_dict: Dict[str, torch.Tensor]) -> None:
         device, dtype = self.device, self.precision
-        has_model_prefix = "model.embed_tokens.weight" in state_dict
-        p = "model." if has_model_prefix else ""
 
         self.qwen2.load_weights(state_dict)
 
-        self.lm_head.load_weights(state_dict, f"{p}lm_head", device, dtype)
+        # HF causal-LM checkpoints usually store the output head as `lm_head.weight`
+        # at the root, not under `model.`. We try that first for correctness.
+        self.lm_head.load_weights(state_dict, "lm_head", device, dtype)
 
     @torch.no_grad()
     def forward(
@@ -335,16 +350,25 @@ class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        return_hidden_states: bool = False,
     ) -> BaseModelOutput:
-        hidden_states = self.qwen2(
+        qwen_out = self.qwen2(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
+            return_hidden_states=return_hidden_states,
         )
+
+        if return_hidden_states:
+            hidden_states, all_hidden_states = qwen_out
+        else:
+            hidden_states = qwen_out
+            all_hidden_states = None
 
         logits = self.lm_head(hidden_states)
 
         return BaseModelOutput(
             logits=logits,
             last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
         )

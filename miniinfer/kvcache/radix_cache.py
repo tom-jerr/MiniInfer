@@ -58,6 +58,9 @@ class RadixCache(IPrefixCache):
         self.root = TreeNode()
         self.page_size = page_size
         self.root.lock_ref = 1  # 根节点永不驱逐
+        # keep legacy references used elsewhere
+        self.root_node = self.root
+        self.protected_size_ = 0
         self.token_allocator = token_allocator
         self.time_counter = 0
         self.evictable_size_ = 0

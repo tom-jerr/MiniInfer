@@ -37,6 +37,27 @@ class ITokenAllocator(ABC):
         pass
 
     @abstractmethod
+    def alloc_pages_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        pass
+
+    @abstractmethod
+    def alloc_pages_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        pass
+
+    @abstractmethod
     def free(self, indices: torch.Tensor):
         """释放 KV cache 位置"""
         pass
@@ -49,10 +70,11 @@ class ITokenAllocator(ABC):
 
 class IRequestPool(ABC):
     """请求池接口"""
+
     @abstractmethod
-    def req_to_token_pool(self)->Any:
+    def req_to_token_pool(self) -> Any:
         pass
-    
+
     @abstractmethod
     def alloc(self, num_reqs: int) -> Optional[List[int]]:
         """分配请求槽位"""
@@ -83,7 +105,7 @@ class IPrefixCache(ABC):
         pass
 
     @abstractmethod
-    def insert(self, key: List[int], value=None)->int:
+    def insert(self, key: List[int], value=None) -> int:
         """插入新的前缀，返回新前缀长度"""
         pass
 

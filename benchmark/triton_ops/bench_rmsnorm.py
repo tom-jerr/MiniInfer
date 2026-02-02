@@ -12,7 +12,7 @@ torch._dynamo.config.cache_size_limit = 64
 # Add the project root to sys.path to allow imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from triton_kernels.rms_norm import rms_norm_forward, add_rms_norm_forward
+from kernels.triton.rms_norm import rms_norm_forward, add_rms_norm_forward
 from miniinfer.layers.layernorm import RMSNorm as PyTorchRMSNorm
 
 

@@ -13,7 +13,7 @@ torch._dynamo.config.cache_size_limit = 64
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from triton_kernels.silu_mul import silu_and_mul_forward
+from kernels.triton.silu_mul import SiluAndMul
 
 
 def test_silu_mul_correctness():
@@ -31,7 +31,7 @@ def test_silu_mul_correctness():
     pt_out = F.silu(gate) * value
 
     # Triton implementation
-    tri_out = silu_and_mul_forward(x)
+    tri_out = SiluAndMul.silu_and_mul_forward(x)
 
     # Compare
     if torch.allclose(tri_out, pt_out, atol=1e-2, rtol=1e-2):
@@ -57,7 +57,7 @@ def run_benchmark_core(M, N, provider):
         )
     elif provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: silu_and_mul_forward(x), quantiles=quantiles
+            lambda: SiluAndMul(x), quantiles=quantiles
         )
 
     return ms, min_ms, max_ms

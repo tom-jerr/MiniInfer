@@ -11,8 +11,13 @@ KV Cache Manager 单元测试
 
 import pytest
 import torch
-import sys
-from kvcache.memory_pool import TokenAllocator, RequestPool, MHAKVCacheStorage
+from engine.scheduler_batch import Req, ScheduledBatch
+from kvcache.memory_pool import (
+    TokenAllocator,
+    RequestPool,
+    MHAKVCacheStorage,
+    PagedTokenAllocator,
+)
 from kvcache.radix_cache import RadixCache
 from kvcache.kv_cache_manager import KVCacheManager
 
@@ -251,168 +256,298 @@ class TestRadixCache:
 
 
 # ============== KVCacheManager 集成测试 ==============
-class TestKVCacheManager:
-    """测试完整的 KV Cache 管理器"""
+PAGE_SIZE = 256
 
-    @pytest.fixture
-    def manager(self):
-        """创建测试用的 manager"""
+
+@pytest.fixture
+def paged_manager_factory():
+    """Provide a KVCacheManager factory using Triton kernels (requires CUDA)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton allocator tests")
+
+    def _factory(*, enable_prefix_cache: bool = True, size: int = PAGE_SIZE * 4) -> KVCacheManager:
         return KVCacheManager(
-            size=1000,
-            max_requests=10,
-            max_context_len=512,
-            num_layers=2,
-            num_heads=4,
-            head_dim=32,
-            dtype=torch.float16,
-            device=DEVICE,
-            enable_prefix_cache=True,
-            page_size=1,
+            size=size,
+            max_requests=8,
+            max_context_len=1024,
+            num_layers=1,
+            num_heads=1,
+            head_dim=8,
+            dtype=torch.float32,
+            device="cuda",
+            enable_prefix_cache=enable_prefix_cache,
+            page_size=PAGE_SIZE,
         )
 
-    def test_initialization(self, manager):
-        """测试初始化"""
-        assert manager.available_tokens() == 1000
-        assert manager.can_allocate(100)
-        assert manager.can_allocate(1000)
-        assert not manager.can_allocate(1001)
+    return _factory
 
-    def test_request_lifecycle(self, manager):
-        """测试请求生命周期: 分配 -> 使用 -> 释放"""
-        # 1. 分配请求槽位
-        req_idx = manager.alloc_request()
-        assert req_idx is not None
 
-        # 2. 为请求分配 KV cache
-        token_ids = [1, 2, 3, 4, 5]
-        kv_indices, num_cached = manager.alloc_for_request(
-            req_idx=req_idx,
-            token_ids=token_ids,
-            num_new_tokens=5,
+@pytest.fixture
+def paged_allocator():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton allocator tests")
+    return PagedTokenAllocator(size=PAGE_SIZE * 4, page_size=PAGE_SIZE, device="cuda")
+
+
+def _print_pages(label: str, out: torch.Tensor, page_size: int = PAGE_SIZE):
+    """Print page-wise view with zero padding for unused slots."""
+    page_ids = torch.unique(out // page_size).tolist()
+    print(f"[{label}] pages_used={len(page_ids)}, page_ids={page_ids}")
+    for pid in page_ids:
+        mask = (out // page_size) == pid
+        locs = out[mask]
+        page_view = torch.zeros(page_size, dtype=torch.int64)
+        offsets = (locs % page_size).to(torch.int64)
+        page_view[offsets] = locs.to(torch.int64)
+        print(f"  page {pid}: {page_view.tolist()}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton allocator")
+class TestPagedTokenAllocator:
+    def test_extend_across_pages(self, paged_allocator: PagedTokenAllocator):
+        prefix_lens = torch.tensor([0], dtype=torch.int64, device=DEVICE)
+        seq_lens = torch.tensor([PAGE_SIZE + 44], dtype=torch.int64, device=DEVICE)
+        last_loc = torch.tensor([-1], dtype=torch.int64, device=DEVICE)
+        out = paged_allocator.alloc_pages_extend(
+            prefix_lens, prefix_lens.cpu(), seq_lens, seq_lens.cpu(), last_loc, int(seq_lens.item())
         )
 
-        assert kv_indices is not None
-        assert len(kv_indices) == 5
-        assert num_cached == 0  # 第一次没有缓存
-        assert manager.available_tokens() == 995
+        assert out.numel() == PAGE_SIZE + 44
+        page_ids = out // PAGE_SIZE
+        assert torch.unique(page_ids).numel() == 2
+        assert (page_ids == page_ids[0]).sum().item() == PAGE_SIZE
+        assert (page_ids == page_ids[-1]).sum().item() == 44
+        assert paged_allocator.available_size() == 2 * PAGE_SIZE  # two pages consumed
+        _print_pages("alloc_extend_two_pages", out.cpu())
 
-        # 3. 释放请求
-        manager.release_request(
-            req_idx=req_idx,
-            token_ids=token_ids,
-            num_tokens=5,
-            cache_to_radix=True,
+    def test_extend_fills_partial_page_before_new(self, paged_allocator: PagedTokenAllocator):
+        # simulate pages 1 & 2 already in use
+        paged_allocator.free_pages = paged_allocator.free_pages[2:]
+
+        prefix_lens = torch.tensor([PAGE_SIZE + 10], dtype=torch.int64, device=DEVICE)
+        seq_lens = torch.tensor([PAGE_SIZE + 20], dtype=torch.int64, device=DEVICE)
+        last_loc = torch.tensor([PAGE_SIZE * 2 + 10 - 1], dtype=torch.int64, device=DEVICE)  # page 2, offset 9
+        out = paged_allocator.alloc_pages_extend(
+            prefix_lens, prefix_lens.cpu(), seq_lens, seq_lens.cpu(), last_loc, 10
         )
 
-        # KV cache 被缓存到 radix tree，不会立即释放
-        # 请求槽位被释放
+        assert torch.unique(out // PAGE_SIZE).tolist() == [2]
+        assert (out // PAGE_SIZE == 2).sum().item() == 10
+        assert paged_allocator.available_size() == 2 * PAGE_SIZE  # no new page consumed
+        _print_pages("alloc_extend_partial_page", out.cpu())
 
-    def test_prefix_cache_hit(self, manager):
-        """测试前缀缓存命中"""
-        # 第一个请求
-        req_idx1 = manager.alloc_request()
-        token_ids1 = [1, 2, 3, 4, 5]
-        kv_indices1, num_cached1 = manager.alloc_for_request(
-            req_idx=req_idx1,
-            token_ids=token_ids1,
-            num_new_tokens=5,
-        )
-        assert num_cached1 == 0
+    def test_extend_from_existing_partial_page_print(self, paged_allocator: PagedTokenAllocator):
+        # Simulate prefix occupying page 1 (remove it from free list)
+        paged_allocator.free_pages = paged_allocator.free_pages[1:]
 
-        # 释放请求 (缓存到 radix tree)
-        manager.release_request(
-            req_idx=req_idx1,
-            token_ids=token_ids1,
-            num_tokens=5,
-            cache_to_radix=True,
-        )
+        prefix_len = PAGE_SIZE - 10  # leave 10 slots unused on page 1
+        seq_len = prefix_len + 30  # fill remaining 10 + 20 into a new page
+        prefix_lens = torch.tensor([prefix_len], dtype=torch.int64, device=DEVICE)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=DEVICE)
+        last_loc = torch.tensor([PAGE_SIZE + prefix_len - 1], dtype=torch.int64, device=DEVICE)
 
-        # 第二个请求，相同前缀
-        req_idx2 = manager.alloc_request()
-        token_ids2 = [1, 2, 3, 4, 5, 6, 7]  # 前 5 个相同
-        kv_indices2, num_cached2 = manager.alloc_for_request(
-            req_idx=req_idx2,
-            token_ids=token_ids2,
-            num_new_tokens=7,
+        out = paged_allocator.alloc_pages_extend(
+            prefix_lens,
+            prefix_lens.cpu(),
+            seq_lens,
+            seq_lens.cpu(),
+            last_loc,
+            seq_len - prefix_len,
         )
 
-        # 应该命中 5 个 token 的缓存
-        assert num_cached2 == 5
-        # 只需要分配 2 个新 token
-        assert len(kv_indices2) == 2
+        page_ids = torch.unique(out // PAGE_SIZE).tolist()
+        assert len(page_ids) == 2
+        assert (out // PAGE_SIZE == page_ids[0]).sum().item() == 10  # tail of page 1
+        assert (out // PAGE_SIZE == page_ids[1]).sum().item() == 20  # new page portion
+        # free pages left: started with pages 2,3,4. One new page consumed -> 2 pages free
+        assert paged_allocator.available_size() == 2 * PAGE_SIZE
+        _print_pages("alloc_extend_partial_existing_page", out.cpu())
 
-    def test_multiple_requests(self, manager):
-        """测试多个并发请求"""
-        # 分配多个请求
-        req_indices = []
-        for i in range(5):
-            req_idx = manager.alloc_request()
-            assert req_idx is not None
-            req_indices.append(req_idx)
+    def test_decode_new_page_when_last_loc_at_page_end(self, paged_allocator: PagedTokenAllocator):
+        # consume page 1 so decoding will use next free page
+        paged_allocator.free_pages = paged_allocator.free_pages[1:]
 
-        # 为每个请求分配 KV cache
-        for req_idx in req_indices:
-            token_ids = list(range(req_idx * 10, req_idx * 10 + 20))
-            kv_indices, _ = manager.alloc_for_request(
-                req_idx=req_idx,
-                token_ids=token_ids,
-                num_new_tokens=20,
-            )
-            assert kv_indices is not None
+        seq_lens = torch.tensor([PAGE_SIZE + 1], dtype=torch.int64, device=DEVICE)
+        last_loc = torch.tensor([PAGE_SIZE * 2 - 1], dtype=torch.int64, device=DEVICE)  # end of page 1
+        out = paged_allocator.alloc_pages_decode(seq_lens, seq_lens.cpu(), last_loc)
 
-        # 验证总共分配了 5 * 20 = 100 tokens
-        assert manager.available_tokens() == 900
+        assert out.numel() == 1
+        assert out[0].item() % PAGE_SIZE == 0  # new page start
+        assert paged_allocator.available_size() == 2 * PAGE_SIZE  # one page consumed from three
+        _print_pages("alloc_decode_new_page", out.cpu())
 
-    def test_kv_buffer_operations(self, manager):
-        """测试 KV buffer 读写"""
-        # 分配请求
-        req_idx = manager.alloc_request()
-        token_ids = [1, 2, 3]
-        kv_indices, _ = manager.alloc_for_request(
-            req_idx=req_idx,
-            token_ids=token_ids,
-            num_new_tokens=3,
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton allocator")
+class TestPagedKVCacheManager:
+    def test_cross_page_extend_and_release(self, paged_manager_factory):
+        manager = paged_manager_factory(enable_prefix_cache=False, size=PAGE_SIZE * 2)
+        req = Req(list(range(PAGE_SIZE + 44)))
+
+        manager.prefix_for_waiting_req(req)
+        batch = ScheduledBatch.init_new([req], device=torch.device(DEVICE))
+        manager.prepare_for_extend(batch)
+
+        req.req_pool_idx = int(batch.req_pool_indices[0].item())
+        req.req_id = req.req_pool_idx
+
+        out_loc = batch.out_cache_loc.cpu()
+        assert out_loc.numel() == PAGE_SIZE + 44
+        assert out_loc[0].item() % PAGE_SIZE == 0
+        assert out_loc[PAGE_SIZE - 1].item() % PAGE_SIZE == PAGE_SIZE - 1
+        assert out_loc[PAGE_SIZE].item() % PAGE_SIZE == 0
+
+        page_ids = out_loc // PAGE_SIZE
+        assert torch.unique(page_ids[:PAGE_SIZE]).numel() == 1
+        assert torch.unique(page_ids[PAGE_SIZE:]).numel() == 1
+        assert page_ids[0].item() != page_ids[-1].item()
+        first_page_tokens = (page_ids == page_ids[0]).sum().item()
+        second_page_tokens = (page_ids == page_ids[-1]).sum().item()
+        print(
+            f"[cross_page] total_tokens={out_loc.numel()}, pages_used={torch.unique(page_ids).numel()}, "
+            f"first_page_tokens={first_page_tokens}, second_page_tokens={second_page_tokens}, "
+            f"last_loc={out_loc[-1].item()}"
         )
+        _print_pages("kv_cross_page", out_loc)
+        assert second_page_tokens == 44  # only partial page write for the tail
 
-        # 写入 KV cache
-        cache_k = torch.randn(3, 4, 32, dtype=torch.float16, device=DEVICE)
-        cache_v = torch.randn(3, 4, 32, dtype=torch.float16, device=DEVICE)
+        mapped = manager.request_pool.read(req.req_pool_idx, slice(0, len(req.fill_ids))).cpu()
+        assert torch.equal(mapped.to(torch.int64), out_loc.to(torch.int64))
 
-        manager.set_kv_buffer(
-            layer_id=0,
-            loc=kv_indices,
-            cache_k=cache_k,
-            cache_v=cache_v,
+        assert manager.available_tokens() == 0
+
+        manager.release_request(req, is_insert=False)
+        assert manager.available_tokens() == manager.size
+
+    def test_prefix_cache_reuse_across_pages(self, paged_manager_factory):
+        manager = paged_manager_factory(enable_prefix_cache=True, size=PAGE_SIZE * 4)
+
+        req1_tokens = list(range(PAGE_SIZE * 2))  # two full pages
+        req1 = Req(req1_tokens)
+        manager.prefix_for_waiting_req(req1)
+        batch1 = ScheduledBatch.init_new([req1], device=torch.device(DEVICE))
+        manager.prepare_for_extend(batch1)
+
+        req1.req_pool_idx = int(batch1.req_pool_indices[0].item())
+        req1.req_id = req1.req_pool_idx
+        kv_indices1 = manager.request_pool.read(req1.req_pool_idx, slice(0, len(req1.fill_ids)))
+        manager.prefix_cache.insert(req1.fill_ids, kv_indices1)
+        print(
+            f"[prefix_cache_hit] req1_prefix_len={len(req1_tokens)}, "
+            f"req1_pages_used={torch.unique(kv_indices1 // PAGE_SIZE).numel()}"
         )
+        _print_pages("kv_prefix_req1_pages", kv_indices1.cpu())
 
-        # 读取 KV buffer
-        k_buffer, v_buffer = manager.get_kv_buffer(layer_id=0)
+        req2_tokens = req1_tokens + list(range(1000, 1008))
+        req2 = Req(req2_tokens)
+        manager.prefix_for_waiting_req(req2)
+        assert req2.cache_protected_len == len(req1_tokens)
+        assert req2.prefix_indices.shape[0] == len(req1_tokens)
+        assert torch.equal(req2.prefix_indices.cpu(), kv_indices1.cpu())
 
-        # 验证写入正确
-        for i, loc in enumerate(kv_indices):
-            assert torch.allclose(k_buffer[loc], cache_k[i])
-            assert torch.allclose(v_buffer[loc], cache_v[i])
+        batch2 = ScheduledBatch.init_new([req2], device=torch.device(DEVICE))
+        manager.prepare_for_extend(batch2)
 
-    def test_stats(self, manager):
-        """测试统计信息"""
-        stats = manager.get_stats()
+        req2.req_pool_idx = int(batch2.req_pool_indices[0].item())
+        req2.req_id = req2.req_pool_idx
 
-        assert "size" in stats
-        assert "available_tokens" in stats
-        assert "used_tokens" in stats
-        assert "utilization" in stats
+        out_loc = batch2.out_cache_loc.cpu()
+        assert out_loc.numel() == len(req2_tokens) - len(req1_tokens)
+        assert torch.unique(out_loc // PAGE_SIZE).tolist() == [3]
+        tail_page_tokens = out_loc.numel()
+        print(
+            f"[prefix_cache_hit] extend_tokens={out_loc.numel()}, new_page={int(out_loc[0] // PAGE_SIZE)}, "
+            f"tail_page_tokens={tail_page_tokens}"
+        )
+        _print_pages("kv_prefix_extend_pages", out_loc.cpu())
+        assert tail_page_tokens == 8  # extend writes into a fresh page partially
 
-        assert stats["size"] == 1000
-        assert stats["available_tokens"] == 1000
-        assert stats["utilization"] == 0.0
+        mapped2 = manager.request_pool.read(req2.req_pool_idx, slice(0, len(req2.fill_ids))).cpu()
+        assert torch.equal(mapped2[: len(req1_tokens)].to(torch.int64), kv_indices1.to(device="cpu", dtype=torch.int64))
+        assert torch.equal(mapped2[len(req1_tokens) :].to(torch.int64), out_loc.to(torch.int64))
 
+        assert manager.available_tokens() == PAGE_SIZE
+    def test_partial_prefix_cache_reuse_across_pages(self, paged_manager_factory):
+        manager = paged_manager_factory(enable_prefix_cache=True, size=PAGE_SIZE * 4)
 
-# ============== 运行测试 ==============
-if __name__ == "__main__":
-    # 可以直接运行这个文件进行测试
-    print("=" * 60)
-    print("KV Cache Manager Unit Tests")
-    print("=" * 60)
+        req1_tokens = list(range(PAGE_SIZE + 100))  # two full pages
+        req1 = Req(req1_tokens)
+        manager.prefix_for_waiting_req(req1)
+        batch1 = ScheduledBatch.init_new([req1], device=torch.device(DEVICE))
+        manager.prepare_for_extend(batch1)
 
-    # 使用 pytest 运行
-    pytest.main([__file__, "-v", "--tb=short"])
+        req1.req_pool_idx = int(batch1.req_pool_indices[0].item())
+        req1.req_id = req1.req_pool_idx
+        kv_indices1 = manager.request_pool.read(req1.req_pool_idx, slice(0, len(req1.fill_ids)))
+        manager.prefix_cache.insert(req1.fill_ids, kv_indices1)
+        print(
+            f"[prefix_cache_hit] req1_prefix_len={len(req1_tokens)}, "
+            f"req1_pages_used={torch.unique(kv_indices1 // PAGE_SIZE).numel()}"
+        )
+        # _print_pages("kv_prefix_req1_pages", kv_indices1.cpu())
+
+        req2_tokens = req1_tokens[:PAGE_SIZE] + list(range(1000, 1008))
+        req2 = Req(req2_tokens)
+        manager.prefix_for_waiting_req(req2)
+        assert req2.cache_protected_len == PAGE_SIZE  # only first page hits
+        assert req2.prefix_indices.shape[0] == PAGE_SIZE
+        assert torch.equal(req2.prefix_indices.cpu()[:PAGE_SIZE], kv_indices1.cpu()[:PAGE_SIZE])
+
+        batch2 = ScheduledBatch.init_new([req2], device=torch.device(DEVICE))
+        print("req2 prefix_indices:", req2.prefix_indices)
+        manager.prepare_for_extend(batch2)
+        print("after prepare_for_extend, req2 prefix_indices:", req2.prefix_indices)
+
+        req2.req_pool_idx = int(batch2.req_pool_indices[0].item())
+        req2.req_id = req2.req_pool_idx
+
+        out_loc = batch2.out_cache_loc.cpu()
+        assert out_loc.numel() == len(req2_tokens) - PAGE_SIZE
+        assert torch.unique(out_loc // PAGE_SIZE).tolist() == [3]
+        tail_page_tokens = out_loc.numel()
+        print(
+            f"[prefix_cache_hit] extend_tokens={out_loc.numel()}, new_page={int(out_loc[0] // PAGE_SIZE)}, "
+            f"tail_page_tokens={tail_page_tokens}"
+        )
+        # _print_pages("kv_prefix_extend_pages", out_loc.cpu())
+        assert tail_page_tokens == 8  # extend writes into a fresh page partially
+
+        # _print_pages("all_mapped_req2", manager.request_pool.read(req2.req_pool_idx, slice(0, len(req2.fill_ids))).cpu())
+        mapped2 = manager.request_pool.read(req2.req_pool_idx, slice(0, len(req2.fill_ids))).cpu()
+        assert torch.equal(mapped2[: PAGE_SIZE].to(torch.int64), kv_indices1[:PAGE_SIZE].to(device="cpu", dtype=torch.int64))
+        assert torch.equal(mapped2[PAGE_SIZE :].to(torch.int64), out_loc.to(torch.int64))
+
+    def test_release_request_unlocks_radix_and_preserves_pages(self, paged_manager_factory):
+        manager = paged_manager_factory(enable_prefix_cache=True, size=PAGE_SIZE * 3)
+
+        # seed radix cache with a one-page request
+        req_base = Req(list(range(PAGE_SIZE)))
+        manager.prefix_for_waiting_req(req_base)
+        batch_base = ScheduledBatch.init_new([req_base], device=torch.device(DEVICE))
+        manager.prepare_for_extend(batch_base)
+        req_base.req_pool_idx = int(batch_base.req_pool_indices[0].item())
+        req_base.req_id = req_base.req_pool_idx
+        manager.release_request(req_base, is_insert=True)
+
+        # one page occupied by radix cache, two pages free
+        assert manager.available_tokens() == PAGE_SIZE * 2
+
+        # second request reuses the cached page and extends by 16 tokens
+        req_hit = Req(list(range(PAGE_SIZE)) + list(range(1000, 1016)))
+        manager.prefix_for_waiting_req(req_hit)
+        assert req_hit.cache_protected_len == PAGE_SIZE
+
+        # lock the matched radix node to make protected_size non-zero
+        manager.prefix_cache.inc_lock_ref(req_hit.last_node)
+        assert manager.prefix_cache.protected_size() == PAGE_SIZE
+
+        batch_hit = ScheduledBatch.init_new([req_hit], device=torch.device(DEVICE))
+        manager.prepare_for_extend(batch_hit)
+        req_hit.req_pool_idx = int(batch_hit.req_pool_indices[0].item())
+        req_hit.req_id = req_hit.req_pool_idx
+
+        manager.release_request(req_hit, is_insert=True)
+
+        # radix cache keeps two pages cached, leaving exactly one free page
+        assert manager.available_tokens() == PAGE_SIZE
+        assert manager.prefix_cache.protected_size() == 0
+        assert req_hit.last_node.lock_ref == 0

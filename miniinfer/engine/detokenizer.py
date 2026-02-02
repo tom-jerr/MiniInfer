@@ -1,13 +1,11 @@
 """
 Incremental Streaming Decoder - 增量流式解码器
 
-用于高效地将 token ids 增量解码为文本，适用于流式输出场景。
+用于流式输出的增量 detokenize。
 
-主要特性:
-1. 增量解码: 每次只解码新增的 token，避免重复计算
-2. Unicode 边界处理: 正确处理多字节字符（如中文）被拆分到多个 token 的情况
-3. 特殊 token 处理: 支持跳过特殊 token
-4. 前缀缓存: 避免输出不完整的字符
+核心策略：每次对“全部 token ids”做一次 decode，然后用新旧文本的差异
+得到增量输出，避免 byte/byte-fallback token 在单 token 解码时产生
+不可逆的 U+FFFD (replacement char)。
 """
 
 from typing import Dict, List, Optional, Tuple, Any, Callable
@@ -20,11 +18,7 @@ class DecodeState:
     # 已处理的所有 token ids
     token_ids: List[int] = field(default_factory=list)
     # 上一次解码后的完整文本
-    prev_text: str = ""
-    # 待确认输出的文本前缀（可能是不完整的 unicode 字符）
-    pending_prefix: str = ""
-    # 已经输出给用户的文本长度
-    output_offset: int = 0
+    text: str = ""
     # 是否已完成
     finished: bool = False
 
@@ -51,14 +45,12 @@ class IncrementalDecoder:
         decoder.cleanup(request_id)
     ```
     """
-    
-    # 用于检测不完整 unicode 的前缀长度
-    UNICODE_CHECK_PREFIX_LEN = 3
-    
+
     def __init__(
         self, 
         tokenizer: Any,
         skip_special_tokens: bool = True,
+        clean_up_tokenization_spaces: Optional[bool] = False,
         on_token_callback: Optional[Callable[[int, int, str, bool], None]] = None,
     ):
         """
@@ -67,22 +59,43 @@ class IncrementalDecoder:
         Args:
             tokenizer: HuggingFace tokenizer 实例
             skip_special_tokens: 解码时是否跳过特殊 token
+            clean_up_tokenization_spaces: 是否清理空格（None 表示使用 tokenizer 默认值）
             on_token_callback: 可选的回调函数，签名为 (req_id, token_id, delta_text, finished)
         """
         self.tokenizer = tokenizer
         self.skip_special_tokens = skip_special_tokens
+        self.clean_up_tokenization_spaces = clean_up_tokenization_spaces
         self.on_token_callback = on_token_callback
         
         # 每个请求的解码状态
         self._states: Dict[int, DecodeState] = {}
         
-        # 特殊 token ids 集合，用于快速查找
-        self._special_token_ids = set()
-        if hasattr(tokenizer, 'all_special_ids'):
-            self._special_token_ids = set(tokenizer.all_special_ids)
-        
         # EOS token id
         self._eos_token_id = getattr(tokenizer, 'eos_token_id', None)
+
+    def _decode(self, token_ids: List[int]) -> str:
+        """对全部 token ids 做一次 decode（兼容不同 tokenizer 签名）"""
+        kwargs = {"skip_special_tokens": self.skip_special_tokens}
+        if self.clean_up_tokenization_spaces is not None:
+            kwargs["clean_up_tokenization_spaces"] = self.clean_up_tokenization_spaces
+        try:
+            return self.tokenizer.decode(token_ids, **kwargs)
+        except TypeError:
+            # 兼容不支持 clean_up_tokenization_spaces 的 tokenizer
+            kwargs.pop("clean_up_tokenization_spaces", None)
+            return self.tokenizer.decode(token_ids, **kwargs)
+
+    @staticmethod
+    def _delta_text(old_text: str, new_text: str) -> str:
+        """计算新旧文本的增量（假设旧文本是新文本的前缀）"""
+        if new_text.startswith(old_text):
+            return new_text[len(old_text) :]
+        # 回退：找最长公共前缀，尽量减少漏发
+        max_len = min(len(old_text), len(new_text))
+        i = 0
+        while i < max_len and old_text[i] == new_text[i]:
+            i += 1
+        return new_text[i:]
     
     def get_or_create_state(self, req_id: int) -> DecodeState:
         """获取或创建请求的解码状态"""
@@ -112,6 +125,14 @@ class IncrementalDecoder:
         if state.finished:
             return "", True
         
+        # 规范化 token_id 为 int，兼容 list/tuple/tensor 形式
+        if isinstance(token_id, (list, tuple)):
+            if len(token_id) == 0:
+                return "", False
+            token_id = token_id[0]
+        if hasattr(token_id, "item"):
+            token_id = int(token_id.item())
+
         # 确定 EOS token id
         eos_id = eos_token_id if eos_token_id is not None else self._eos_token_id
         
@@ -121,37 +142,21 @@ class IncrementalDecoder:
         # 添加新 token
         state.token_ids.append(token_id)
         
-        # 如果是 EOS，标记完成并返回剩余的 pending 文本
+        # 解码所有 token
+        full_text = self._decode(state.token_ids)
+
+        # 计算增量文本
+        delta_text = self._delta_text(state.text, full_text)
+
+        # 更新状态
+        state.text = full_text
         if is_eos:
             state.finished = True
-            delta = state.pending_prefix
-            state.pending_prefix = ""
-            
-            if self.on_token_callback:
-                self.on_token_callback(req_id, token_id, delta, True)
-            
-            return delta, True
-        
-        # 如果需要跳过特殊 token
-        if self.skip_special_tokens and token_id in self._special_token_ids:
-            return "", False
-        
-        # 解码所有 token
-        full_text = self.tokenizer.decode(
-            state.token_ids,
-            skip_special_tokens=self.skip_special_tokens,
-        )
-        
-        # 计算增量文本
-        delta_text = self._compute_delta(state, full_text)
-        
-        # 更新状态
-        state.prev_text = full_text
-        
+
         if self.on_token_callback:
-            self.on_token_callback(req_id, token_id, delta_text, False)
-        
-        return delta_text, False
+            self.on_token_callback(req_id, token_id, delta_text, is_eos)
+
+        return delta_text, is_eos
     
     def decode_batch(
         self,
@@ -176,56 +181,6 @@ class IncrementalDecoder:
             results.append(result)
         return results
     
-    def _compute_delta(self, state: DecodeState, full_text: str) -> str:
-        """
-        计算增量文本
-        
-        HuggingFace tokenizer 的 decode 方法已经正确处理了 Unicode 边界，
-        所以我们只需要简单地计算新增部分。
-        
-        但需要注意：某些 tokenizer 在处理 token 边界时可能会调整空格，
-        所以我们需要正确处理 prev_text 和 pending_prefix 的关系。
-        """
-        
-        # 已输出的文本长度
-        output_len = state.output_offset
-        
-        # 新增的文本就是从已输出位置开始到当前完整文本
-        if len(full_text) <= output_len:
-            return ""
-        
-        new_text = full_text[output_len:]
-        
-        # 对于可能存在的不完整 UTF-8 字节（在某些 tokenizer 中），
-        # 我们检查最后的字符是否完整
-        # 策略：检查最后一个字符是否是有效的 Unicode 代码点
-        if new_text and self._has_incomplete_char(new_text):
-            # 保留可能不完整的部分
-            state.pending_prefix = new_text
-            return ""
-        
-        # 更新已输出偏移
-        state.output_offset = len(full_text)
-        state.pending_prefix = ""
-        
-        return new_text
-    
-    def _has_incomplete_char(self, text: str) -> bool:
-        """
-        检查文本末尾是否有不完整的字符
-        
-        对于 Python str（已经是 Unicode），通常不会有不完整的字符，
-        但某些 tokenizer 可能会产生 replacement character (U+FFFD)。
-        """
-        if not text:
-            return False
-        
-        # 检查是否包含 replacement character
-        if '\ufffd' in text:
-            return True
-        
-        return False
-    
     def flush(self, req_id: int) -> str:
         """
         刷新请求的所有待输出文本
@@ -242,19 +197,11 @@ class IncrementalDecoder:
             return ""
         
         state = self._states[req_id]
-        
-        # 获取完整解码文本
-        full_text = self.tokenizer.decode(
-            state.token_ids,
-            skip_special_tokens=self.skip_special_tokens,
-        )
-        
-        # 返回从已输出位置开始的剩余文本
-        remaining = full_text[state.output_offset:]
-        state.output_offset = len(full_text)
-        state.pending_prefix = ""
-        
-        return remaining
+
+        full_text = self._decode(state.token_ids)
+        delta = self._delta_text(state.text, full_text)
+        state.text = full_text
+        return delta
     
     def get_full_text(self, req_id: int) -> str:
         """
@@ -270,10 +217,7 @@ class IncrementalDecoder:
             return ""
         
         state = self._states[req_id]
-        return self.tokenizer.decode(
-            state.token_ids,
-            skip_special_tokens=self.skip_special_tokens,
-        )
+        return state.text
     
     def get_output_tokens(self, req_id: int) -> List[int]:
         """

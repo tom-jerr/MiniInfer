@@ -65,7 +65,7 @@ class Sampler(nn.Module):
             next_token = sampler_fn(logprobs)  # [1]
             batch_next_token_ids[i, 0] = next_token
 
-        return batch_next_token_ids  # [num_seqs, 1]
+        return batch_next_token_ids.squeeze(-1)  # [num_seqs, 1] -> [num_seqs]
 
 
 def apply_custom_logits_processor(

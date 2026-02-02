@@ -13,3 +13,4 @@ node_modules/
 output
 *.txt
 output/
+*.ncu-rep

@@ -7,7 +7,7 @@ import os
 # Add the project root to sys.path to allow imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from triton_kernels.rotary_embedding import (
+from kernels.triton.rotary_embedding import (
     apply_rotary_embedding as apply_rotary_embedding_triton,
 )
 
@@ -16,31 +16,29 @@ def apply_rotary_embedding_torch(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    interleaved: bool = False,
+    is_neox_style: bool,
 ) -> torch.Tensor:
-    # Ensure cos/sin have the same number of dimensions as x for broadcasting
-    # x: [B, S, H, D]
-    # cos: [1, S, D/2] -> need [1, S, 1, D/2]
-    if cos.dim() == 3:
-        cos = cos.unsqueeze(2)
-        sin = sin.unsqueeze(2)
-
-    if interleaved:
+    """
+    Args:
+        x: [num_tokens, num_heads, head_size]
+        cos: [num_tokens, head_size // 2]
+        sin: [num_tokens, head_size // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+    if is_neox_style:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+    else:
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
-        o1 = x1 * cos - x2 * sin
-        o2 = x1 * sin + x2 * cos
-        output = torch.empty_like(x)
-        output[..., ::2] = o1
-        output[..., 1::2] = o2
-        return output
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    if is_neox_style:
+        return torch.cat((o1, o2), dim=-1)
     else:
-        head_size = x.shape[-1]
-        x1 = x[..., : head_size // 2]
-        x2 = x[..., head_size // 2 :]
-        o1 = x1 * cos - x2 * sin
-        o2 = x1 * sin + x2 * cos
-        return torch.cat([o1, o2], dim=-1)
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
 def test_rope_correctness():
@@ -58,7 +56,7 @@ def test_rope_correctness():
     sin = torch.randn(1, SEQ_LEN, HEAD_DIM // 2, device="cuda", dtype=torch.float16)
 
     tri_out = apply_rotary_embedding_triton(x, cos, sin)
-    pt_out = apply_rotary_embedding_torch(x, cos, sin)
+    pt_out = apply_rotary_embedding_torch(x, cos, sin, is_neox_style=True)
 
     if torch.allclose(tri_out, pt_out, atol=1e-2, rtol=1e-2):
         print("✅ RoPE correctness test passed!")
@@ -77,7 +75,8 @@ def run_benchmark_core(BATCH_SIZE, HEAD_DIM, NUM_HEADS, SEQ_LEN, provider):
     quantiles = [0.5, 0.2, 0.8]
     if provider == "torch":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: apply_rotary_embedding_torch(x, cos, sin), quantiles=quantiles
+            lambda: apply_rotary_embedding_torch(x, cos, sin, is_neox_style=True),
+            quantiles=quantiles,
         )
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
@@ -144,9 +143,10 @@ def benchmark_bandwidth(BATCH_SIZE, HEAD_DIM, NUM_HEADS, SEQ_LEN, provider):
 
 if __name__ == "__main__":
     test_rope_correctness()
-    benchmark_latency.run(
-        save_path="./benchmark/output", show_plots=False, print_data=True
-    )
-    benchmark_bandwidth.run(
-        save_path="./benchmark/output", show_plots=False, print_data=True
-    )
+    test_rope_correctness()
+    # benchmark_latency.run(
+    #     save_path="./benchmark/output", show_plots=False, print_data=True
+    # )
+    # benchmark_bandwidth.run(
+    #     save_path="./benchmark/output", show_plots=False, print_data=True
+    # )
