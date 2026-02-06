@@ -1,22 +1,17 @@
 """
-Memory Budget Manager - 管理 GPU 显存预算和 token 分配
+显存预算管理模块
 
-职责:
-1. 计算 GPU 可用显存
-2. 根据配置的利用率百分比确定可用的 token 预算
-3. 为调度器提供 token 预算限制
-4. 支持 chunked prefill 的预算控制
+实现 KV Cache 显存预算计算和管理:
+1. _determine_num_pages: 根据 GPU 空闲显存计算可用页面数
+2. MemoryBudgetManager: 管理显存预算和 token 分配
+3. PrefillAdder: Prefill 阶段的预算控制（支持 chunked prefill）
+4. TokenBudgetAdder: Token 预算加法器
 """
 
-from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple, Any
 import torch
 import logging
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from miniinfer.engine.scheduler_batch import Req
-    from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +23,27 @@ MB = 1024 * 1024
 class MemoryStats:
     """GPU 显存统计信息"""
 
-    total_bytes: int
-    allocated_bytes: int
-    reserved_bytes: int
-    free_bytes: int
+    total_bytes: int  # 总显存 (bytes)
+    allocated_bytes: int  # 已分配显存 (bytes)
+    reserved_bytes: int  # 已预留显存 (bytes)
+    free_bytes: int  # 空闲显存 (bytes)
+
+    # 兼容旧属性名
+    @property
+    def total(self) -> int:
+        return self.total_bytes
+
+    @property
+    def allocated(self) -> int:
+        return self.allocated_bytes
+
+    @property
+    def reserved(self) -> int:
+        return self.reserved_bytes
+
+    @property
+    def free(self) -> int:
+        return self.free_bytes
 
     @property
     def total_gb(self) -> float:
@@ -54,19 +66,28 @@ class MemoryStats:
 
 
 def get_gpu_memory_stats(device: str = "cuda") -> MemoryStats:
-    """获取 GPU 显存统计信息"""
+    """
+    获取 GPU 显存统计信息
+
+    Args:
+        device: GPU 设备标识
+
+    Returns:
+        MemoryStats: 显存统计信息
+    """
     if not torch.cuda.is_available():
-        return MemoryStats(0, 0, 0, 0)
+        return MemoryStats(
+            total_bytes=0, allocated_bytes=0, reserved_bytes=0, free_bytes=0
+        )
 
     device_idx = (
-        torch.cuda.current_device() if device == "cuda" else int(device.split(":")[1])
+        torch.cuda.current_device() if device == "cuda" else int(device.split(":")[-1])
     )
+
     total = torch.cuda.get_device_properties(device_idx).total_memory
     allocated = torch.cuda.memory_allocated(device_idx)
     reserved = torch.cuda.memory_reserved(device_idx)
-    # 实际可用 = 总量 - 已分配
-    # 注：reserved 包含了 PyTorch 的缓存，可能比 allocated 大
-    free = total - reserved
+    free = total - allocated
 
     return MemoryStats(
         total_bytes=total,
@@ -83,24 +104,190 @@ def estimate_kv_cache_memory_per_token(
     dtype: torch.dtype = torch.float16,
 ) -> int:
     """
-    估算每个 token 的 KV cache 显存占用（字节）
+    估算每个 token 的 KV cache 内存占用
 
-    每层每个 token 需要存储:
-    - K: [num_kv_heads, head_dim]
-    - V: [num_kv_heads, head_dim]
+    KV cache shape per layer: [num_tokens, num_kv_heads, head_dim] * 2 (K and V)
+    Total memory = 2 * num_layers * num_kv_heads * head_dim * dtype_size
+
+    Args:
+        num_layers: 模型层数
+        num_kv_heads: KV head 数量 (支持 GQA/MQA)
+        head_dim: head 维度
+        dtype: 数据类型
+
+    Returns:
+        每个 token 的 KV cache 字节数
     """
-    element_size = torch.tensor([], dtype=dtype).element_size()
-    # K + V per layer
-    bytes_per_layer = 2 * num_kv_heads * head_dim * element_size
-    return bytes_per_layer * num_layers
+    dtype_size = torch.tensor([], dtype=dtype).element_size()
+    # 2 for K and V
+    bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_size
+    return bytes_per_token
+
+
+def estimate_kv_cache_memory_per_page(
+    page_size: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float16,
+) -> int:
+    """
+    估算每个 page 的 KV cache 内存占用
+
+    Args:
+        page_size: 每页包含的 token 数量
+        num_layers: 模型层数
+        num_kv_heads: KV head 数量
+        head_dim: head 维度
+        dtype: 数据类型
+
+    Returns:
+        每个 page 的 KV cache 字节数
+    """
+    bytes_per_token = estimate_kv_cache_memory_per_token(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+    )
+    return bytes_per_token * page_size
+
+
+def _determine_num_pages(
+    page_size: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float16,
+    memory_ratio: float = 0.9,
+    num_pages_override: Optional[int] = None,
+    device: str = "cuda",
+) -> int:
+    """
+    根据 GPU 空闲显存计算可用的 KV cache 页面数量
+
+    计算流程:
+    1. 获取模型加载后的 GPU 空闲显存
+    2. 计算每个 page 所需的显存: 2 * head_dim * num_kv_heads * page_size * dtype_size * num_layers
+    3. 根据 memory_ratio (默认 0.9) 计算可分配给 KV cache 的显存
+    4. 返回 num_pages = available_memory / memory_per_page
+
+    Args:
+        page_size: 每页的 token 数量
+        num_layers: 模型层数
+        num_kv_heads: KV head 数量
+        head_dim: head 维度
+        dtype: 数据类型
+        memory_ratio: GPU 显存利用率 (0.0 ~ 1.0)
+        num_pages_override: 手动指定的页面数 (--num-pages)
+        device: GPU 设备
+
+    Returns:
+        num_pages: 可分配的总页面数
+    """
+    # 如果手动指定了页面数，直接返回
+    if num_pages_override is not None and num_pages_override > 0:
+        logger.info(f"Using manual num_pages override: {num_pages_override}")
+        return num_pages_override
+
+    # 获取 GPU 显存统计
+    memory_stats = get_gpu_memory_stats(device)
+    available_memory = int(memory_stats.free_bytes * memory_ratio)
+
+    # 计算每个 page 的显存占用
+    memory_per_page = estimate_kv_cache_memory_per_page(
+        page_size=page_size,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+    )
+
+    # 计算页面数
+    num_pages = available_memory // memory_per_page
+
+    logger.info(
+        f"KV Cache allocation: "
+        f"free_memory={memory_stats.free_gb:.2f}GB, "
+        f"usable={available_memory / GB:.2f}GB (ratio={memory_ratio}), "
+        f"memory_per_page={memory_per_page / MB:.2f}MB, "
+        f"num_pages={num_pages}"
+    )
+
+    return max(1, num_pages)  # 至少返回 1 页
+
+
+def _determine_num_tokens(
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float16,
+    memory_ratio: float = 0.9,
+    max_total_tokens_override: Optional[int] = None,
+    device: str = "cuda",
+) -> int:
+    """
+    根据 GPU 空闲显存计算可用的 KV cache token 数量
+
+    Args:
+        num_layers: 模型层数
+        num_kv_heads: KV head 数量
+        head_dim: head 维度
+        dtype: 数据类型
+        memory_ratio: GPU 显存利用率 (0.0 ~ 1.0)
+        max_total_tokens_override: 手动指定的最大 token 数
+        device: GPU 设备
+
+    Returns:
+        max_total_tokens: 可分配的总 token 数
+    """
+    # 如果手动指定了 token 数，直接返回
+    if max_total_tokens_override is not None and max_total_tokens_override > 0:
+        logger.info(
+            f"Using manual max_total_tokens override: {max_total_tokens_override}"
+        )
+        return max_total_tokens_override
+
+    # 获取 GPU 显存统计
+    memory_stats = get_gpu_memory_stats(device)
+    available_memory = int(memory_stats.free_bytes * memory_ratio)
+
+    # 计算每个 token 的显存占用
+    memory_per_token = estimate_kv_cache_memory_per_token(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+    )
+
+    # 计算 token 数
+    num_tokens = available_memory // memory_per_token
+
+    logger.info(
+        f"KV Cache allocation: "
+        f"free_memory={memory_stats.free_gb:.2f}GB, "
+        f"usable={available_memory / GB:.2f}GB (ratio={memory_ratio}), "
+        f"memory_per_token={memory_per_token}B, "
+        f"max_total_tokens={num_tokens}"
+    )
+
+    return max(1, num_tokens)
 
 
 class MemoryBudgetManager:
     """
     显存预算管理器
 
-    根据 GPU 可用显存和配置的利用率，计算可用的 token 预算。
-    用于限制调度器的 token 分配，防止 OOM。
+    负责:
+    1. 计算和管理 KV cache 可用容量 (num_pages / max_total_tokens)
+    2. 跟踪已分配和可用的显存
+    3. 提供预算检查接口
+
+    Attributes:
+        num_pages: 总页面数
+        max_total_tokens: 最大 token 数
+        page_size: 每页 token 数
+        bytes_per_token: 每个 token 的显存占用
     """
 
     def __init__(
@@ -108,10 +295,11 @@ class MemoryBudgetManager:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-        gpu_memory_utilization: float = 0.9,
-        max_total_tokens: int = 20480,
-        max_num_batched_tokens: Optional[int] = None,
         dtype: torch.dtype = torch.float16,
+        page_size: int = 256,
+        gpu_memory_utilization: float = 0.9,
+        max_total_tokens: Optional[int] = None,
+        max_num_batched_tokens: Optional[int] = None,
         device: str = "cuda",
     ):
         """
@@ -121,469 +309,351 @@ class MemoryBudgetManager:
             num_layers: 模型层数
             num_kv_heads: KV head 数量
             head_dim: head 维度
-            gpu_memory_utilization: GPU 显存利用率 (0.0-1.0)
-            max_total_tokens: KV cache 的最大 token 数（来自 EngineConfig）
-            max_num_batched_tokens: 每个 batch 的最大 token 数（用于 chunked prefill）
             dtype: 数据类型
-            device: 设备
+            page_size: 每页 token 数
+            gpu_memory_utilization: GPU 显存利用率
+            max_total_tokens: 手动指定的最大 token 数（用于 KV cache 容量）
+            max_num_batched_tokens: 单次推理的最大 token 数（用于 prefill 调度）
+            device: GPU 设备
         """
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.gpu_memory_utilization = gpu_memory_utilization
-        self.max_total_tokens = max_total_tokens
         self.dtype = dtype
+        self.page_size = page_size
+        self.gpu_memory_utilization = gpu_memory_utilization
         self.device = device
 
-        # 计算每个 token 的 KV cache 占用
+        # 计算每个 token 的显存占用
         self.bytes_per_token = estimate_kv_cache_memory_per_token(
-            num_layers, num_kv_heads, head_dim, dtype
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        # 兼容旧属性名
+        self.memory_per_token = self.bytes_per_token
+
+        # 计算最大 token 数
+        self.max_total_tokens = _determine_num_tokens(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            memory_ratio=gpu_memory_utilization,
+            max_total_tokens_override=max_total_tokens,
+            device=device,
         )
 
-        # 设置每个 batch 的最大 token 数
-        # 如果没有指定，使用 max_total_tokens 作为默认值
-        self.max_num_batched_tokens = max_num_batched_tokens or max_total_tokens
+        # 计算页面数
+        self.num_pages = (self.max_total_tokens + page_size - 1) // page_size
 
-        # 初始化时获取显存状态
-        self._update_memory_stats()
+        # 设置单次推理的最大 token 数
+        if max_num_batched_tokens is None:
+            # 默认值：使用 max_total_tokens
+            self.max_num_batched_tokens = self.max_total_tokens
+        else:
+            self.max_num_batched_tokens = max_num_batched_tokens
+
+        # 当前分配的 token 数（由 token allocator 管理，这里只是记录）
+        self._allocated_tokens = 0
 
         logger.info(
             f"MemoryBudgetManager initialized: "
-            f"bytes_per_token={self.bytes_per_token}, "
+            f"max_total_tokens={self.max_total_tokens}, "
+            f"num_pages={self.num_pages}, "
+            f"page_size={self.page_size}, "
             f"max_num_batched_tokens={self.max_num_batched_tokens}, "
-            f"gpu_utilization={gpu_memory_utilization}"
+            f"bytes_per_token={self.bytes_per_token}B"
         )
 
-    def _update_memory_stats(self):
-        """更新显存统计信息"""
-        self.memory_stats = get_gpu_memory_stats(self.device)
+    @property
+    def available_tokens(self) -> int:
+        """返回可用的 token 数"""
+        return self.max_total_tokens - self._allocated_tokens
 
-    def get_available_memory_bytes(self) -> int:
-        """
-        获取可用于 KV cache 的显存字节数
+    @property
+    def kv_cache_memory_bytes(self) -> int:
+        """返回 KV cache 总显存占用"""
+        return self.max_total_tokens * self.bytes_per_token
 
-        考虑 gpu_memory_utilization 配置
-        """
-        self._update_memory_stats()
-        # 基于总显存和利用率计算可用显存
-        usable_memory = int(self.memory_stats.total_bytes * self.gpu_memory_utilization)
-        # 减去当前已分配的显存
-        available = usable_memory - self.memory_stats.allocated_bytes
-        return max(0, available)
+    def can_allocate(self, num_tokens: int) -> bool:
+        """检查是否可以分配指定数量的 tokens"""
+        return self.available_tokens >= num_tokens
+
+    def allocate(self, num_tokens: int) -> bool:
+        """分配 tokens (仅用于跟踪)"""
+        if not self.can_allocate(num_tokens):
+            return False
+        self._allocated_tokens += num_tokens
+        return True
+
+    def free(self, num_tokens: int):
+        """释放 tokens (仅用于跟踪)"""
+        self._allocated_tokens = max(0, self._allocated_tokens - num_tokens)
 
     def estimate_tokens_from_memory(self, memory_bytes: int) -> int:
-        """根据显存字节数估算可容纳的 token 数量"""
-        if self.bytes_per_token == 0:
-            return 0
+        """从内存大小估算可容纳的 token 数"""
         return memory_bytes // self.bytes_per_token
 
     def estimate_memory_from_tokens(self, num_tokens: int) -> int:
-        """根据 token 数量估算需要的显存字节数"""
+        """从 token 数量估算所需内存"""
         return num_tokens * self.bytes_per_token
 
-    def get_max_new_tokens_budget(self, currently_used_tokens: int = 0) -> int:
-        """
-        获取当前可以新分配的最大 token 数
-
-        Args:
-            currently_used_tokens: 当前已使用的 token 数（运行中的请求）
-
-        Returns:
-            可以新分配的最大 token 数
-        """
-        # 方法1：基于 max_total_tokens 配置
-        budget_from_config = self.max_total_tokens - currently_used_tokens
-
-        # 方法2：基于实际可用显存
-        available_memory = self.get_available_memory_bytes()
-        budget_from_memory = self.estimate_tokens_from_memory(available_memory)
-
-        # 取两者的最小值
-        budget = min(budget_from_config, budget_from_memory)
-
-        return max(0, budget)
-
     def get_batch_token_budget(self) -> int:
-        """
-        获取单个 batch 的 token 预算
-
-        这是 chunked prefill 的核心：限制每个 batch 处理的 token 总数
-        """
+        """获取单次推理的 token 预算"""
         return self.max_num_batched_tokens
-
-    def can_allocate(self, num_tokens: int, current_usage: int = 0) -> bool:
-        """
-        检查是否可以分配指定数量的 tokens
-
-        Args:
-            num_tokens: 需要分配的 token 数
-            current_usage: 当前已使用的 token 数
-
-        Returns:
-            是否可以分配
-        """
-        budget = self.get_max_new_tokens_budget(current_usage)
-        return num_tokens <= budget
 
     def get_stats(self) -> dict:
         """获取统计信息"""
-        self._update_memory_stats()
         return {
-            "memory_stats": self.memory_stats,
-            "bytes_per_token": self.bytes_per_token,
             "max_total_tokens": self.max_total_tokens,
+            "num_pages": self.num_pages,
+            "page_size": self.page_size,
+            "allocated_tokens": self._allocated_tokens,
+            "available_tokens": self.available_tokens,
+            "bytes_per_token": self.bytes_per_token,
+            "memory_per_token": self.bytes_per_token,
+            "kv_cache_memory_gb": self.kv_cache_memory_bytes / GB,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
             "max_num_batched_tokens": self.max_num_batched_tokens,
-            "estimated_max_tokens_from_memory": self.estimate_tokens_from_memory(
-                self.get_available_memory_bytes()
-            ),
         }
 
 
-@dataclass
-class PrefillAdder:
-    """
-    Prefill 预算控制器 - 支持 Chunked Prefill
-
-    核心策略:
-    1. 优先保证 decode 请求：reserved_size = running_bs（正在运行的 decode 请求数）
-    2. prefill_budget = max_extend_tokens - reserved_size
-    3. 如果请求太大无法完整 prefill，则分块处理
-    4. 分块的请求不会进入 decode 阶段，继续留在 waiting queue
-
-    使用方式:
-        adder = PrefillAdder(
-            prefill_budget=8192,
-            reserved_size=running_bs,
-            kv_cache_mgr=kv_cache_mgr,
-        )
-        # 先处理 decode
-        for req in running_reqs:
-            adder.add_decode(req)
-        # 再处理 prefill
-        for req in waiting_queue:
-            result = adder.try_add_prefill(req)
-            if result is None:
-                break
-    """
-
-    prefill_budget: int  # 可用于 prefill 的 token 预算
-    reserved_size: int  # 为 decode 预留的 token 数（= running_bs）
-    kv_cache_mgr: "KVCacheManager"  # KV cache 管理器
-    max_batch_size: int = 512  # 最大 batch size
-
-    # 运行时状态（使用 field(default_factory=...) 初始化可变对象）
-    current_prefill_tokens: int = field(default=0, init=False)
-    current_decode_tokens: int = field(default=0, init=False)
-    current_prefill_pages: int = field(default=0, init=False)  # 追踪累计的 prefill 页数
-    prefill_reqs: List = field(default_factory=list, init=False)
-    decode_reqs: List = field(default_factory=list, init=False)
-    chunked_reqs: List = field(default_factory=list, init=False)  # 被分块的请求
-
-    def __post_init__(self):
-        """初始化后重置状态"""
-        self.reset()
-
-    def reset(self):
-        """重置状态，开始新的 batch 调度"""
-        self.current_prefill_tokens = 0
-        self.current_decode_tokens = 0
-        self.current_prefill_pages = 0
-        self.prefill_reqs = []
-        self.decode_reqs = []
-        self.chunked_reqs = []
-
-    @property
-    def total_tokens(self) -> int:
-        """当前总 token 数"""
-        return self.current_prefill_tokens + self.current_decode_tokens
-
-    @property
-    def total_reqs(self) -> int:
-        """当前总请求数"""
-        return len(self.prefill_reqs) + len(self.decode_reqs)
-
-    @property
-    def available_prefill_budget(self) -> int:
-        """剩余可用于 prefill 的预算"""
-        return self.prefill_budget - self.current_prefill_tokens
-
-    def _get_page_size(self) -> int:
-        """获取 page size，用于分页对齐计算"""
-        page_size = getattr(self.kv_cache_mgr, "page_size", None)
-        if page_size is None or not isinstance(page_size, int):
-            return 1
-        return page_size
-
-    def _estimate_pages_needed(self, num_tokens: int, prefix_len: int = 0) -> int:
-        """估算需要的新页数
-
-        对于 paged KV cache，需要计算请求需要多少新页，而不是多少 tokens。
-
-        Args:
-            num_tokens: 需要分配的 token 数（extend_len）
-            prefix_len: 已有的前缀长度
-
-        Returns:
-            需要的新页数
-        """
-        page_size = self._get_page_size()
-        if page_size <= 1:
-            return num_tokens
-
-        # 计算扩展后的总长度需要的页数
-        total_len = prefix_len + num_tokens
-        pages_after = (total_len + page_size - 1) // page_size
-
-        # 计算之前已有的页数
-        pages_before = (
-            (prefix_len + page_size - 1) // page_size if prefix_len > 0 else 0
-        )
-
-        # 需要的新页数
-        return pages_after - pages_before
-
-    def _can_allocate_kv_cache(self, num_tokens: int, prefix_len: int = 0) -> bool:
-        """检查 KV cache 是否有足够的空间
-
-        需要考虑：
-        1. 当前批次中已经预分配的 prefill 页数（current_prefill_pages）
-        2. 当前批次中 decode 需要的新页数（通过 _decode_pages_needed 计算）
-        3. 分页对齐：实际分配按页进行
-        """
-        page_size = self._get_page_size()
-
-        # 对于非分页分配器，直接按 token 计算
-        if page_size <= 1:
-            effective_available = (
-                self.kv_cache_mgr.available_tokens()
-                - self.current_prefill_tokens
-                - self.current_decode_tokens
-            )
-            return effective_available >= num_tokens
-
-        # 对于分页分配器，需要按页计算
-        # available_tokens() 返回的是 free_pages * page_size
-        available_pages = self.kv_cache_mgr.available_tokens() // page_size
-
-        # 计算 decode 需要的新页数
-        decode_pages = self._decode_pages_needed()
-
-        # 使用精确的页数追踪（包括 prefill 和 decode 需要的页）
-        used_pages = self.current_prefill_pages + decode_pages
-
-        # 计算这个请求需要的新页数
-        pages_needed = self._estimate_pages_needed(num_tokens, prefix_len)
-
-        # 可用页数
-        remaining_pages = available_pages - used_pages
-
-        return remaining_pages >= pages_needed
-
-    def _decode_pages_needed(self) -> int:
-        """计算当前 decode 请求需要的新页数
-
-        这需要在所有 decode 请求添加后调用，用于估算 prefill 的可用空间。
-        """
-        page_size = self._get_page_size()
-        if page_size <= 1:
-            return 0
-
-        count = 0
-        for req in self.decode_reqs:
-            seq_len = len(req.origin_input_ids) + len(req.output_ids)
-            # decode 后 seq_len 变为 seq_len + 1
-            # 如果 (seq_len + 1) % page_size == 1，说明新 token 是新页的第一个 token
-            if (seq_len + 1) % page_size == 1:
-                count += 1
-        return count
-
-    def add_decode(self, req: "Req") -> bool:
-        """
-        添加一个 decode 请求
-
-        Decode 请求优先级最高，每个请求消耗 1 token。
-        注意：Decode 请求总是应该被接受，因为它们的 KV cache 已经被分配。
-        拒绝 decode 会导致死锁（KV cache 无法释放）。
-
-        Args:
-            req: 请求对象
-
-        Returns:
-            是否成功添加
-        """
-        if self.total_reqs >= self.max_batch_size:
-            return False
-
-        self.current_decode_tokens += 1
-        self.decode_reqs.append(req)
-        return True
-
-    def try_add_prefill(
-        self,
-        req: "Req",
-        chunk_size: Optional[int] = None,
-    ) -> Optional[Tuple["Req", int, bool]]:
-        """
-        尝试添加一个 prefill 请求
-
-        策略:
-        1. 如果请求可以完整 prefill，直接添加
-        2. 如果请求太大但启用了 chunked prefill，分块处理
-        3. 分块的请求返回 (req, actual_chunk_size, is_chunked=True)
-
-        Args:
-            req: 请求对象（已经调用过 prefix_for_waiting_req）
-            chunk_size: 可选的 chunk 大小限制
-
-        Returns:
-            None: 无法添加（预算不足或 KV cache 满）
-            (req, extend_len, is_chunked): 成功添加
-        """
-        if self.total_reqs >= self.max_batch_size:
-            return None
-
-        extend_len = req.extend_input_len
-        # 获取前缀长度，优先使用 cache_protected_len
-        prefix_len = getattr(req, "cache_protected_len", 0) or 0
-        if prefix_len == 0:
-            prefix_indices = getattr(req, "prefix_indices", None)
-            if prefix_indices is not None and hasattr(prefix_indices, "__len__"):
-                prefix_len = len(prefix_indices)
-
-        # 检查是否可以完整 prefill
-        if extend_len <= self.available_prefill_budget:
-            # 检查 KV cache 容量（考虑分页开销）
-            if not self._can_allocate_kv_cache(extend_len, prefix_len):
-                page_size = self._get_page_size()
-                available_pages = (
-                    self.kv_cache_mgr.available_tokens() // page_size
-                    if page_size > 0
-                    else 0
-                )
-                logger.warning(
-                    f"KV cache insufficient for req {req.req_id}: "
-                    f"need {extend_len} tokens ({self._estimate_pages_needed(extend_len, prefix_len)} pages), "
-                    f"current_prefill_pages={self.current_prefill_pages}, "
-                    f"available_pages={available_pages}"
-                )
-                return None
-
-            # 更新 token 和页数计数
-            pages_needed = self._estimate_pages_needed(extend_len, prefix_len)
-            self.current_prefill_tokens += extend_len
-            self.current_prefill_pages += pages_needed
-            self.prefill_reqs.append(req)
-            return (req, extend_len, False)
-
-        # 尝试 chunked prefill
-        if chunk_size is None:
-            chunk_size = self.available_prefill_budget
-
-        if chunk_size <= 0:
-            return None
-
-        # 实际可以处理的 chunk 大小
-        actual_chunk_size = min(chunk_size, extend_len, self.available_prefill_budget)
-
-        if actual_chunk_size <= 0:
-            return None
-
-        # 检查 KV cache 容量（chunked prefill 也需要考虑 prefix_len）
-        if not self._can_allocate_kv_cache(actual_chunk_size, prefix_len):
-            return None
-
-        # 标记为 chunked 请求，更新 token 和页数计数
-        pages_needed = self._estimate_pages_needed(actual_chunk_size, prefix_len)
-        self.current_prefill_tokens += actual_chunk_size
-        self.current_prefill_pages += pages_needed
-        self.chunked_reqs.append((req, actual_chunk_size))
-        return (req, actual_chunk_size, True)
-
-    def get_batch_summary(self) -> dict:
-        """获取当前 batch 的摘要"""
-        return {
-            "prefill_reqs": len(self.prefill_reqs),
-            "decode_reqs": len(self.decode_reqs),
-            "chunked_reqs": len(self.chunked_reqs),
-            "prefill_tokens": self.current_prefill_tokens,
-            "prefill_pages": self.current_prefill_pages,
-            "decode_tokens": self.current_decode_tokens,
-            "total_tokens": self.total_tokens,
-            "prefill_budget_remaining": self.available_prefill_budget,
-        }
-
-
-# 保留旧的 TokenBudgetAdder 作为别名以保持向后兼容
 class TokenBudgetAdder:
     """
-    Token 预算加法器 - 用于 Chunked Prefill
+    Token 预算加法器
 
-    注意: 这是旧版实现，建议使用 PrefillAdder
+    用于在调度过程中跟踪当前 batch 的 token 数量，
+    确保不超过 token_budget 限制。支持分别跟踪 extend 和 decode tokens。
     """
 
     def __init__(
         self,
         token_budget: int,
-        max_batch_size: int,
+        max_batch_size: int = 256,
         reserved_decode_tokens: int = 0,
     ):
+        """
+        Args:
+            token_budget: 单次推理的最大 token 数
+            max_batch_size: 最大 batch 大小
+            reserved_decode_tokens: 为 decode 预留的 token 数
+        """
         self.token_budget = token_budget
         self.max_batch_size = max_batch_size
         self.reserved_decode_tokens = reserved_decode_tokens
-        self.reset()
+
+        # 跟踪状态
+        self.current_extend_tokens = 0
+        self.current_decode_tokens = 0
+        self.extend_reqs: List[Any] = []
+        self.decode_reqs: List[Any] = []
+
+    @property
+    def total_tokens(self) -> int:
+        """当前已添加的总 token 数"""
+        return self.current_extend_tokens + self.current_decode_tokens
+
+    @property
+    def total_reqs(self) -> int:
+        """当前已添加的总请求数"""
+        return len(self.extend_reqs) + len(self.decode_reqs)
+
+    def can_add_extend(self, num_tokens: int) -> bool:
+        """检查是否可以添加 extend tokens"""
+        if self.total_reqs >= self.max_batch_size:
+            return False
+        # 可用于 extend 的预算 = token_budget - reserved_decode_tokens - 已用
+        available = (
+            self.token_budget - self.reserved_decode_tokens - self.current_extend_tokens
+        )
+        return num_tokens <= available
+
+    def add_extend(self, req: Any, num_tokens: int) -> bool:
+        """
+        添加 extend 请求
+
+        Returns:
+            True 如果添加成功
+        """
+        if not self.can_add_extend(num_tokens):
+            return False
+        self.extend_reqs.append(req)
+        self.current_extend_tokens += num_tokens
+        return True
+
+    def can_add_decode(self) -> bool:
+        """检查是否可以添加 decode 请求"""
+        if self.total_reqs >= self.max_batch_size:
+            return False
+        # decode 每个请求消耗 1 token
+        return self.total_tokens + 1 <= self.token_budget
+
+    def add_decode(self, req: Any) -> bool:
+        """
+        添加 decode 请求
+
+        Returns:
+            True 如果添加成功
+        """
+        if not self.can_add_decode():
+            return False
+        self.decode_reqs.append(req)
+        self.current_decode_tokens += 1
+        return True
+
+    def remaining(self) -> int:
+        """返回剩余可添加的 token 数"""
+        return self.token_budget - self.total_tokens
 
     def reset(self):
+        """重置计数器"""
         self.current_extend_tokens = 0
         self.current_decode_tokens = 0
         self.extend_reqs = []
         self.decode_reqs = []
 
-    @property
-    def total_tokens(self) -> int:
-        return self.current_extend_tokens + self.current_decode_tokens
-
-    @property
-    def total_reqs(self) -> int:
-        return len(self.extend_reqs) + len(self.decode_reqs)
-
-    @property
-    def available_budget(self) -> int:
-        return self.token_budget - self.total_tokens
-
-    def can_add_extend(self, extend_len: int, prefix_len: int = 0) -> bool:
-        if self.total_reqs >= self.max_batch_size:
-            return False
-        if extend_len > self.available_budget - self.reserved_decode_tokens:
-            return False
-        return True
-
-    def add_extend(self, req, extend_len: int) -> bool:
-        if not self.can_add_extend(extend_len):
-            return False
-        self.current_extend_tokens += extend_len
-        self.extend_reqs.append(req)
-        return True
-
-    def can_add_decode(self) -> bool:
-        if self.total_reqs >= self.max_batch_size:
-            return False
-        if self.total_tokens + 1 > self.token_budget:
-            return False
-        return True
-
-    def add_decode(self, req) -> bool:
-        if not self.can_add_decode():
-            return False
-        self.current_decode_tokens += 1
-        self.decode_reqs.append(req)
-        return True
-
     def get_batch_summary(self) -> dict:
+        """获取 batch 摘要"""
         return {
             "extend_reqs": len(self.extend_reqs),
             "decode_reqs": len(self.decode_reqs),
             "extend_tokens": self.current_extend_tokens,
             "decode_tokens": self.current_decode_tokens,
             "total_tokens": self.total_tokens,
-            "budget_remaining": self.available_budget,
         }
+
+
+class PrefillAdder:
+    """
+    Prefill 预算控制器
+
+    支持 chunked prefill，可以将大的 prefill 请求分成多个 chunk 处理。
+    同时跟踪 token 预算和请求数量。
+    """
+
+    def __init__(
+        self,
+        prefill_budget: Optional[int] = None,
+        reserved_size: int = 0,
+        kv_cache_mgr: Any = None,
+        max_batch_size: int = 256,
+        chunk_size: int = 8192,
+    ):
+        """
+        Args:
+            prefill_budget: Prefill token 预算 (旧 API)
+            reserved_size: 为 decode 预留的 token 数
+            kv_cache_mgr: KV cache 管理器
+            max_batch_size: 最大 batch 大小
+            chunk_size: 分块大小
+            max_num_batched_tokens: 单次推理的最大 token 数 (新 API)
+            max_num_seqs: 单次推理的最大请求数 (新 API)
+            max_extend_tokens: 单个请求的最大 extend token 数
+        """
+        self.prefill_budget = prefill_budget
+        self.reserved_size = reserved_size
+        self.kv_cache_mgr = kv_cache_mgr
+        self.chunk_size = chunk_size
+        self.max_batch_size = max_batch_size
+
+        # 跟踪状态
+        self.current_prefill_tokens = 0
+        self.prefill_reqs: List[Any] = []
+        self.chunked_reqs: List[Any] = []
+
+    @property
+    def total_tokens(self) -> int:
+        """当前已添加的总 token 数"""
+        return self.current_prefill_tokens + self.current_decode_tokens
+
+    @property
+    def available_prefill_budget(self) -> int:
+        """可用的 prefill token 预算"""
+        return self.prefill_budget - self.current_prefill_tokens
+
+    def try_add_prefill(
+        self,
+        req: Any,
+        chunk_size: Optional[int] = None,
+    ) -> Optional[Tuple[Any, int, bool]]:
+        """
+        尝试添加 prefill 请求
+
+        Args:
+            req: 请求对象，需要有 extend_input_len 属性
+            chunk_size: 可选的分块大小
+
+        Returns:
+            (req, actual_extend_len, is_chunked) 或 None
+        """
+        # 检查 batch size 限制
+        if (
+            len(self.prefill_reqs) + self.reserved_size + len(self.chunked_reqs)
+            >= self.max_batch_size
+        ):
+            return None
+
+        extend_len = getattr(req, "extend_input_len", 0)
+
+        # 检查 KV cache 可用空间
+        available = self.kv_cache_mgr.available_tokens()
+        if extend_len > available:
+            return None
+
+        # 检查预算
+        if self.current_prefill_tokens >= self.prefill_budget:
+            return None
+
+        # 计算可处理的长度
+        remaining_budget = self.available_prefill_budget
+        actual_chunk_size = chunk_size or self.chunk_size
+        actual_len = min(extend_len, remaining_budget, actual_chunk_size)
+
+        if actual_len <= 0:
+            return None
+
+        is_chunked = actual_len < extend_len
+
+        if is_chunked:
+            self.chunked_reqs.append(req)
+            req.is_chunked = True
+        else:
+            self.prefill_reqs.append(req)
+
+        self.current_prefill_tokens += actual_len
+
+        return (req, actual_len, is_chunked)
+
+
+def compute_max_total_tokens(
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float16,
+    gpu_memory_utilization: float = 0.9,
+    device: str = "cuda",
+) -> int:
+    """
+    便捷函数：计算 KV cache 可容纳的最大 token 数
+
+    Args:
+        num_layers: 模型层数
+        num_kv_heads: KV head 数量
+        head_dim: head 维度
+        dtype: 数据类型
+        gpu_memory_utilization: GPU 显存利用率
+        device: GPU 设备
+
+    Returns:
+        max_total_tokens: 可分配的总 token 数
+    """
+    return _determine_num_tokens(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        memory_ratio=gpu_memory_utilization,
+        device=device,
+    )

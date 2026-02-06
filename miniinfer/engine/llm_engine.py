@@ -216,18 +216,30 @@ class LLMEngine:
         #     self.ps.append(process)
         #     self.events.append(event)
         config = self.config
+
+        # 初始化 KV Cache 管理器
+        # 使用 MemoryBudgetManager 自动计算 max_total_tokens
         self.kv_cache_mgr = KVCacheManager(
-            size=config.max_total_tokens,
+            size=config.max_total_tokens,  # None 时自动根据 GPU 显存计算
             max_requests=config.max_num_seqs,
             max_context_len=config.max_context_len,
             num_layers=config.hf_config.num_hidden_layers,
             num_heads=config.hf_config.num_key_value_heads,  # 使用 KV head 数量，支持 GQA
             head_dim=config.hf_config.hidden_size
             // config.hf_config.num_attention_heads,
-            # 传递显存预算相关配置
+            dtype=config.dtype,
+            device="cuda",
+            enable_prefix_cache=config.enable_prefix_cache,
+            page_size=config.page_size,
+            max_extend_tokens=config.max_extend_len,
+            # 显存预算相关配置
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_num_batched_tokens=config.max_num_batched_tokens,
         )
+
+        # 将实际计算的 max_total_tokens 回写到 config
+        config.max_total_tokens = self.kv_cache_mgr.size
+
         # Model Runner (rank 0)
         self.model_runner = ModelRunner(self.config, self.kv_cache_mgr, 0, self.events)
 
@@ -250,10 +262,14 @@ class LLMEngine:
         self._started = True
 
         # 打印内存预算信息
+        budget_stats = self.kv_cache_mgr.memory_budget.get_stats()
         logger.info(
             f"Memory budget initialized: "
-            f"max_num_batched_tokens={config.max_num_batched_tokens}, "
-            f"gpu_memory_utilization={config.gpu_memory_utilization}"
+            f"max_total_tokens={budget_stats['max_total_tokens']}, "
+            f"num_pages={budget_stats['num_pages']}, "
+            f"kv_cache_memory={budget_stats['kv_cache_memory_gb']:.2f}GB, "
+            f"max_num_batched_tokens={budget_stats['max_num_batched_tokens']}, "
+            f"gpu_memory_utilization={budget_stats['gpu_memory_utilization']}"
         )
 
     def start(self):

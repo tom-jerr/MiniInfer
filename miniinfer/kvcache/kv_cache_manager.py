@@ -16,6 +16,7 @@ from kvcache.memory_budget import (
     MemoryBudgetManager,
     get_gpu_memory_stats,
     estimate_kv_cache_memory_per_token,
+    _determine_num_tokens,
 )
 from engine.scheduler_batch import ScheduledBatch, Req, ForwardMode, ForwardBatch
 
@@ -27,29 +28,52 @@ class KVCacheManager:
     KV Cache 管理器
 
     由多个组件构成:
-    - CacheStorage: 物理存储
-    - TokenAllocator: 分配 KV indices
+    - CacheStorage: 物理存储 (MHAKVCacheStorage)
+    - TokenAllocator: 分配 KV indices (PagedTokenAllocator)
     - RequestPool: 管理不同请求分配
-    - PrefixCache: 前缀缓存 (Radix Tree)
-    - MemoryBudgetManager: 显存预算管理（可选）
+    - PrefixCache: 前缀缓存 (RadixCache)
+    - MemoryBudgetManager: 显存预算管理
+
+    初始化流程:
+    1. 使用 gpu_memory_utilization 计算 GPU 空闲显存能容纳的 max_total_tokens
+    2. 根据 max_total_tokens 初始化物理存储和各组件
     """
 
     def __init__(
         self,
-        size: int,
-        max_requests: int,
-        max_context_len: int,
-        num_layers: int,
-        num_heads: int,
-        head_dim: int,
+        size: Optional[int] = None,  # 现在可以为 None，自动计算
+        max_requests: int = 256,
+        max_context_len: int = 4096,
+        num_layers: int = 32,
+        num_heads: int = 8,
+        head_dim: int = 128,
         dtype: torch.dtype = torch.float16,
         device: str = "cuda",
         enable_prefix_cache: bool = True,
         page_size: int = 256,
+        max_extend_tokens: int = 8192,
+        # 新增显存预算参数
         gpu_memory_utilization: float = 0.9,
         max_num_batched_tokens: Optional[int] = None,
     ):
-        self.size = size
+        """
+        初始化 KV Cache 管理器
+
+        Args:
+            size: KV cache 容量（token 数），None 时自动根据 GPU 显存计算
+            max_requests: 最大并发请求数
+            max_context_len: 单请求最大上下文长度
+            num_layers: 模型层数
+            num_heads: KV head 数量
+            head_dim: head 维度
+            dtype: 数据类型
+            device: GPU 设备
+            enable_prefix_cache: 是否启用前缀缓存
+            page_size: 每页 token 数
+            max_extend_tokens: 单次 prefill 最大 token 数
+            gpu_memory_utilization: GPU 显存利用率 (0.0 ~ 1.0)
+            max_num_batched_tokens: 单次推理最大 token 数
+        """
         self.max_requests = max_requests
         self.max_context_len = max_context_len
         self.num_layers = num_layers
@@ -59,6 +83,30 @@ class KVCacheManager:
         self.device = device
         self.enable_prefix_cache = enable_prefix_cache
         self.page_size = page_size
+        self.max_extend_tokens = max_extend_tokens
+        self.gpu_memory_utilization = gpu_memory_utilization
+
+        # 初始化显存预算管理器
+        self.memory_budget = MemoryBudgetManager(
+            num_layers=num_layers,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            page_size=page_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_total_tokens=size,  # 如果 size 为 None，会自动计算
+            max_num_batched_tokens=max_num_batched_tokens,
+            device=device,
+        )
+
+        # 使用显存预算管理器计算的 size
+        self.size = self.memory_budget.max_total_tokens
+
+        logger.info(
+            f"KVCacheManager: size={self.size} tokens, "
+            f"num_pages={self.memory_budget.num_pages}, "
+            f"memory={self.memory_budget.kv_cache_memory_bytes / (1024**3):.2f}GB"
+        )
 
         # 初始化物理存储
         self.storage: IKVCacheStorage = MHAKVCacheStorage(
@@ -94,71 +142,8 @@ class KVCacheManager:
         else:
             self.prefix_cache = None
 
-        # 初始化显存预算管理器
-        self.memory_budget_mgr = MemoryBudgetManager(
-            num_layers=num_layers,
-            num_kv_heads=num_heads,
-            head_dim=head_dim,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_total_tokens=size,
-            max_num_batched_tokens=max_num_batched_tokens,
-            dtype=dtype,
-            device=device,
-        )
-
-        # 计算每个 token 的 KV cache 占用
-        self.bytes_per_token = estimate_kv_cache_memory_per_token(
-            num_layers, num_heads, head_dim, dtype
-        )
-
-        logger.info(
-            f"KVCacheManager initialized: size={size}, "
-            f"max_requests={max_requests}, prefix_cache={enable_prefix_cache}, "
-            f"bytes_per_token={self.bytes_per_token}"
-        )
-
-    # ============== Memory Budget Methods ==============
-
-    def get_memory_budget(self) -> int:
-        """获取当前可用于新分配的 token 预算"""
-        current_used = self.size - self.available_tokens()
-        return self.memory_budget_mgr.get_max_new_tokens_budget(current_used)
-
-    def can_allocate_tokens(self, num_tokens: int) -> bool:
-        """
-        检查是否可以分配指定数量的 tokens
-
-        综合考虑:
-        1. TokenAllocator 的可用槽位
-        2. 显存预算限制
-        """
-        # 检查 TokenAllocator 可用槽位
-        if self.available_tokens() < num_tokens:
-            return False
-
-        # 检查显存预算
-        current_used = self.size - self.available_tokens()
-        if not self.memory_budget_mgr.can_allocate(num_tokens, current_used):
-            return False
-
-        return True
-
-    def estimate_extend_tokens(self, reqs: List[Req]) -> int:
-        """估算一组请求需要的 extend token 数"""
-        return sum(req.extend_input_len for req in reqs)
-
-    def estimate_decode_tokens(self, reqs: List[Req]) -> int:
-        """估算一组 decode 请求需要的 token 数（每个请求 1 token）"""
-        return len(reqs)
-
-    def get_memory_stats(self) -> dict:
-        """获取详细的显存统计信息"""
-        gpu_stats = get_gpu_memory_stats(self.device)
-        return {
-            "gpu_memory": gpu_stats,
-            "kv_cache": self.get_stats(),
-            "memory_budget": self.memory_budget_mgr.get_stats(),
-        }
+        # prefill max length
+        self.max_extend_tokens = max_extend_tokens
 
     # ============== public methods for scheduler ==============
 

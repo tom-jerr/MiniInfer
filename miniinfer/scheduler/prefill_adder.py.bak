@@ -1,0 +1,219 @@
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple, Any
+from enum import Enum, auto
+from contextlib import contextmanager
+import math
+import torch
+import logging
+
+logger = logging.getLogger(__name__)
+
+# SGLang 常量
+CLIP_MAX_NEW_TOKENS = 4096
+
+
+class AddReqResult(Enum):
+    """添加请求的结果状态"""
+    CONTINUE = auto()  # 继续添加请求
+    NO_TOKEN = auto()  # 没有足够 token
+    OTHER = auto()  # 其他原因停止添加
+
+
+def _align_up(value: int, alignment: int) -> int:
+    """向上对齐到 alignment 的整数倍"""
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _align_down(value: int, alignment: int) -> int:
+    """向下对齐到 alignment 的整数倍"""
+    return (value // alignment) * alignment
+
+
+class PrefillAdder:
+    """
+    Prefill 预算控制器 (SGLang 风格)
+
+    核心思想：
+    1. 从 KV cache 总可用 token 数出发
+    2. 先扣除正在 decode 的请求所需的 new_token 预算（由 new_token_ratio 估算）
+    3. 剩余的才是 prefill 可用的 input 预算
+    4. 所有预算以 page_size 粒度对齐
+    5. 支持 chunked prefill
+
+    预算变量：
+    - rem_total_tokens:  KV cache 剩余可用 token（已扣除 decode 预留）
+    - rem_input_tokens:  剩余 prefill 输入 token 预算（不超过 max_extend_len）
+    - cur_rem_tokens:    当前轮次剩余可用 token（动态扣减）
+    """
+
+    def __init__(
+        self,
+        available_kv_tokens: int,
+        running_bs: int,
+        new_token_ratio: float,
+        max_new_tokens: int,
+        max_extend_len: int,
+        max_batch_size: int = 256,
+        chunk_size: int = 8192,
+        page_size: int = 256,
+    ):
+        """
+        Args:
+            available_kv_tokens: KV cache 中当前可用 token 数
+            running_bs: 正在 decode 的请求数量
+            new_token_ratio: 为每个 decode 请求预留的新 token 比例
+            max_extend_len: 单次 prefill 最大输入 token 数
+            max_batch_size: 最大 batch 大小
+            chunk_size: 分块大小
+            page_size: 对齐粒度
+        """
+        self.max_batch_size = max_batch_size
+        self.chunk_size = chunk_size
+        self.page_size = page_size
+        self.running_bs = running_bs
+
+        # ========== 预算计算（核心逻辑）==========
+        # 为 decode 请求预留的 token 数 = running_bs * new_token_ratio * max_context_len 的简化版
+        # SGLang 风格：decode_reserve = running_bs * estimated_new_tokens_per_req
+        # 这里用 new_token_ratio 乘以总可用 token 来估算预留量
+        decode_reserve = (
+            int(available_kv_tokens * new_token_ratio) if running_bs > 0 else 0
+        )
+        decode_reserve = _align_up(decode_reserve, page_size)
+
+        # rem_total_tokens: 扣除 decode 预留后的 KV cache 可用量
+        self.rem_total_tokens = _align_down(
+            max(available_kv_tokens - decode_reserve, 0), page_size
+        )
+
+        # rem_input_tokens: 单次 prefill 的输入 token 预算上限
+        self.rem_input_tokens = _align_down(
+            min(self.rem_total_tokens, max_extend_len), page_size
+        )
+
+        # cur_rem_tokens: 当前轮次剩余可用 token（动态扣减）
+        self.cur_rem_tokens = self.rem_total_tokens
+
+        # 跟踪状态
+        self.prefill_reqs: List[Any] = []
+        self.chunked_reqs: List[Any] = []
+        self.current_prefill_tokens = 0  # 已加入的 prefill token 总数
+
+        logger.debug(
+            f"PrefillAdder: available={available_kv_tokens}, "
+            f"decode_reserve={decode_reserve}, "
+            f"rem_total={self.rem_total_tokens}, "
+            f"rem_input={self.rem_input_tokens}"
+        )
+
+    @property
+    def total_reqs(self) -> int:
+        return len(self.prefill_reqs) + len(self.chunked_reqs)
+
+    @property
+    def available_prefill_budget(self) -> int:
+        """当前可用的 prefill token 预算"""
+        return min(self.cur_rem_tokens, self.rem_input_tokens)
+
+    def no_remaining_budget(self) -> bool:
+        """是否已无剩余预算"""
+        return self.cur_rem_tokens <= 0 or self.rem_input_tokens <= 0
+
+    def try_add_prefill(
+        self,
+        req: Any,
+        chunk_size: Optional[int] = None,
+    ) -> Optional[Tuple[Any, int, bool]]:
+        """
+        尝试添加 prefill 请求
+
+        对齐逻辑: extend_len 向上对齐到 page_size 计算 real 占用，
+        检查是否超过 rem_total_tokens / rem_input_tokens。
+
+        Args:
+            req: 请求对象，需要有 extend_input_len 属性
+            chunk_size: 可选的分块大小
+
+        Returns:
+            (req, actual_extend_len, is_chunked) 或 None
+        """
+        # 检查 batch size 限制
+        if self.total_reqs + self.running_bs >= self.max_batch_size:
+            return None
+
+        # 检查预算是否已用尽
+        if self.no_remaining_budget():
+            return None
+
+        extend_len = getattr(req, "extend_input_len", 0)
+        if extend_len <= 0:
+            return None
+
+        # 对齐后的实际占用 token 数（用于预算检查）
+        real_tokens = _align_up(extend_len, self.page_size)
+
+        # 检查 total token 预算
+        if real_tokens > self.cur_rem_tokens:
+            # 如果启用 chunked prefill，降级为 chunk
+            actual_chunk_size = chunk_size or self.chunk_size
+            if chunk_size is not None:
+                # 尝试塞入一个 chunk
+                actual_len = _align_down(
+                    min(self.cur_rem_tokens, self.rem_input_tokens, actual_chunk_size),
+                    self.page_size,
+                )
+                if actual_len <= 0:
+                    return None
+                # chunked 路径
+                return self._add_chunked(req, actual_len)
+            else:
+                return None
+
+        # 检查 input token 预算
+        if real_tokens > self.rem_input_tokens:
+            if chunk_size is not None:
+                actual_len = _align_down(
+                    min(
+                        self.rem_input_tokens,
+                        self.cur_rem_tokens,
+                        chunk_size or self.chunk_size,
+                    ),
+                    self.page_size,
+                )
+                if actual_len <= 0:
+                    return None
+                return self._add_chunked(req, actual_len)
+            else:
+                return None
+
+        # 检查是否需要 chunk（超过 chunk_size）
+        actual_chunk_size = chunk_size or self.chunk_size
+        if chunk_size is not None and extend_len > actual_chunk_size:
+            actual_len = min(actual_chunk_size, extend_len)
+            return self._add_chunked(req, actual_len)
+
+        # 完整 prefill
+        self.prefill_reqs.append(req)
+        self._update_prefill_budget(real_tokens, extend_len)
+        return (req, extend_len, False)
+
+    def _add_chunked(self, req: Any, actual_len: int) -> Tuple[Any, int, bool]:
+        """内部：添加为 chunked 请求"""
+        real_tokens = _align_up(actual_len, self.page_size)
+        self.chunked_reqs.append(req)
+        req.is_chunked = True
+        self._update_prefill_budget(real_tokens, actual_len)
+        return (req, actual_len, True)
+
+    def _update_prefill_budget(self, real_tokens: int, input_tokens: int):
+        """
+        扣减预算
+
+        Args:
+            real_tokens: 对齐后的实际 token 占用（page 级别）
+            input_tokens: 原始 input token 数
+        """
+        self.cur_rem_tokens -= real_tokens
+        self.rem_total_tokens -= real_tokens
+        self.rem_input_tokens -= input_tokens
+        self.current_prefill_tokens += input_tokens

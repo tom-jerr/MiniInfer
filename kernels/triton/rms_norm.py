@@ -95,12 +95,12 @@ def add_rms_norm_kernel(
     tl.store(x_new_row_start_ptr + offsets, acc, mask=mask)
 
     # RMSNorm on acc
-    acc_f32 = acc.to(tl.float32)
-    mean_square = tl.sum(acc_f32 * acc_f32, axis=0) / N
+    # acc_f32 = acc.to(tl.float32)
+    mean_square = tl.sum(acc * acc, axis=0) / N
     rstd = tl.rsqrt(mean_square + eps)
 
     w_vals = tl.load(w_ptr + offsets, mask=mask, other=0.0)
-    output = acc * rstd.to(acc.dtype) * w_vals
+    output = acc * rstd * w_vals
 
     output_row_start_ptr = output_ptr + row_idx * stride_y_row
     tl.store(output_row_start_ptr + offsets, output, mask=mask)

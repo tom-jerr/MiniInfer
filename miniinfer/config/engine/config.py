@@ -1,39 +1,66 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 from transformers import AutoConfig
 import torch
 
 
 @dataclass
 class EngineConfig:
-    model: str
-    max_num_seqs: int = 512
-    max_context_len: int = 4096
-    max_total_tokens: int = 20480
+    """
+    推理引擎配置
+
+    显存管理相关参数:
+    - gpu_memory_utilization: GPU 显存利用率 (0.0 ~ 1.0)，用于计算 KV cache 可用容量
+    - max_total_tokens: 手动指定 KV cache 可容纳的最大 token 数（覆盖自动计算）
+    - max_num_batched_tokens: 单次推理的最大 token 数（用于 prefill 调度）
+    - num_pages: 手动指定 KV cache 页面数（覆盖自动计算）
+    - page_size: 每页包含的 token 数
+    """
+
+    model_path: str
+    dtype: torch.dtype = torch.float16
+    attention_backend: str = "flash_attention_2"
+
+    # ============ 显存管理配置 ============
+    # GPU 显存利用率，用于自动计算 KV cache 容量
     gpu_memory_utilization: float = 0.9
+    # the size of kv cache page
+    num_pages: Optional[int] = None
+    # 每页 token 数
+    page_size: int = 256
+
+    # ============ 调度配置 ============
+    max_num_seqs: int = 256
+    max_context_len: int = 4096
+    max_extend_len: int = 8192  # for chunked prefill
+    chunked_prefill_size: int = 4096
+    enable_prefix_cache: bool = True
+    enable_chunked_prefill: bool = False
+
+    # ============ 并行配置 ============
     tensor_parallel_size: int = 1
+
+    # ============ 其他配置 ============
     enforce_eager: bool = False
-    hf_config: AutoConfig | None = None
+    hf_config: Optional[AutoConfig] = field(default=None, repr=False)
     eos: int = -1
 
-    # ============ Chunked Prefill / Memory Budget 配置 ============
-    # 每个 batch 的最大 token 数（包括 extend + decode）
-    # 设置为 None 则使用 max_total_tokens
-    max_num_batched_tokens: int | None = None
-    # 是否启用 chunked prefill（将长 prefill 拆分成多个 chunk）
-    enable_chunked_prefill: bool = False
-    # chunked prefill 的 chunk 大小（每次最多处理多少 token）
-    chunked_prefill_size: int = 4096
-    # 为 decode 请求预留的 token 数（防止 prefill 饿死 decode）
-    reserved_decode_tokens: int = 256
+    # 别名支持（兼容旧配置）
+    @property
+    def model(self) -> str:
+        return self.model_path
+
+    @property
+    def memory_ratio(self) -> float:
+        """兼容旧的 memory_ratio 参数名"""
+        return self.gpu_memory_utilization
 
     def __post_init__(self):
-        # assert os.path.isdir(self.model)
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        # 加载 HuggingFace 配置
+        self.hf_config = AutoConfig.from_pretrained(self.model_path)
+
+        # 限制 max_context_len 不超过模型支持的最大位置编码
         self.max_context_len = min(
             self.max_context_len, self.hf_config.max_position_embeddings
         )
-
-        # 如果没有指定 max_num_batched_tokens，使用 max_total_tokens
-        if self.max_num_batched_tokens is None:
-            self.max_num_batched_tokens = self.max_total_tokens

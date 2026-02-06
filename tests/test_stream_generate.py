@@ -523,8 +523,8 @@ def run_all_tests(model_path: Optional[str] = None):
 
     # 如果提供了模型路径，运行真实测试
     if model_path:
-        # test_stream_generate_with_engine(model_path)
-        # test_generate_with_engine(model_path)
+        test_stream_generate_with_engine(model_path)
+        test_generate_with_engine(model_path)
         # test_dynamic_add_request(model_path)
         test_prefix_cache_reuse_after_finished_request(model_path)
     else:
