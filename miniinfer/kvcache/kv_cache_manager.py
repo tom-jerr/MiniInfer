@@ -1,5 +1,7 @@
 """KV Cache Manager - 由 Scheduler 持有"""
 
+import triton.language as tl
+import triton
 from typing import Optional, List, Tuple, Any
 import torch
 import logging
@@ -12,13 +14,7 @@ from kvcache.interface import (
 )
 from kvcache.memory_pool import MHAKVCacheStorage, PagedTokenAllocator, RequestPool
 from kvcache.radix_cache import RadixCache
-from kvcache.memory_budget import (
-    MemoryBudgetManager,
-    get_gpu_memory_stats,
-    estimate_kv_cache_memory_per_token,
-    _determine_num_tokens,
-)
-from engine.scheduler_batch import ScheduledBatch, Req, ForwardMode, ForwardBatch
+from scheduler.scheduler_batch import ScheduledBatch, Req, ForwardMode, ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +37,7 @@ class KVCacheManager:
 
     def __init__(
         self,
-        size: Optional[int] = None,  # 现在可以为 None，自动计算
+        size: int,  # 现在可以为 None，自动计算
         max_requests: int = 256,
         max_context_len: int = 4096,
         num_layers: int = 32,
@@ -52,9 +48,6 @@ class KVCacheManager:
         enable_prefix_cache: bool = True,
         page_size: int = 256,
         max_extend_tokens: int = 8192,
-        # 新增显存预算参数
-        gpu_memory_utilization: float = 0.9,
-        max_num_batched_tokens: Optional[int] = None,
     ):
         """
         初始化 KV Cache 管理器
@@ -71,8 +64,6 @@ class KVCacheManager:
             enable_prefix_cache: 是否启用前缀缓存
             page_size: 每页 token 数
             max_extend_tokens: 单次 prefill 最大 token 数
-            gpu_memory_utilization: GPU 显存利用率 (0.0 ~ 1.0)
-            max_num_batched_tokens: 单次推理最大 token 数
         """
         self.max_requests = max_requests
         self.max_context_len = max_context_len
@@ -84,23 +75,6 @@ class KVCacheManager:
         self.enable_prefix_cache = enable_prefix_cache
         self.page_size = page_size
         self.max_extend_tokens = max_extend_tokens
-        self.gpu_memory_utilization = gpu_memory_utilization
-
-        # 初始化显存预算管理器
-        self.memory_budget = MemoryBudgetManager(
-            num_layers=num_layers,
-            num_kv_heads=num_heads,
-            head_dim=head_dim,
-            dtype=dtype,
-            page_size=page_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_total_tokens=size,  # 如果 size 为 None，会自动计算
-            max_num_batched_tokens=max_num_batched_tokens,
-            device=device,
-        )
-
-        # 使用显存预算管理器计算的 size
-        self.size = self.memory_budget.max_total_tokens
 
         logger.info(
             f"KVCacheManager: size={self.size} tokens, "
@@ -180,7 +154,7 @@ class KVCacheManager:
 
         # Init batch metadata
         batch.forward_mode = ForwardMode.EXTEND
-        extend_ids = [r.fill_ids[len(r.prefix_indices) :] for r in batch.reqs]
+        extend_ids = [r.fill_ids[len(r.prefix_indices):] for r in batch.reqs]
         extend_num_tokens = sum(len(ids) for ids in extend_ids)
         seq_lens = [len(r.fill_ids) for r in batch.reqs]
         prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
@@ -189,7 +163,8 @@ class KVCacheManager:
         extend_ids_tensor = torch.tensor(
             [token_id for ids in extend_ids for token_id in ids], dtype=torch.int64
         ).to(self.device)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(self.device)
+        seq_lens_tensor = torch.tensor(
+            seq_lens, dtype=torch.int64).to(self.device)
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
 
         batch.prefix_lens = prefix_lens
@@ -270,7 +245,8 @@ class KVCacheManager:
         if bs == 0:
             return
         last_tokens = [req.output_ids[-1] for req in batch.reqs]
-        batch.input_ids = torch.tensor(last_tokens, dtype=torch.int64).to(self.device)
+        batch.input_ids = torch.tensor(
+            last_tokens, dtype=torch.int64).to(self.device)
         batch.output_ids = None
         token_per_req = 1  # decode
 
@@ -326,10 +302,10 @@ class KVCacheManager:
             # 插入到前缀缓存
             new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
             self.token_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
+                kv_indices[req.cache_protected_len: new_prefix_len]
             )
         else:
-            self.token_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_allocator.free(kv_indices[req.cache_protected_len:])
 
         self.request_pool.free([req_pool_idx])  # param is list
         if self.prefix_cache is not None:
@@ -340,13 +316,14 @@ class KVCacheManager:
         if is_insert and self.prefix_cache is not None:
             token_ids = req.origin_input_ids + req.output_ids
             num_tokens = len(token_ids)
-            kv_indices = self.request_pool.read(req.req_pool_idx, slice(0, num_tokens))
+            kv_indices = self.request_pool.read(
+                req.req_pool_idx, slice(0, num_tokens))
             new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
             self.token_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
+                kv_indices[req.cache_protected_len: new_prefix_len]
             )
         else:
-            self.token_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_allocator.free(kv_indices[req.cache_protected_len:])
 
         self.request_pool.free([req.req_pool_idx])  # param is list
         if self.prefix_cache is not None:
@@ -357,15 +334,17 @@ class KVCacheManager:
         if self.prefix_cache is None:
             return
         token_ids = req.fill_ids
-        kv_indices = self.request_pool.read(req.req_pool_idx, slice(0, len(token_ids)))
+        kv_indices = self.request_pool.read(
+            req.req_pool_idx, slice(0, len(token_ids)))
         new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
-        self.token_allocator.free(kv_indices[req.cache_protected_len : new_prefix_len])
+        self.token_allocator.free(
+            kv_indices[req.cache_protected_len: new_prefix_len])
         # update req metadata
         new_indices, new_last_node = self.prefix_cache.match_prefix(token_ids)
         self.request_pool.write(
             req.req_pool_idx,
             slice(req.cache_protected_len, len(new_indices)),
-            new_indices[req.cache_protected_len :],
+            new_indices[req.cache_protected_len:],
         )
 
         self.prefix_cache.dec_lock_ref(req.last_node)
@@ -401,7 +380,7 @@ class KVCacheManager:
 
     def available_tokens(self) -> int:
         """返回可用的 token 槽位数"""
-        return self.token_allocator.available_size()
+        return self.token_allocator.available_size() + self.prefix_cache.evictable_size() if self.prefix_cache is not None else self.token_allocator.available_size()
 
     def can_allocate(self, num_tokens: int) -> bool:
         """检查是否可以分配指定数量的 tokens"""
@@ -416,10 +395,6 @@ class KVCacheManager:
             "utilization": 1.0 - self.available_tokens() / self.size,
             "kv_cache_bytes": self.storage.get_kv_size_bytes(),
         }
-
-
-import triton
-import triton.language as tl
 
 
 @triton.jit

@@ -20,7 +20,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # 最大新 token 裁剪值，防止极端长输出请求过度预留 decode 空间
-CLIP_MAX_NEW_TOKENS = 4096
+CLIP_MAX_NEW_TOKENS = 1024
 
 
 class AddReqResult(Enum):
@@ -256,14 +256,14 @@ class PrefillAdder:
             )
         else:
             # ---- chunked: 截断为一个 chunk ----
-            trunc_len = (self.rem_chunk_tokens // self.page_size) * self.page_size
+            trunc_len = (self.rem_chunk_tokens //
+                         self.page_size) * self.page_size
             if trunc_len <= 0:
                 return AddReqResult.OTHER
 
             req.extend_input_len = trunc_len
             prefix_len = len(getattr(req, "prefix_indices", []))
-            if hasattr(req, "fill_ids") and req.fill_ids:
-                req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
+            req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
             self.can_run_list.append(req)
             self.new_chunked_req = req
@@ -302,8 +302,7 @@ class PrefillAdder:
         truncated = extend_len > _rem_tokens
         req.extend_input_len = min(extend_len, _rem_tokens)
         prefix_len = len(getattr(req, "prefix_indices", []))
-        if hasattr(req, "fill_ids") and req.fill_ids:
-            req.fill_ids = req.fill_ids[: prefix_len + req.extend_input_len]
+        req.fill_ids = req.fill_ids[: prefix_len + req.extend_input_len]
 
         self.can_run_list.append(req)
 

@@ -25,8 +25,6 @@ class EngineConfig:
     # ============ 显存管理配置 ============
     # GPU 显存利用率，用于自动计算 KV cache 容量
     gpu_memory_utilization: float = 0.9
-    # the size of kv cache page
-    num_pages: Optional[int] = None
     # 每页 token 数
     page_size: int = 256
 

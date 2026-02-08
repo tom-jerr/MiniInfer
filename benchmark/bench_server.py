@@ -6,6 +6,14 @@ from random import randint, seed
 from miniinfer.utils.sampling_params import SamplingParams
 from miniinfer.engine.llm_engine import LLMEngine
 
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,  # 想要 INFO 就改 INFO
+    format="%(asctime)s %(levelname)s %(name)s:%(lineno)d - %(message)s",
+    force=True,  # Python 3.8+：确保生效（避免被别的库提前配置）
+)
+
 
 def main():
     seed(0)
@@ -18,7 +26,6 @@ def main():
         model="Qwen/Qwen2-0.5B-Instruct",
         enable_chunked_prefill=False,  # 启用 chunked prefill
         chunked_prefill_size=4096,  # 每个 chunk 最多 4096 tokens
-        gpu_memory_utilization=0.9,  # 使
     )
 
     prompt_token_ids = [

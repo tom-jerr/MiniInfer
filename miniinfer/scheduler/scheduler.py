@@ -87,12 +87,15 @@ class Scheduler:
         self.tokenizer = tokenizer
         self.kv_cache_mgr = kv_cache_mgr
         self.max_batch_size = config.max_num_seqs
-        self.max_extend_len = getattr(config, "max_extend_len", config.max_total_tokens)
+        self.max_extend_len = getattr(
+            config, "max_extend_len", config.max_total_tokens)
         self.page_size = getattr(config, "page_size", 256)
 
         # ============ Token Budget 控制 ============
-        self.enable_chunked_prefill = getattr(config, "enable_chunked_prefill", False)
-        self.chunked_prefill_size = getattr(config, "chunked_prefill_size", 4096)
+        self.enable_chunked_prefill = getattr(
+            config, "enable_chunked_prefill", False)
+        self.chunked_prefill_size = getattr(
+            config, "chunked_prefill_size", 4096)
 
         # ============ 动态 new_token_ratio ============
         self.new_token_ratio = _INIT_NEW_TOKEN_RATIO
@@ -275,7 +278,7 @@ class Scheduler:
                 # KV cache 不足，后续请求也无法添加
                 remaining_waiting.append(req)
                 remaining_waiting.extend(
-                    self.waiting_queue[self.waiting_queue.index(req) + 1 :]
+                    self.waiting_queue[self.waiting_queue.index(req) + 1:]
                 )
                 break
             elif result == AddReqResult.OTHER:
@@ -458,8 +461,7 @@ class Scheduler:
         # 从 req 上的 req_pool_idx 重建
         pool_indices = []
         for req in batch.reqs:
-            if hasattr(req, "req_pool_idx") and req.req_pool_idx >= 0:
-                pool_indices.append(req.req_pool_idx)
+            pool_indices.append(req.req_pool_idx)
 
         if pool_indices:
             device = (
@@ -474,7 +476,8 @@ class Scheduler:
             seq_lens = [
                 len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
             ]
-            batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+            batch.seq_lens = torch.tensor(
+                seq_lens, dtype=torch.int64, device=device)
             batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         else:
             batch.req_pool_indices = None
@@ -502,10 +505,10 @@ class Scheduler:
         if batch.req_pool_indices is None or batch.seq_lens is None:
             return
 
-        req_pool_idx = batch.req_pool_indices[req_idx_in_batch : req_idx_in_batch + 1]
-        seq_len = batch.seq_lens[req_idx_in_batch : req_idx_in_batch + 1]
+        req_pool_idx = batch.req_pool_indices[req_idx_in_batch: req_idx_in_batch + 1]
+        seq_len = batch.seq_lens[req_idx_in_batch: req_idx_in_batch + 1]
         seq_len_cpu = (
-            batch.seq_lens_cpu[req_idx_in_batch : req_idx_in_batch + 1]
+            batch.seq_lens_cpu[req_idx_in_batch: req_idx_in_batch + 1]
             if batch.seq_lens_cpu is not None
             else None
         )

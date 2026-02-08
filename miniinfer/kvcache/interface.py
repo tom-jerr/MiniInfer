@@ -98,6 +98,15 @@ class IRequestPool(ABC):
 
 class IPrefixCache(ABC):
     """前缀缓存接口"""
+    @abstractmethod
+    def evictable_size(self) -> int:
+        """返回可驱逐的 token 数"""
+        pass
+
+    @abstractmethod
+    def protected_size(self) -> int:
+        """返回可驱逐的 token 数"""
+        pass
 
     @abstractmethod
     def match_prefix(self, key: List[int]) -> Tuple[torch.Tensor, Any]:

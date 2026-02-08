@@ -22,7 +22,7 @@ def _key_match_paged(key0: List[int], key1: List[int], page_size: int) -> int:
     min_len = min(len(key0), len(key1))
     i = 0
     while i < min_len:
-        if key0[i : i + page_size] != key1[i : i + page_size]:
+        if key0[i: i + page_size] != key1[i: i + page_size]:
             break
         i += page_size
 
@@ -69,8 +69,10 @@ class RadixCache(IPrefixCache):
             self.get_child_key_fn = get_child_key
         else:
             print("Using paged radix tree with page size", self.page_size)
-            self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
-            self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
+            self.key_match_fn = partial(
+                _key_match_paged, page_size=self.page_size)
+            self.get_child_key_fn = partial(
+                get_child_key, page_size=self.page_size)
         if self.token_allocator is not None:
             self.device = self.token_allocator.device
         else:
@@ -135,7 +137,6 @@ class RadixCache(IPrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def inc_lock_ref(self, node: TreeNode):
-
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
@@ -147,7 +148,6 @@ class RadixCache(IPrefixCache):
         return delta
 
     def dec_lock_ref(self, node: TreeNode):
-
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
