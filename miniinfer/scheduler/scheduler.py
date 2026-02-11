@@ -87,15 +87,12 @@ class Scheduler:
         self.tokenizer = tokenizer
         self.kv_cache_mgr = kv_cache_mgr
         self.max_batch_size = config.max_num_seqs
-        self.max_extend_len = getattr(
-            config, "max_extend_len", config.max_total_tokens)
+        self.max_extend_len = getattr(config, "max_extend_len", 8192)
         self.page_size = getattr(config, "page_size", 256)
+        self.gpu_memory_utilization = getattr(config, "gpu_memory_utilization", 0.6)
 
-        # ============ Token Budget 控制 ============
-        self.enable_chunked_prefill = getattr(
-            config, "enable_chunked_prefill", False)
-        self.chunked_prefill_size = getattr(
-            config, "chunked_prefill_size", 4096)
+        self.enable_chunked_prefill = getattr(config, "enable_chunked_prefill", False)
+        self.chunked_prefill_size = getattr(config, "chunked_prefill_size", 4096)
 
         # ============ 动态 new_token_ratio ============
         self.new_token_ratio = _INIT_NEW_TOKEN_RATIO
@@ -109,9 +106,6 @@ class Scheduler:
         self.cur_batch: Optional[ScheduledBatch] = None
         self.last_batch: Optional[ScheduledBatch] = None
         self.num_retracted_reqs: int = 0
-
-        # ============ Decode 饿死保护 ============
-        self.decode_waiting_ticks: int = 0  # decode 连续未被调度的轮数
 
         # ============ 已完成的请求 ============
         self.finished_reqs: List[Req] = []
@@ -144,52 +138,49 @@ class Scheduler:
         self.waiting_queue.append(req)
 
     def has_unfinished(self) -> bool:
-        return len(self.waiting_queue) > 0 or len(self.running_batch.reqs) > 0
+        return (
+            len(self.waiting_queue) > 0
+            or len(self.running_batch.reqs) > 0
+            or len(self.chunking_reqs) > 0
+        )
 
     def get_num_unfinished(self) -> int:
-        return len(self.waiting_queue) + len(self.running_batch.reqs)
+        return (
+            len(self.waiting_queue)
+            + len(self.running_batch.reqs)
+            + len(self.chunking_reqs)
+        )
 
     # ======================== 调度主循环 ========================
 
     def schedule(self, device: torch.device = None) -> Optional[ScheduledBatch]:
         """
-        调度主循环 — prefill 优先、decode 兜底、防饿死
+        调度主循环 — Sarathi-Serve 风格 stall-free batching
 
-        流程:
+        当开启 chunked prefill 时:
         1. 过滤已完成请求
-        2. 如果 decode 饿死保护触发 → 强制走 decode 路径
-        3. 尝试拼 prefill 批次 (get_new_batch_prefill)
-        4. 如果 prefill 为空 → 走 decode 路径 (update_running_batch)
-        5. 返回调度好的批次
+        2. 尝试构建 mixed batch (decode + prefill)，decode 优先
+        3. 如果 prefill 队列为空且有 decode → 走纯 decode 路径
+
+        当未开启 chunked prefill 时:
+        1. 过滤已完成请求
+        2. 尝试 prefill 批次
+        3. 如果 prefill 为空 → 走 decode 路径
         """
-        # Step 0: 过滤已完成的请求
+        # Step 1: 过滤已完成的请求
         self._filter_batch(self.running_batch)
         running_bs = len(self.running_batch.reqs)
 
-        # Step 1: decode 饿死保护
-        if running_bs > 0 and self.decode_waiting_ticks >= _DECODE_STARVATION_TICKS:
-            logger.warning(
-                f"Decode starvation detected: {self.decode_waiting_ticks} ticks, "
-                f"forcing decode batch (running_bs={running_bs})"
-            )
-            self.decode_waiting_ticks = 0
-            return self._get_decode_batch(device)
-
-        # Step 2: 尝试拼 prefill 批次
+        # Step 2: 尝试拼 prefill/mixed 批次
         prefill_batch = self._get_new_batch_prefill(device)
 
         if prefill_batch is not None:
-            # 有 prefill → decode 等待轮数 +1
-            if running_bs > 0:
-                self.decode_waiting_ticks += 1
             return prefill_batch
 
-        # Step 3: 没有 prefill → 回退到 decode
+        # Step 3: 没有 prefill → 回退到纯 decode
         if running_bs > 0:
-            self.decode_waiting_ticks = 0
             return self._get_decode_batch(device)
 
-        # 什么都没有
         return None
 
     # ======================== Prefill 批次构建 ========================
@@ -238,11 +229,17 @@ class Scheduler:
             cached_len = chunked_req.cached_len + chunked_req.chunk_size
             remaining_len = req.total_input_len - cached_len
 
-            if remaining_len <= 0:
-                # chunk 全部完成 → 可以进入 decode
-                req.is_chunked = False
-                self.running_batch.reqs.append(req)
-                continue
+            # 关键: 恢复 fill_ids 为完整序列。
+            # 上一轮 PrefillAdder 会破坏性地截断 fill_ids，
+            # 而续 chunk 需要完整的 fill_ids 才能正确切片出后续 token。
+            req.fill_ids = req.origin_input_ids + req.output_ids
+
+            # 释放上一轮分配的 req_pool slot，防止泄漏。
+            # update_unfinished_req_radix_cache 已将 KV 写入 radix cache，
+            # prefix_indices 指向 radix cache 中的 KV 位置，旧 slot 不再需要。
+            if getattr(req, 'req_pool_idx', -1) >= 0:
+                self.kv_cache_mgr.request_pool.free([req.req_pool_idx])
+                req.req_pool_idx = -1
 
             # 更新 req 的 extend_input_len 供 add_chunked_req 使用
             req.extend_input_len = remaining_len
@@ -255,6 +252,18 @@ class Scheduler:
                 # 还有后续 chunk，留到下一轮
                 remaining_chunks.append(
                     ChunkedReq(req, cached_len + actual_chunk_size, 0)
+                )
+                logger.debug(
+                    f"Continuing chunked req_id={req.req_id}, "
+                    f"cached_len={cached_len}, "
+                    f"actual_chunk_size={actual_chunk_size}, "
+                    f"remaining_len={remaining_len - actual_chunk_size}"
+                )
+            else:
+                logger.debug(
+                    f"Finished chunked req_id={req.req_id}, "
+                    f"cached_len={cached_len}, "
+                    f"actual_chunk_size={actual_chunk_size}"
                 )
 
         self.chunking_reqs = remaining_chunks
@@ -278,7 +287,7 @@ class Scheduler:
                 # KV cache 不足，后续请求也无法添加
                 remaining_waiting.append(req)
                 remaining_waiting.extend(
-                    self.waiting_queue[self.waiting_queue.index(req) + 1:]
+                    self.waiting_queue[self.waiting_queue.index(req) + 1 :]
                 )
                 break
             elif result == AddReqResult.OTHER:
@@ -317,11 +326,27 @@ class Scheduler:
             if not chunked_req.is_last_chunk:
                 self.chunking_reqs.append(chunked_req)
 
-        # 构建批次
-        batch = ScheduledBatch.init_new(all_extend_reqs, device=device)
-        batch.forward_mode = ForwardMode.EXTEND
+        # ---- 构建 mixed batch: prefill + decode ----
+        # 当开启 chunked prefill 且有 running decode 请求时，
+        # 将 decode 请求附加到 prefill 批次，组成 mixed batch，
+        # 所有请求统一使用 extend kernel 处理（decode 视为 extend_len=1）
+        decode_reqs = []
+        if self.enable_chunked_prefill and running_reqs:
+            decode_reqs = list(running_reqs)  # 复制列表，不修改原 running_batch
+
+        # 合并所有请求: prefill extend + decode (as extend_len=1)
+        all_batch_reqs = all_extend_reqs + decode_reqs
+
+        batch = ScheduledBatch.init_new(all_batch_reqs, device=device)
+        batch.decoding_reqs = decode_reqs if decode_reqs else None
+
+        if decode_reqs:
+            batch.forward_mode = ForwardMode.MIXED
+        else:
+            batch.forward_mode = ForwardMode.EXTEND
+
         self._prepare_chunked_input_ids(batch, all_chunked_reqs)
-        self.kv_cache_mgr.prepare_for_extend(batch)
+        self.kv_cache_mgr.prepare_for_mixed(batch, all_extend_reqs, decode_reqs)
 
         # 非 chunked 请求完成 prefill 后加入 running_batch
         for req in all_extend_reqs:
@@ -404,18 +429,44 @@ class Scheduler:
         available = self.kv_cache_mgr.available_tokens()
         bs = len(self.running_batch.reqs)
 
-        # 每个 decode 请求至少需要 1 token
-        # 最坏情况：每个请求都需要一个新 page
-        needed = bs  # 简化估算：每个 req 1 token
+        # 精确估算 decode 需要的新 page 数
+        # 当 seq_len 跨越 page 边界时需要分配整个新 page
+        if self.running_batch.seq_lens_cpu is not None:
+            seq_lens_next = self.running_batch.seq_lens_cpu + 1
+            num_new_pages = (seq_lens_next % self.page_size == 1).int().sum().item()
+            needed = num_new_pages * self.page_size
+        else:
+            # 回退到保守估算：最坏情况每个请求都需要新 page
+            needed = bs * self.page_size
+
+        logger.debug(
+            f"Check decode mem: available={available}, needed={needed}, "
+            f"running_bs={bs}"
+        )
+
+        # 增加安全裕量：即使本步不需要新 page，也需要为后续几步预留
+        needed = max(needed, bs)
 
         if available >= needed:
             return False
 
         # 内存不足 → 从 batch 尾部开始收缩
         retract_count = 0
-        while len(self.running_batch.reqs) > 0 and available < len(
-            self.running_batch.reqs
-        ):
+        while len(self.running_batch.reqs) > 0:
+            # 重新估算剩余请求的实际需求
+            remaining_bs = len(self.running_batch.reqs)
+            if self.running_batch.seq_lens_cpu is not None and remaining_bs > 0:
+                remaining_seq_lens = self.running_batch.seq_lens_cpu[:remaining_bs] + 1
+                remaining_pages = (
+                    (remaining_seq_lens % self.page_size == 1).int().sum().item()
+                )
+                remaining_needed = max(remaining_pages * self.page_size, remaining_bs)
+            else:
+                remaining_needed = remaining_bs
+
+            if available >= remaining_needed:
+                break
+
             req = self.running_batch.reqs.pop()
             retract_count += 1
 
@@ -425,6 +476,7 @@ class Scheduler:
             # 标记为被收缩，重新放回 waiting 队列头部
             req.is_retracted = True
             req.finished = False
+            req.is_chunked = False
             # 重置 KV 相关状态，下次重新 prefill
             req.output_ids = []
             req.fill_ids = []
@@ -476,8 +528,7 @@ class Scheduler:
             seq_lens = [
                 len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
             ]
-            batch.seq_lens = torch.tensor(
-                seq_lens, dtype=torch.int64, device=device)
+            batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
             batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         else:
             batch.req_pool_indices = None
@@ -505,10 +556,10 @@ class Scheduler:
         if batch.req_pool_indices is None or batch.seq_lens is None:
             return
 
-        req_pool_idx = batch.req_pool_indices[req_idx_in_batch: req_idx_in_batch + 1]
-        seq_len = batch.seq_lens[req_idx_in_batch: req_idx_in_batch + 1]
+        req_pool_idx = batch.req_pool_indices[req_idx_in_batch : req_idx_in_batch + 1]
+        seq_len = batch.seq_lens[req_idx_in_batch : req_idx_in_batch + 1]
         seq_len_cpu = (
-            batch.seq_lens_cpu[req_idx_in_batch: req_idx_in_batch + 1]
+            batch.seq_lens_cpu[req_idx_in_batch : req_idx_in_batch + 1]
             if batch.seq_lens_cpu is not None
             else None
         )

@@ -202,7 +202,7 @@ def qwen_2_7b_model_exists() -> bool:
 # Naive Attention Backend (No KV Cache)
 # ============================================================================
 import torch.nn as nn
-from miniinfer.engine.scheduler_batch import ForwardBatch, ForwardMode
+from miniinfer.scheduler.scheduler_batch import ForwardBatch, ForwardMode
 
 
 class NaiveAttnBackend:
@@ -324,4 +324,3 @@ def create_simple_forward_batch(
     batch.attn_backend = NaiveAttnBackend(use_causal_mask=use_causal_mask)
 
     return batch
-

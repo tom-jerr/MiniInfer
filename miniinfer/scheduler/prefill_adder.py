@@ -59,6 +59,7 @@ class PrefillAdder:
         max_batch_size: int = 256,
         chunk_size: Optional[int] = None,
         page_size: int = 256,
+        min_decode_reserve_pages: int = 2,
     ):
         """
         Args:
@@ -69,12 +70,14 @@ class PrefillAdder:
             max_batch_size:      最大 batch 大小
             chunk_size:          分块大小；None 表示禁用 chunked prefill
             page_size:           KV cache 页对齐粒度
+            min_decode_reserve_pages: 为 decode 预留的最小 page 数（软限制保护）
         """
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
         self.page_size = page_size
         self.new_token_ratio = new_token_ratio
         self.available_kv_tokens = available_kv_tokens
+        self.min_decode_reserve = min_decode_reserve_pages * page_size
 
         # ========== 预算偏移 ==========
         # rem_total_token_offset: 累计预留量 (running 预留 + prefill 即时占用 + prefill 新 token 预留)
@@ -201,6 +204,62 @@ class PrefillAdder:
         self.log_input_tokens += aligned
 
     # ------------------------------------------------------------------ #
+    #  Chunked prefill helper
+    # ------------------------------------------------------------------ #
+
+    def _do_chunked_prefill(
+        self, req: Any, trunc_len: int, extend_len: int, max_tokens: int, reason: str
+    ) -> AddReqResult:
+        """
+        执行 chunked prefill 截断操作。
+
+        Args:
+            req: 请求对象
+            trunc_len: 截断后的长度（已对齐到 page_size）
+            extend_len: 原始 extend_input_len
+            max_tokens: 请求的 max_tokens（用于预留 decode 空间）
+            reason: 截断原因（用于日志）
+
+        Returns:
+            AddReqResult.CONTINUE 如果成功
+            AddReqResult.OTHER 如果 trunc_len <= 0
+        """
+        if trunc_len <= 0:
+            logger.debug(f"try_add_prefill: {reason} - trunc_len={trunc_len} <= 0")
+            return AddReqResult.OTHER
+
+        # 判断是否真正截断了请求
+        actually_truncated = trunc_len < extend_len
+
+        req.extend_input_len = trunc_len
+        prefix_len = len(getattr(req, "prefix_indices", []))
+        req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
+
+        self.can_run_list.append(req)
+
+        if actually_truncated:
+            # 真正被截断了，标记为 chunked，不预留 decode 空间
+            req.is_chunked = True
+            self.new_chunked_req = req
+            self._update_prefill_budget(0, trunc_len, 0)
+            logger.debug(
+                f"try_add_prefill: CHUNKED ({reason}) - extend_len={extend_len} "
+                f"truncated to {trunc_len}, rem_total={self.rem_total_tokens}"
+            )
+        else:
+            # 没有真正截断，完整 prefill，预留 decode 空间
+            req.is_chunked = False
+            self._update_prefill_budget(
+                0, trunc_len, min(max_tokens, CLIP_MAX_NEW_TOKENS)
+            )
+            logger.debug(
+                f"try_add_prefill: COMPLETE ({reason}) - extend_len={extend_len}, "
+                f"rem_total={self.rem_total_tokens}"
+            )
+
+        return AddReqResult.CONTINUE
+
+    # ------------------------------------------------------------------ #
     #  添加请求
     # ------------------------------------------------------------------ #
 
@@ -211,6 +270,7 @@ class PrefillAdder:
         检查顺序:
         1. batch size 上限
         2. 总 token 预算 (extend + decode 预留 ≤ rem_total_tokens)
+           - 如果启用 chunked prefill，尝试分块处理而不是直接拒绝
         3. 输入 token 预算 (extend ≤ rem_input_tokens)
         4. chunked prefill 预算 (extend ≤ rem_chunk_tokens)
 
@@ -230,16 +290,70 @@ class PrefillAdder:
         max_tokens = getattr(req, "max_tokens", 0)
         output_len = len(getattr(req, "output_ids", []))
         # 该请求整体需要的 token: extend 输入 + 未来 decode 输出预留
-        total_tokens = extend_len + min(
-            max(max_tokens - output_len, 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
+        decode_reserve = min(max(max_tokens - output_len, 0), CLIP_MAX_NEW_TOKENS)
+        total_tokens = extend_len + decode_reserve
 
         input_tokens = self.ceil_paged_tokens(extend_len)
 
         # --- 总 token 预算检查 ---
+        # 修改: 当启用 chunked prefill 时，不直接返回 NO_TOKEN，
+        # 而是尝试分块处理请求
         if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
+            # 如果 chunked prefill 未启用，直接拒绝
+            if self.rem_chunk_tokens is None:
+                return AddReqResult.NO_TOKEN
+
+            # 检查是否有足够空间进行至少一个 page 的 chunk
+            min_chunk = self.page_size
+            if self.rem_total_tokens < min_chunk:
+                logger.debug(
+                    f"try_add_prefill: NO_TOKEN - rem_total_tokens={self.rem_total_tokens} "
+                    f"< min_chunk={min_chunk}"
+                )
+                return AddReqResult.NO_TOKEN
+
+            # 在 budget_limited 分支中，total_tokens > rem_total_tokens，
+            # 意味着无法完整执行请求（extend + decode 预留）。
+            # 必须使用 chunked 路径：只执行一部分 extend，不预留 decode 空间。
+            # chunked 请求不预留 decode，只需要保留 1 个 token 的余量
+            available_for_chunk = max(self.rem_total_tokens - 1, 0)
+            available_for_chunk = (
+                available_for_chunk // self.page_size
+            ) * self.page_size
+
+            if available_for_chunk < min_chunk:
+                logger.debug(
+                    f"try_add_prefill: NO_TOKEN - available_for_chunk={available_for_chunk} "
+                    f"< min_chunk={min_chunk}"
+                )
+                return AddReqResult.NO_TOKEN
+
+            # 截断为可用的 chunk 大小（取可用空间、请求长度、chunk预算的最小值）
+            trunc_len = min(
+                available_for_chunk, extend_len, self.rem_chunk_tokens or extend_len
+            )
+            trunc_len = (trunc_len // self.page_size) * self.page_size
+
+            # 关键：既然是 budget_limited，必须确保是真正的 chunk（trunc_len < extend_len）
+            # 如果 trunc_len == extend_len，说明空间足够执行完整请求，但不够 decode 预留
+            # 此时必须强制截断，让出空间给 decode
+            if trunc_len >= extend_len:
+                # 向下减少一个 page，强制截断
+                trunc_len = max(trunc_len - self.page_size, 0)
+                trunc_len = (trunc_len // self.page_size) * self.page_size
+                if trunc_len < min_chunk:
+                    logger.debug(
+                        f"try_add_prefill: NO_TOKEN - forced truncation resulted in "
+                        f"trunc_len={trunc_len} < min_chunk={min_chunk}"
+                    )
+                    return AddReqResult.NO_TOKEN
+
+            result = self._do_chunked_prefill(
+                req, trunc_len, extend_len, max_tokens, "budget_limited"
+            )
+            if result != AddReqResult.CONTINUE:
+                return AddReqResult.NO_TOKEN
+            return AddReqResult.CONTINUE
 
         # --- 输入 token 预算检查 (已有请求时不再加，留给下轮) ---
         if input_tokens >= self.rem_input_tokens and len(self.can_run_list) > 0:
@@ -255,22 +369,20 @@ class PrefillAdder:
                 min(max_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
-            # ---- chunked: 截断为一个 chunk ----
-            trunc_len = (self.rem_chunk_tokens //
-                         self.page_size) * self.page_size
-            if trunc_len <= 0:
-                return AddReqResult.OTHER
+            # ---- chunked: 输入超过 chunk 预算，按 chunk_size 截断 ----
+            trunc_len = (self.rem_chunk_tokens // self.page_size) * self.page_size
+            result = self._do_chunked_prefill(
+                req, trunc_len, extend_len, max_tokens, "chunk_size_limited"
+            )
+            if result != AddReqResult.CONTINUE:
+                return result
 
-            req.extend_input_len = trunc_len
-            prefix_len = len(getattr(req, "prefix_indices", []))
-            req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
-
-            self.can_run_list.append(req)
-            self.new_chunked_req = req
-            # chunk 中途不预留 decode 空间（max_new_tokens=0），等最后一个 chunk 再预留
-            self._update_prefill_budget(0, trunc_len, 0)
-
-        return self.budget_state()
+        # 请求已成功加入 can_run_list，返回 CONTINUE 表示"本请求添加成功"。
+        # 后续请求是否能继续添加，由调用方的 no_remaining_budget() 判断。
+        # 注意：不能返回 budget_state()，因为页对齐膨胀 + decode 预留
+        # 可能使 rem_total_tokens 略为负数，导致返回 NO_TOKEN，
+        # 而调用方会误认为请求未被添加，形成死循环。
+        return AddReqResult.CONTINUE
 
     def add_chunked_req(self, req: Any) -> Any:
         """
@@ -313,5 +425,6 @@ class PrefillAdder:
             # 仅在最后一个 chunk 时预留 decode 空间
             min(max_tokens, CLIP_MAX_NEW_TOKENS) if not truncated else 0,
         )
+        req.is_chunked = truncated
 
         return req if truncated else None

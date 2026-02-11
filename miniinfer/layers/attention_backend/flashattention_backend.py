@@ -1,7 +1,7 @@
 from __future__ import annotations
 from .base_backend import AttentionBackend
 from miniinfer.layers.attention import AttentionImpl
-from miniinfer.engine.scheduler_batch import ForwardBatch
+from miniinfer.scheduler.scheduler_batch import ForwardBatch
 from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 import torch
 from dataclasses import dataclass

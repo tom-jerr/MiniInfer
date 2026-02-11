@@ -21,10 +21,13 @@ class ForwardMode(IntEnum):
     IDLE = auto()
 
     def is_extend(self) -> bool:
-        return self == ForwardMode.EXTEND
+        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
 
     def is_decode(self) -> bool:
         return self == ForwardMode.DECODE
+
+    def is_mixed(self) -> bool:
+        return self == ForwardMode.MIXED
 
 
 class BatchType(IntEnum):
@@ -119,8 +122,9 @@ class ChunkedReq:
         self.cached_len = cached_len  # 包括 prefix cache + 已处理的 chunk
         self.chunk_size = chunk_size  # 当前 chunk 要处理的 token 数
 
-        # 更新原始请求的状态
-        req.is_chunked = True
+        # 不要在这里修改 req.is_chunked！
+        # add_chunked_req / _do_chunked_prefill 已经正确设置了 is_chunked 状态。
+        # 最后一个 chunk 时 is_chunked = False，此时不应该被改回 True。
 
     @property
     def input_len(self) -> int:

@@ -1,6 +1,6 @@
 from typing import Any, Dict, Optional
 
-from engine.scheduler_batch import ForwardBatch
+from miniinfer.scheduler.scheduler_batch import ForwardBatch
 
 from .base import BaseModelOutput
 import torch

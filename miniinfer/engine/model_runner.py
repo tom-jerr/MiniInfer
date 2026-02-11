@@ -14,7 +14,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
 from config.engine.config import EngineConfig
-from .scheduler_batch import ForwardBatch, ForwardMode
+from miniinfer.scheduler.scheduler_batch import ForwardBatch, ForwardMode
 from loader.weight import load_hf_weight
 from config.model.qwen2 import Qwen2Config
 from config.model.base import PretrainedConfig
@@ -38,7 +38,7 @@ class ModelRunner:
     def __init__(
         self,
         config: EngineConfig,
-        kv_cache_mgr: Any,
+        kv_cache_mgr: Any = None,
         rank: int = 0,
         events: list = None,
         attn_backend: str = "flash_attn",
@@ -48,6 +48,8 @@ class ModelRunner:
         self.rank = rank
         self.events = events or []
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.attn_backend = None
+        self._attn_backend_type = attn_backend
 
         if "Qwen2" in config.model:
             self.model_config: PretrainedConfig = Qwen2Config.from_pretrained(
@@ -59,7 +61,10 @@ class ModelRunner:
             self.model = None
         self.sampler = Sampler()
         self.init_load_model()
-        self.init_attn_backend(attn_backend)
+
+        # 如果提供了 kv_cache_mgr，立即初始化 attn_backend
+        if kv_cache_mgr is not None:
+            self.init_attn_backend(attn_backend)
 
     def init_load_model(self):
         """初始化加载模型"""
@@ -70,17 +75,33 @@ class ModelRunner:
         self.model.eval()
         logger.info(f"Model loaded on device {self.device}.")
 
-    def init_attn_backend(self, attn_backend: str):
+    def init_attn_backend(self, attn_backend: str = None):
+        """初始化 attention backend（需要先提供 kv_cache_mgr）"""
+        if self.kv_cache_mgr is None:
+            raise RuntimeError("Cannot initialize attn_backend without kv_cache_mgr")
+
+        attn_backend = attn_backend or self._attn_backend_type
         if attn_backend not in ["flash_attn"]:
             raise ValueError(f"Unsupported attention backend: {attn_backend}")
         self.attn_backend = FlashAttention2Backend(self.kv_cache_mgr)
         logger.info(f"Using {self.attn_backend.type()} as attention backend.")
+
+    def set_kv_cache_mgr(self, kv_cache_mgr: Any):
+        """设置 KV Cache 管理器并初始化 attn_backend"""
+        self.kv_cache_mgr = kv_cache_mgr
+        self.init_attn_backend()
 
     def forward(
         self,
         forward_batch: ForwardBatch,
         return_hidden_states: bool = False,
     ) -> BaseModelOutput:
+        if self.attn_backend is None:
+            raise RuntimeError(
+                "Attention backend not initialized. "
+                "Call set_kv_cache_mgr() first to initialize the backend."
+            )
+
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 forward_batch, return_hidden_states=return_hidden_states

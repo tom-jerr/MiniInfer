@@ -1,0 +1,7 @@
+2026-02-11 14:38:38,804 DEBUG urllib3.connectionpool:1049 - Starting new HTTPS connection (1): huggingface.co:443
+2026-02-11 14:38:40,266 DEBUG urllib3.connectionpool:544 - https://huggingface.co:443 "HEAD /Qwen/Qwen2-0.5B-Instruct/resolve/main/config.json HTTP/1.1" 307 0
+2026-02-11 14:38:40,737 DEBUG urllib3.connectionpool:544 - https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2-0.5B-Instruct/c540970f9e29518b1d8f06ab8b24cba66ad77b6d/config.json HTTP/1.1" 200 0
+2026-02-11 14:38:40,816 INFO miniinfer.engine.llm_engine:416 - Initializing LLMEngine in single-process mode
+2026-02-11 14:38:40,816 INFO miniinfer.engine.llm_engine:434 - Step 1: Loading model...
+2026-02-11 14:38:41,326 DEBUG urllib3.connectionpool:544 - https://huggingface.co:443 "HEAD /Qwen/Qwen2-0.5B-Instruct/resolve/main/config.json HTTP/1.1" 307 0
+2026-02-11 14:38:41,764 DEBUG urllib3.connectionpool:544 - https://huggingface.co:443 "HEAD /api/resolve-cache/models/Qwen/Qwen2-0.5B-Instruct/c540970f9e29518b1d8f06ab8b24cba66ad77b6d/config.json HTTP/1.1" 200 0

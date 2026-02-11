@@ -4,13 +4,16 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 from miniinfer.layers.attention import AttentionImpl
+
 if TYPE_CHECKING:
     from miniinfer.engine.scheduler_batch import ForwardBatch
 
+
 class AttentionBackend(ABC):
     """The base class of attention backends"""
+
     @abstractmethod
-    def type(self)->str:
+    def type(self) -> str:
         """Return the type of attention backend."""
         raise NotImplementedError()
 
@@ -32,7 +35,7 @@ class AttentionBackend(ABC):
         """Run forward on an attention layer."""
         # if forward_batch.forward_mode.is_idle():
         #     return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        
+
         if forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 q,
@@ -44,6 +47,9 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         else:
+            # EXTEND and MIXED both use forward_extend.
+            # In MIXED mode, decode requests are treated as extend with len=1,
+            # so the extend kernel handles all sequences uniformly.
             return self.forward_extend(
                 q,
                 k,

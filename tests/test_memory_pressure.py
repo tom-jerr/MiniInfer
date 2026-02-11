@@ -24,20 +24,28 @@
     pytest tests/test_memory_pressure.py -v -s
 """
 
+import gc
 import time
 import logging
 from random import randint, seed
 
 import pytest
 import torch
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 
 from miniinfer.utils.sampling_params import SamplingParams
 from miniinfer.engine.llm_engine import LLMEngine
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(name)s:%(lineno)d - %(message)s",
     force=True,
+    # filename="memory_pressure_test.log",
+    # filemode="w",
 )
 logger = logging.getLogger(__name__)
 
@@ -101,9 +109,7 @@ class TestPrefillExceedsMemory:
             for _ in range(num_seqs)
         ]
         sampling_params = [
-            SamplingParams(
-                temperature=0.6, ignore_eos=True, max_tokens=output_tokens
-            )
+            SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_tokens)
             for _ in range(num_seqs)
         ]
 
@@ -120,9 +126,9 @@ class TestPrefillExceedsMemory:
         elapsed = time.time() - t
 
         # 验证
-        assert len(results) == num_seqs, (
-            f"Expected {num_seqs} results, got {len(results)}"
-        )
+        assert (
+            len(results) == num_seqs
+        ), f"Expected {num_seqs} results, got {len(results)}"
         for i, result in enumerate(results):
             assert len(result["token_ids"]) == output_tokens, (
                 f"Request {i}: expected {output_tokens} output tokens, "
@@ -181,8 +187,7 @@ class TestDecodeExceedsMemory:
         num_seqs = min(num_seqs, 256)
 
         prompt_token_ids = [
-            [randint(0, 10000) for _ in range(prompt_len)]
-            for _ in range(num_seqs)
+            [randint(0, 10000) for _ in range(prompt_len)] for _ in range(num_seqs)
         ]
         sampling_params = [
             SamplingParams(
@@ -208,9 +213,9 @@ class TestDecodeExceedsMemory:
         elapsed = time.time() - t
 
         # 验证
-        assert len(results) == num_seqs, (
-            f"Expected {num_seqs} results, got {len(results)}"
-        )
+        assert (
+            len(results) == num_seqs
+        ), f"Expected {num_seqs} results, got {len(results)}"
         for i, result in enumerate(results):
             expected_len = sampling_params[i].max_tokens
             assert len(result["token_ids"]) == expected_len, (
@@ -346,9 +351,7 @@ class TestChunkedPrefillExceedsMemory:
 
         prompt_token_ids = [[randint(0, 10000) for _ in range(prompt_len)]]
         sampling_params = [
-            SamplingParams(
-                temperature=0.6, ignore_eos=True, max_tokens=output_tokens
-            )
+            SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_tokens)
         ]
 
         logger.info(
@@ -365,8 +368,7 @@ class TestChunkedPrefillExceedsMemory:
         assert len(results[0]["text"]) > 0
 
         logger.info(
-            f"Chunked prefill test PASSED: "
-            f"{output_tokens} tokens in {elapsed:.2f}s"
+            f"Chunked prefill test PASSED: " f"{output_tokens} tokens in {elapsed:.2f}s"
         )
 
     def test_multiple_long_prefills_chunked(self, engine):
@@ -387,9 +389,7 @@ class TestChunkedPrefillExceedsMemory:
             for _ in range(num_seqs)
         ]
         sampling_params = [
-            SamplingParams(
-                temperature=0.6, ignore_eos=True, max_tokens=output_tokens
-            )
+            SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_tokens)
             for _ in range(num_seqs)
         ]
 
@@ -448,13 +448,10 @@ class TestExtremeRequestCount:
         output_tokens = 16
 
         prompt_token_ids = [
-            [randint(0, 10000) for _ in range(prompt_len)]
-            for _ in range(num_seqs)
+            [randint(0, 10000) for _ in range(prompt_len)] for _ in range(num_seqs)
         ]
         sampling_params = [
-            SamplingParams(
-                temperature=0.6, ignore_eos=True, max_tokens=output_tokens
-            )
+            SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_tokens)
             for _ in range(num_seqs)
         ]
 
@@ -498,30 +495,36 @@ if __name__ == "__main__":
     print(f"\nKV cache capacity: {kv_cap} tokens")
 
     # --- Test 1: Prefill 压力 ---
-    print("\n" + "-" * 60)
-    print("Test 1: Prefill exceeds KV cache")
-    print("-" * 60)
-    test_prefill = TestPrefillExceedsMemory()
-    test_prefill.test_many_long_prefills(llm)
+    # print("\n" + "-" * 60)
+    # print("Test 1: Prefill exceeds KV cache")
+    # print("-" * 60)
+    # test_prefill = TestPrefillExceedsMemory()
+    # test_prefill.test_many_long_prefills(llm)
 
-    # --- Test 2: Decode 压力 ---
-    print("\n" + "-" * 60)
-    print("Test 2: Decode exceeds KV cache")
-    print("-" * 60)
-    test_decode = TestDecodeExceedsMemory()
-    test_decode.test_many_concurrent_decodes(llm)
+    # # --- Test 2: Decode 压力 ---
+    # print("\n" + "-" * 60)
+    # print("Test 2: Decode exceeds KV cache")
+    # print("-" * 60)
+    # test_decode = TestDecodeExceedsMemory()
+    # test_decode.test_many_concurrent_decodes(llm)
 
-    # --- Test 3: 混合压力 ---
-    print("\n" + "-" * 60)
-    print("Test 3: Mixed pressure")
-    print("-" * 60)
-    test_mixed = TestMixedPressure()
-    test_mixed.test_mixed_long_prefill_and_decode(llm)
+    # # --- Test 3: 混合压力 ---
+    # print("\n" + "-" * 60)
+    # print("Test 3: Mixed pressure")
+    # print("-" * 60)
+    # test_mixed = TestMixedPressure()
+    # test_mixed.test_mixed_long_prefill_and_decode(llm)
 
     # --- Test 4: Chunked Prefill ---
     print("\n" + "-" * 60)
     print("Test 4: Chunked Prefill")
     print("-" * 60)
+    # 先释放之前的 engine，避免两个模型同时占用显存导致 OOM
+    llm.stop()
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
+
     llm_chunked = LLMEngine(
         model=MODEL_NAME,
         enable_chunked_prefill=True,
@@ -536,6 +539,17 @@ if __name__ == "__main__":
     print("\n" + "-" * 60)
     print("Test 5: Extreme request count")
     print("-" * 60)
+    # 释放 chunked engine，创建新的 engine 用于 Test 5
+    llm_chunked.stop()
+    del llm_chunked
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    llm = LLMEngine(
+        model=MODEL_NAME,
+        enable_chunked_prefill=False,
+    )
+    _warmup(llm)
     test_extreme = TestExtremeRequestCount()
     test_extreme.test_request_count_far_exceeds_batch_limit(llm)
 

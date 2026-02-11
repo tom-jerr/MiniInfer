@@ -37,7 +37,7 @@ class KVCacheManager:
 
     def __init__(
         self,
-        size: int,  # 现在可以为 None，自动计算
+        size: int,
         max_requests: int = 256,
         max_context_len: int = 4096,
         num_layers: int = 32,
@@ -76,11 +76,8 @@ class KVCacheManager:
         self.page_size = page_size
         self.max_extend_tokens = max_extend_tokens
 
-        logger.info(
-            f"KVCacheManager: size={self.size} tokens, "
-            f"num_pages={self.memory_budget.num_pages}, "
-            f"memory={self.memory_budget.kv_cache_memory_bytes / (1024**3):.2f}GB"
-        )
+        # for debug
+        self.size = size
 
         # 初始化物理存储
         self.storage: IKVCacheStorage = MHAKVCacheStorage(
@@ -119,6 +116,14 @@ class KVCacheManager:
         # prefill max length
         self.max_extend_tokens = max_extend_tokens
 
+        logger.info(
+            f"Initialized KVCacheManager with size={size} tokens, "
+            f"max_requests={max_requests}, max_context_len={max_context_len}, "
+            f"num_layers={num_layers}, num_heads={num_heads}, head_dim={head_dim}, "
+            f"dtype={dtype}, device={device}, enable_prefix_cache={enable_prefix_cache}, "
+            f"page_size={page_size}, max_extend_tokens={max_extend_tokens}"
+        )
+
     # ============== public methods for scheduler ==============
 
     def prefix_for_waiting_req(self, req: "Req"):
@@ -142,7 +147,7 @@ class KVCacheManager:
             req.cache_protected_len = 0
             req.last_node = None
         req.extend_input_len = len(req.fill_ids) - req.cache_protected_len
-        print(
+        logger.debug(
             f"prefix_for_waiting_req: req_id={req.req_id}, prefix_len={req.cache_protected_len}, extend_input_len={req.extend_input_len}"
         )
 
@@ -154,7 +159,7 @@ class KVCacheManager:
 
         # Init batch metadata
         batch.forward_mode = ForwardMode.EXTEND
-        extend_ids = [r.fill_ids[len(r.prefix_indices):] for r in batch.reqs]
+        extend_ids = [r.fill_ids[len(r.prefix_indices) :] for r in batch.reqs]
         extend_num_tokens = sum(len(ids) for ids in extend_ids)
         seq_lens = [len(r.fill_ids) for r in batch.reqs]
         prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
@@ -163,8 +168,7 @@ class KVCacheManager:
         extend_ids_tensor = torch.tensor(
             [token_id for ids in extend_ids for token_id in ids], dtype=torch.int64
         ).to(self.device)
-        seq_lens_tensor = torch.tensor(
-            seq_lens, dtype=torch.int64).to(self.device)
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(self.device)
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
 
         batch.prefix_lens = prefix_lens
@@ -237,6 +241,187 @@ class KVCacheManager:
         batch.req_pool_indices = req_pool_indices_tensor
         batch.out_cache_loc = out_cache_loc
 
+    def prepare_for_mixed(
+        self,
+        batch: "ScheduledBatch",
+        extend_reqs: list,
+        decode_reqs: list,
+    ):
+        """
+        为 mixed batch (prefill + decode) 准备 KV cache。
+
+        Mixed batch 将 decode 请求视为 extend_len=1 的 extend 请求，
+        这样所有请求统一使用 extend kernel 处理。
+
+        Args:
+            batch: 包含所有请求 (extend_reqs + decode_reqs) 的 ScheduledBatch
+            extend_reqs: prefill/chunked prefill extend 请求列表
+            decode_reqs: 正在 decode 的请求列表（已有 req_pool_idx 和 KV cache）
+        """
+        if not decode_reqs:
+            # 没有 decode 请求，退化为纯 extend
+            self.prepare_for_extend(batch)
+            return
+
+        # ============ 处理 extend 请求 (新 prefill) ============
+        extend_ids_list = []
+        extend_seq_lens = []
+        extend_prefix_lens = []
+        extend_extend_lens = []
+        extend_prefix_tensors = []
+
+        for r in extend_reqs:
+            ids = r.fill_ids[len(r.prefix_indices) :]
+            extend_ids_list.append(ids)
+            extend_seq_lens.append(len(r.fill_ids))
+            extend_prefix_lens.append(len(r.prefix_indices))
+            extend_extend_lens.append(r.extend_input_len)
+            extend_prefix_tensors.append(r.prefix_indices)
+
+        extend_num_tokens = sum(len(ids) for ids in extend_ids_list)
+
+        # ============ 处理 decode 请求 (视为 extend_len=1) ============
+        decode_ids_list = []
+        decode_seq_lens = []
+        decode_prefix_lens = []
+        decode_extend_lens = []
+
+        for r in decode_reqs:
+            # decode 请求的 "extend" 就是最后一个 output token
+            last_token_id = r.output_ids[-1]
+            decode_ids_list.append([last_token_id])
+            cur_seq_len = len(r.origin_input_ids) + len(r.output_ids)
+            decode_seq_lens.append(cur_seq_len)
+            decode_prefix_lens.append(cur_seq_len - 1)  # 前面全是 "prefix"
+            decode_extend_lens.append(1)
+
+        decode_num_tokens = len(decode_reqs)
+        total_new_tokens = extend_num_tokens + decode_num_tokens
+
+        # ============ 合并 batch metadata ============
+        all_ids = []
+        for ids in extend_ids_list:
+            all_ids.extend(ids)
+        for ids in decode_ids_list:
+            all_ids.extend(ids)
+
+        all_seq_lens = extend_seq_lens + decode_seq_lens
+        all_prefix_lens = extend_prefix_lens + decode_prefix_lens
+        all_extend_lens = extend_extend_lens + decode_extend_lens
+
+        batch.input_ids = torch.tensor(all_ids, dtype=torch.int64).to(self.device)
+        batch.seq_lens = torch.tensor(all_seq_lens, dtype=torch.int64).to(self.device)
+        batch.seq_lens_cpu = torch.tensor(all_seq_lens, dtype=torch.int64)
+        batch.prefix_lens = all_prefix_lens
+        batch.extend_lens = all_extend_lens
+
+        # ============ KV cache 分配 ============
+        # Evict if needed
+        if self.available_tokens() < total_new_tokens and self.prefix_cache is not None:
+            self.prefix_cache.evict(total_new_tokens)
+
+        # --- Extend 请求: 分配新的 req_pool slot + KV cache ---
+        extend_bs = len(extend_reqs)
+        extend_req_pool_indices = []
+        if extend_bs > 0:
+            pool_indices = self.request_pool.alloc(extend_bs)
+            if pool_indices is not None:
+                for req, pool_idx in zip(extend_reqs, pool_indices):
+                    req.req_pool_idx = int(pool_idx)
+            extend_req_pool_indices = list(pool_indices)
+
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=self.device))
+                for t in extend_prefix_tensors
+            ]
+
+            extend_out_cache_loc = self.token_allocator.alloc_pages_extend(
+                prefix_lens=torch.tensor(extend_prefix_lens, dtype=torch.int64).to(
+                    self.device
+                ),
+                prefix_lens_cpu=torch.tensor(extend_prefix_lens, dtype=torch.int64),
+                seq_lens=torch.tensor(extend_seq_lens, dtype=torch.int64).to(
+                    self.device
+                ),
+                seq_lens_cpu=torch.tensor(extend_seq_lens, dtype=torch.int64),
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=extend_num_tokens,
+            )
+            if extend_out_cache_loc is None:
+                raise RuntimeError(
+                    f"Failed to allocate KV cache for mixed batch extend part: "
+                    f"need {extend_num_tokens} tokens, available {self.available_tokens()}"
+                )
+
+            # Write prefix + extend indices to request pool
+            extend_req_pool_indices_tensor = torch.tensor(
+                extend_req_pool_indices, dtype=torch.int64
+            ).to(self.device)
+            prefix_lens_device = torch.tensor(extend_prefix_lens, dtype=torch.int64).to(
+                self.device
+            )
+            extend_lens_device = torch.tensor(extend_extend_lens, dtype=torch.int64).to(
+                self.device
+            )
+            extend_seq_lens_tensor = torch.tensor(
+                extend_seq_lens, dtype=torch.int64
+            ).to(self.device)
+
+            write_cache_indices(
+                extend_out_cache_loc,
+                extend_req_pool_indices_tensor,
+                prefix_lens_device,
+                extend_seq_lens_tensor,
+                extend_lens_device,
+                extend_prefix_tensors,
+                self.request_pool,
+            )
+        else:
+            extend_out_cache_loc = torch.tensor(
+                [], dtype=torch.int64, device=self.device
+            )
+
+        # --- Decode 请求: 已有 req_pool slot，只分配 1 个新 token 的 KV 槽位 ---
+        decode_req_pool_indices = []
+        if decode_reqs:
+            decode_req_pool_indices = [r.req_pool_idx for r in decode_reqs]
+            decode_rpi = torch.tensor(decode_req_pool_indices, dtype=torch.int64).to(
+                self.device
+            )
+            # seq_lens for decode reqs before +1 (current seq len)
+            decode_seq_lens_tensor = torch.tensor(
+                [s - 1 for s in decode_seq_lens], dtype=torch.int64
+            ).to(self.device)
+            decode_seq_lens_cpu = torch.tensor(
+                [s - 1 for s in decode_seq_lens], dtype=torch.int64
+            )
+
+            last_loc = self.request_pool.req_to_token_pool()[
+                decode_rpi, decode_seq_lens_tensor - 1
+            ]
+            decode_out_cache_loc = self.token_allocator.alloc_pages_decode(
+                seq_lens=decode_seq_lens_tensor,
+                seq_lens_cpu=decode_seq_lens_cpu,
+                last_loc=last_loc,
+            )
+
+            # Update seq_lens and request pool mapping for decode tokens
+            new_pos = decode_seq_lens_tensor  # position = old_seq_len (0-indexed)
+            self.request_pool.req_to_token_pool()[decode_rpi, new_pos] = (
+                decode_out_cache_loc.to(torch.int32)
+            )
+        else:
+            decode_out_cache_loc = torch.tensor(
+                [], dtype=torch.int64, device=self.device
+            )
+
+        # ============ 合并所有 out_cache_loc 和 req_pool_indices ============
+        all_req_pool_indices = extend_req_pool_indices + decode_req_pool_indices
+        batch.req_pool_indices = torch.tensor(
+            all_req_pool_indices, dtype=torch.int64
+        ).to(self.device)
+        batch.out_cache_loc = torch.cat([extend_out_cache_loc, decode_out_cache_loc])
+
     def prepare_for_decode(self, batch: "ScheduledBatch"):
         batch.forward_mode = ForwardMode.DECODE
         # Decode 阶段的 input_ids 是每个请求最后生成的 token
@@ -245,8 +430,7 @@ class KVCacheManager:
         if bs == 0:
             return
         last_tokens = [req.output_ids[-1] for req in batch.reqs]
-        batch.input_ids = torch.tensor(
-            last_tokens, dtype=torch.int64).to(self.device)
+        batch.input_ids = torch.tensor(last_tokens, dtype=torch.int64).to(self.device)
         batch.output_ids = None
         token_per_req = 1  # decode
 
@@ -302,10 +486,10 @@ class KVCacheManager:
             # 插入到前缀缓存
             new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
             self.token_allocator.free(
-                kv_indices[req.cache_protected_len: new_prefix_len]
+                kv_indices[req.cache_protected_len : new_prefix_len]
             )
         else:
-            self.token_allocator.free(kv_indices[req.cache_protected_len:])
+            self.token_allocator.free(kv_indices[req.cache_protected_len :])
 
         self.request_pool.free([req_pool_idx])  # param is list
         if self.prefix_cache is not None:
@@ -316,14 +500,13 @@ class KVCacheManager:
         if is_insert and self.prefix_cache is not None:
             token_ids = req.origin_input_ids + req.output_ids
             num_tokens = len(token_ids)
-            kv_indices = self.request_pool.read(
-                req.req_pool_idx, slice(0, num_tokens))
+            kv_indices = self.request_pool.read(req.req_pool_idx, slice(0, num_tokens))
             new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
             self.token_allocator.free(
-                kv_indices[req.cache_protected_len: new_prefix_len]
+                kv_indices[req.cache_protected_len : new_prefix_len]
             )
         else:
-            self.token_allocator.free(kv_indices[req.cache_protected_len:])
+            self.token_allocator.free(kv_indices[req.cache_protected_len :])
 
         self.request_pool.free([req.req_pool_idx])  # param is list
         if self.prefix_cache is not None:
@@ -334,17 +517,15 @@ class KVCacheManager:
         if self.prefix_cache is None:
             return
         token_ids = req.fill_ids
-        kv_indices = self.request_pool.read(
-            req.req_pool_idx, slice(0, len(token_ids)))
+        kv_indices = self.request_pool.read(req.req_pool_idx, slice(0, len(token_ids)))
         new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
-        self.token_allocator.free(
-            kv_indices[req.cache_protected_len: new_prefix_len])
+        self.token_allocator.free(kv_indices[req.cache_protected_len : new_prefix_len])
         # update req metadata
         new_indices, new_last_node = self.prefix_cache.match_prefix(token_ids)
         self.request_pool.write(
             req.req_pool_idx,
             slice(req.cache_protected_len, len(new_indices)),
-            new_indices[req.cache_protected_len:],
+            new_indices[req.cache_protected_len :],
         )
 
         self.prefix_cache.dec_lock_ref(req.last_node)
@@ -380,7 +561,11 @@ class KVCacheManager:
 
     def available_tokens(self) -> int:
         """返回可用的 token 槽位数"""
-        return self.token_allocator.available_size() + self.prefix_cache.evictable_size() if self.prefix_cache is not None else self.token_allocator.available_size()
+        return (
+            self.token_allocator.available_size() + self.prefix_cache.evictable_size()
+            if self.prefix_cache is not None
+            else self.token_allocator.available_size()
+        )
 
     def can_allocate(self, num_tokens: int) -> bool:
         """检查是否可以分配指定数量的 tokens"""

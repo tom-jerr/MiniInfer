@@ -1,12 +1,15 @@
 from datetime import time
 from functools import partial
 import heapq
+import logging
 
 import torch
 from kvcache.interface import IPrefixCache, ITokenAllocator
 from typing import List, Tuple, Any, Optional
 import time
 import hashlib
+
+logger = logging.getLogger(__name__)
 
 
 def _key_match_page_size1(key0: List[int], key1: List[int]) -> int:
@@ -22,7 +25,7 @@ def _key_match_paged(key0: List[int], key1: List[int], page_size: int) -> int:
     min_len = min(len(key0), len(key1))
     i = 0
     while i < min_len:
-        if key0[i: i + page_size] != key1[i: i + page_size]:
+        if key0[i : i + page_size] != key1[i : i + page_size]:
             break
         i += page_size
 
@@ -68,11 +71,9 @@ class RadixCache(IPrefixCache):
             self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = get_child_key
         else:
-            print("Using paged radix tree with page size", self.page_size)
-            self.key_match_fn = partial(
-                _key_match_paged, page_size=self.page_size)
-            self.get_child_key_fn = partial(
-                get_child_key, page_size=self.page_size)
+            logger.debug("Using paged radix tree with page size %d", self.page_size)
+            self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
+            self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
         if self.token_allocator is not None:
             self.device = self.token_allocator.device
         else:
@@ -116,7 +117,7 @@ class RadixCache(IPrefixCache):
     def insert(self, key: List[int], value=None):
         if value is None:
             value = torch.tensor(key, dtype=torch.int64)
-        print(f"Inserting val of length {len(value)}")
+        logger.debug(f"Inserting val of length {len(value)}")
         return self._insert_helper(self.root, key, value)
 
     def evict(self, num_tokens: int):
@@ -212,7 +213,7 @@ class RadixCache(IPrefixCache):
         if len(key) == 0:
             return 0
         child_key = self.get_child_key_fn(key)
-        print(f"Inserting key with child key {child_key}")
+        # logger.debug(f"Inserting key with child key {child_key}")
         total_prefix_len = 0
 
         while len(key) > 0 and child_key in node.children.keys():
@@ -229,7 +230,7 @@ class RadixCache(IPrefixCache):
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
-                print(f"Descending to child key {child_key}")
+                logger.debug(f"Descending to child key {child_key}")
 
         if len(key):
             new_node = TreeNode()
@@ -238,7 +239,7 @@ class RadixCache(IPrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
-            print(f"Created new node with key {child_key}")
+            logger.debug(f"Created new node with key {child_key}")
 
         return total_prefix_len
 

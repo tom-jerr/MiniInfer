@@ -32,8 +32,13 @@ import zmq
 from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 from miniinfer.config.engine.config import EngineConfig
 from .model_runner import ModelRunner
-from .scheduler import Scheduler
-from .scheduler_batch import Req, ScheduledBatch, ForwardBatch, BatchResult
+from miniinfer.scheduler.scheduler import Scheduler
+from miniinfer.scheduler.scheduler_batch import (
+    Req,
+    ScheduledBatch,
+    ForwardBatch,
+    BatchResult,
+)
 
 # from .process_controller import ProcessController
 # from .ipc.zmq_channel import create_socket, send_pyobj, recv_pyobj
@@ -120,6 +125,7 @@ class LLMEngine:
 
         atexit.register(self.stop)
 
+    # ======================== private helper function ========================
     def _debug_print_topk_next_tokens(
         self, logits: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
@@ -156,6 +162,7 @@ class LLMEngine:
                     "req=%s top%d next_token candidates: %s", req.req_id, k, candidates
                 )
 
+    # ======== prompt encoding ========
     def _should_apply_chat_template(self) -> bool:
         if self.use_chat_template is True:
             return hasattr(self.tokenizer, "apply_chat_template")
@@ -200,6 +207,210 @@ class LLMEngine:
                 )
         return self.tokenizer.encode(prompt)
 
+    # ======== calculate max total tokens =========
+    def _estimate_model_weight_memory(self) -> int:
+        """
+        估算模型权重占用的 GPU 内存（字节）
+
+        对于 Transformer 模型，主要参数包括：
+        1. Embedding: vocab_size × hidden_size
+        2. Transformer layers: num_layers × layer_params
+        3. LM Head: vocab_size × hidden_size
+
+        Returns:
+            估算的模型权重字节数
+        """
+        hf_config = self.config.hf_config
+        dtype_size = torch.tensor([], dtype=self.config.dtype).element_size()
+
+        # 1. Embedding 层
+        embedding_params = hf_config.vocab_size * hf_config.hidden_size
+
+        # 2. 每个 Transformer 层的参数
+        # - Q/K/V projections
+        qkv_params = (
+            hf_config.hidden_size
+            * (
+                hf_config.num_attention_heads
+                * (hf_config.hidden_size // hf_config.num_attention_heads)
+            )
+            * 3
+        )  # Q, K, V
+
+        # - O projection
+        o_params = hf_config.hidden_size * hf_config.hidden_size
+
+        # - MLP (gate_proj, up_proj, down_proj)
+        mlp_params = hf_config.hidden_size * hf_config.intermediate_size * 3
+
+        # - LayerNorm (input norm + post attention norm)
+        ln_params = hf_config.hidden_size * 2
+
+        # 每层总参数
+        layer_params = qkv_params + o_params + mlp_params + ln_params
+
+        # 所有层的参数
+        all_layers_params = layer_params * hf_config.num_hidden_layers
+
+        # 3. 最终 LayerNorm
+        final_ln_params = hf_config.hidden_size
+
+        # 4. LM Head
+        lm_head_params = hf_config.vocab_size * hf_config.hidden_size
+
+        # 总参数量
+        total_params = (
+            embedding_params + all_layers_params + final_ln_params + lm_head_params
+        )
+
+        # 总字节数
+        total_bytes = total_params * dtype_size
+
+        # 添加安全系数 1.5，考虑内存碎片、padding、额外缓冲区等
+        # PyTorch 在加载和存储权重时可能有额外开销
+        safety_factor = 1.5
+        estimated_bytes = int(total_bytes * safety_factor)
+
+        logger.info(
+            f"Estimated model weight memory: {estimated_bytes / (1024**3):.2f}GB "
+            f"(params: {total_params / 1e9:.2f}B, dtype: {self.config.dtype}, "
+            f"with safety_factor={safety_factor})"
+        )
+
+        return estimated_bytes
+
+    def _get_available_gpu_memory(self) -> int:
+        """
+        获取 GPU 可用内存（字节）
+
+        Returns:
+            可用显存字节数（考虑 gpu_memory_utilization 和已分配内存）
+        """
+        # 获取当前设备
+        device = torch.cuda.current_device()
+
+        # 使用 mem_get_info 获取 GPU 真实空闲显存（考虑所有占用：
+        # CUDA context、驱动开销、其他进程、PyTorch 分配等）
+        free_memory, total_memory = torch.cuda.mem_get_info(device)
+
+        # 目标：最多使用 total_memory * gpu_memory_utilization
+        # 已占用 = total - free（包含所有消费者：模型权重 + CUDA ctx + 其他进程...）
+        used_memory = total_memory - free_memory
+        available_memory = int(total_memory * self.gpu_memory_utilization) - used_memory
+
+        logger.info(
+            f"GPU Memory - Total: {total_memory / (1024**3):.2f}GB, "
+            f"Used: {used_memory / (1024**3):.2f}GB, "
+            f"Free: {free_memory / (1024**3):.2f}GB, "
+            f"Available for KV Cache (with {self.gpu_memory_utilization:.1%} utilization): "
+            f"{available_memory / (1024**3):.2f}GB"
+        )
+
+        return max(0, available_memory)
+
+    def _get_cell_size_per_token(self) -> int:
+        """
+        计算每个 token 的 KV cache 大小（字节）
+
+        KV cache 大小 = 2 (K + V) × num_layers × num_heads × head_dim × dtype_size
+
+        Returns:
+            每个 token 占用的字节数
+        """
+        # 获取数据类型的字节大小
+        dtype_size = torch.tensor([], dtype=self.config.dtype).element_size()
+
+        # 计算：2 (K, V) × 层数 × head数 × head维度 × 数据类型大小
+        bytes_per_token = (
+            2
+            * self.config.hf_config.num_hidden_layers
+            * self.config.hf_config.num_key_value_heads
+            * (
+                self.config.hf_config.hidden_size
+                // self.config.hf_config.num_attention_heads
+            )
+            * dtype_size
+        )
+
+        logger.info(
+            f"KV Cache per token: {bytes_per_token} bytes "
+            f"(layers={self.config.hf_config.num_hidden_layers}, "
+            f"heads={self.config.hf_config.num_key_value_heads}, "
+            f"head_dim={self.config.hf_config.hidden_size // self.config.hf_config.num_attention_heads}, "
+            f"dtype={self.config.dtype})"
+        )
+
+        return bytes_per_token
+
+    def _calc_max_total_tokens(self) -> int:
+        """
+        计算 KV cache 可以容纳的最大 token 数量
+
+        通过以下步骤计算:
+        1. 查询 GPU 内存 - 获取当前 GPU 的实际已分配内存（模型已加载）
+        2. 计算 token 大小 - 根据模型配置计算每个 token 占用的字节数
+        3. 计算最大容量 - 用剩余内存除以每个 token 大小
+
+        注意：
+        - 此方法在模型加载后调用，使用实际已分配的显存
+        - MHAKVCacheStorage 实际分配 (size + page_size) tokens 的空间
+        - 需要为激活值、中间结果等预留约 20% 的内存
+        - 最小 KV cache 大小为 2 * page_size，确保至少能处理一个请求
+
+        Returns:
+            max_total_num_tokens: KV cache 最大 token 容量
+        """
+        # 获取可用内存（模型已加载，这是实际剩余的显存）
+        available_memory = self._get_available_gpu_memory()
+
+        # 计算每个 token 的大小
+        bytes_per_token = self._get_cell_size_per_token()
+        if bytes_per_token == 0:
+            logger.error("bytes_per_token is 0, cannot calculate max_total_tokens")
+            return 0
+
+        # 预留内存给激活值、中间结果等，约 20%
+        # 由于模型已经加载，available_memory 是真实剩余显存
+        # 需要在 KV cache 和 forward pass activations 之间分配
+        reserved_ratio = 0.20
+        usable_memory = int(available_memory * (1.0 - reserved_ratio))
+
+        # 由于 MHAKVCacheStorage 实际分配 (size + page_size) 的空间
+        # 所以：(max_total_tokens + page_size) * bytes_per_token <= usable_memory
+        # 因此：max_total_tokens <= usable_memory / bytes_per_token - page_size
+        page_size = self.config.page_size
+        raw_tokens = usable_memory // bytes_per_token
+        max_total_num_tokens = raw_tokens - page_size
+
+        # 对齐到 page_size，确保 Flash Attention paged attention 的 view 操作正确工作
+        max_total_num_tokens = (max_total_num_tokens // page_size) * page_size
+
+        # 确保至少有最小容量 (2 * page_size)，以便能处理基本请求
+        # 最小容量 = 1 page 用于 prefill + 1 page 用于 decode
+        min_kv_tokens = 2 * page_size
+        max_total_num_tokens = max(max_total_num_tokens, min_kv_tokens)
+
+        # 检查是否显存严重不足
+        if max_total_num_tokens <= min_kv_tokens:
+            logger.warning(
+                f"KV cache capacity ({max_total_num_tokens} tokens) is at minimum. "
+                f"Available GPU memory may be insufficient. "
+                f"Consider using a smaller model or increasing GPU memory."
+            )
+
+        logger.info(
+            f"Calculated max_total_tokens: {max_total_num_tokens} "
+            f"(available: {available_memory / (1024**3):.2f}GB, "
+            f"usable: {usable_memory / (1024**3):.2f}GB, "
+            f"bytes_per_token: {bytes_per_token}, "
+            f"raw_tokens: {raw_tokens}, "
+            f"page_size: {page_size}, "
+            f"min_kv_tokens: {min_kv_tokens}, "
+            f"actual_allocation: {(max_total_num_tokens + page_size) * bytes_per_token / (1024**3):.2f}GB)"
+        )
+
+        return max_total_num_tokens
+
     def _init_single_process_mode(self):
         """初始化单进程模式"""
         logger.info("Initializing LLMEngine in single-process mode")
@@ -215,12 +426,26 @@ class LLMEngine:
         #     process.start()
         #     self.ps.append(process)
         #     self.events.append(event)
+        # ======== engine config =============
+        self.gpu_memory_utilization = self.config.gpu_memory_utilization
         config = self.config
 
-        # 初始化 KV Cache 管理器
-        # 使用 MemoryBudgetManager 自动计算 max_total_tokens
+        # 步骤 1: 先创建 ModelRunner 并加载模型（不传入 kv_cache_mgr）
+        logger.info("Step 1: Loading model...")
+        self.model_runner = ModelRunner(
+            self.config, kv_cache_mgr=None, rank=0, events=self.events
+        )
+
+        # 步骤 2: 模型加载完成后，基于实际已分配显存计算 max_total_tokens
+        logger.info(
+            "Step 2: Calculating max_total_tokens based on actual GPU memory usage..."
+        )
+        self.max_total_tokens = self._calc_max_total_tokens()
+
+        # 步骤 3: 初始化 KV Cache 管理器
+        logger.info("Step 3: Initializing KV Cache Manager...")
         self.kv_cache_mgr = KVCacheManager(
-            size=config.max_total_tokens,  # None 时自动根据 GPU 显存计算
+            size=self.max_total_tokens,
             max_requests=config.max_num_seqs,
             max_context_len=config.max_context_len,
             num_layers=config.hf_config.num_hidden_layers,
@@ -232,16 +457,11 @@ class LLMEngine:
             enable_prefix_cache=config.enable_prefix_cache,
             page_size=config.page_size,
             max_extend_tokens=config.max_extend_len,
-            # 显存预算相关配置
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            max_num_batched_tokens=config.max_num_batched_tokens,
         )
 
-        # 将实际计算的 max_total_tokens 回写到 config
-        config.max_total_tokens = self.kv_cache_mgr.size
-
-        # Model Runner (rank 0)
-        self.model_runner = ModelRunner(self.config, self.kv_cache_mgr, 0, self.events)
+        # 步骤 4: 设置 ModelRunner 的 kv_cache_mgr 并初始化 attn_backend
+        logger.info("Step 4: Initializing attention backend...")
+        self.model_runner.set_kv_cache_mgr(self.kv_cache_mgr)
 
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -260,17 +480,6 @@ class LLMEngine:
         self.scheduler = Scheduler(self.config, self.tokenizer, self.kv_cache_mgr)
 
         self._started = True
-
-        # 打印内存预算信息
-        budget_stats = self.kv_cache_mgr.memory_budget.get_stats()
-        logger.info(
-            f"Memory budget initialized: "
-            f"max_total_tokens={budget_stats['max_total_tokens']}, "
-            f"num_pages={budget_stats['num_pages']}, "
-            f"kv_cache_memory={budget_stats['kv_cache_memory_gb']:.2f}GB, "
-            f"max_num_batched_tokens={budget_stats['max_num_batched_tokens']}, "
-            f"gpu_memory_utilization={budget_stats['gpu_memory_utilization']}"
-        )
 
     def start(self):
         """启动引擎 (多进程模式)"""
@@ -378,14 +587,26 @@ class LLMEngine:
         num_decode = 0
         prefill_prefix_lens: Dict[int, int] = {}
         prefill_extend_lens: Dict[int, int] = {}
+
+        decode_req_set = set()
+        if batch.decoding_reqs:
+            decode_req_set = {id(r) for r in batch.decoding_reqs}
+
         if batch.forward_mode.is_extend():
-            num_prefill = sum(batch.extend_lens) if batch.extend_lens else 0
+            # is_extend() covers both EXTEND and MIXED modes
             if batch.prefix_lens and batch.extend_lens:
                 for req, pre_len, ext_len in zip(
                     batch.reqs, batch.prefix_lens, batch.extend_lens
                 ):
-                    prefill_prefix_lens[int(req.req_id)] = int(pre_len)
-                    prefill_extend_lens[int(req.req_id)] = int(ext_len)
+                    if id(req) in decode_req_set:
+                        # decode 请求在 mixed batch 中视为 decode token
+                        num_decode += 1
+                    else:
+                        num_prefill += ext_len
+                        prefill_prefix_lens[int(req.req_id)] = int(pre_len)
+                        prefill_extend_lens[int(req.req_id)] = int(ext_len)
+            else:
+                num_prefill = sum(batch.extend_lens) if batch.extend_lens else 0
         elif batch.forward_mode.is_decode():
             num_decode = len(batch.reqs)
 
@@ -397,11 +618,17 @@ class LLMEngine:
             prefill_extend_lens=prefill_extend_lens,
         )
 
+    # ========== process helper function ============
     def _process_step_result(
         self, batch: ScheduledBatch, result: BatchResult
     ) -> List[RequestOutput]:
         """
         处理单步推理结果，返回每个请求的增量输出
+
+        对于 chunked prefill 请求：
+        - 将已推理的 token 插入 radix cache（通过 update_unfinished_req_radix_cache）
+        - 不进行 output_ids 解码和 finished 判断
+        - 保持 is_chunked 标志直到完成所有 chunk
         """
         if batch is None or len(batch.reqs) == 0:
             return []
@@ -414,6 +641,24 @@ class LLMEngine:
         finished_req_ids = []
 
         for i, req in enumerate(batch.reqs):
+            # ============ Chunked Prefill 特殊处理 ============
+            # 对于未完成 prefill 的 chunked 请求，只更新 radix cache，
+            # 不进行 output_ids 解码和 finished 判断
+            if req.is_chunked:
+                # 将已推理的 token 插入 radix cache
+                # update_unfinished_req_radix_cache 会：
+                # 1. 将当前 fill_ids 对应的 KV 写入 radix cache
+                # 2. 更新 req.cache_protected_len, prefix_indices, last_node
+                self.kv_cache_mgr.update_unfinished_req_radix_cache(req)
+                logger.debug(
+                    f"Updated radix cache for chunked prefill req_id={req.req_id}, "
+                    f"cache_protected_len={req.cache_protected_len}, "
+                    f"prefix_indices={req.prefix_indices}, "
+                    f"last_node={req.last_node}"
+                )
+                continue
+
+            # ============ 正常请求处理 ============
             token_id = next_token_ids[i]
             req.output_ids.append(token_id)
 
@@ -491,7 +736,7 @@ class LLMEngine:
         if not self._started:
             self.start()
 
-        # 归一化输入
+        # 归一化输入`
         if isinstance(prompts, str):
             prompts = [prompts]
         elif (
