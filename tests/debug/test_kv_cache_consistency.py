@@ -30,7 +30,7 @@ if str(MINIINFER_ROOT) not in sys.path:
 
 from config.engine.config import EngineConfig
 from engine.model_runner import ModelRunner
-from engine.scheduler_batch import Req, ScheduledBatch, ForwardBatch
+from scheduler.scheduler_batch import Req, ScheduledBatch, ForwardBatch
 from kvcache.kv_cache_manager import KVCacheManager
 from layers.attention_backend.flashattention_backend import FlashAttention2Backend
 from utils.sampling_params import SamplingParams
@@ -793,6 +793,12 @@ def main():
         help="HF model dtype: fp16|bf16|fp32 (default: fp16 on cuda, fp32 on cpu)",
     )
     parser.add_argument(
+        "--hf-attn-impl",
+        choices=["sdpa", "eager", "flash_attention_2"],
+        default=None,
+        help="HF attention implementation: sdpa (default), eager, or flash_attention_2",
+    )
+    parser.add_argument(
         "--check-kv-weights",
         action="store_true",
         help="Compare HF Q/K/V weights with our fused QKV weights",
@@ -850,7 +856,7 @@ def main():
         args.model,
         max_num_seqs=1,
         max_context_len=max_seq_len,
-        max_total_tokens=kv_size,
+        # max_extend_len=kv_size,
     )
 
     if max_seq_len > cfg.max_context_len:
@@ -974,14 +980,20 @@ def main():
     hf_dtype = None
     if args.compare_hf or args.check_kv_weights or args.compare_hf_layers:
         hf_dtype = _resolve_dtype(args.hf_dtype, device)
+        hf_load_kwargs = {
+            "torch_dtype": hf_dtype,
+            "trust_remote_code": True,
+        }
+        if args.hf_attn_impl:
+            hf_load_kwargs["attn_implementation"] = args.hf_attn_impl
         hf_model = AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=hf_dtype,
-            trust_remote_code=True,
+            **hf_load_kwargs,
         ).to(device)
         hf_model.eval()
         if args.compare_hf or args.compare_hf_layers:
-            print(f"[HF] compare enabled, dtype={hf_dtype}")
+            attn_impl = args.hf_attn_impl or "default (sdpa)"
+            print(f"[HF] compare enabled, dtype={hf_dtype}, attn_impl={attn_impl}")
 
     # Prefill A: prompt only, then sample the first token (token_0).
     req_a = Req(prompt_ids, SamplingParams(temperature=0, max_tokens=args.steps + 1))

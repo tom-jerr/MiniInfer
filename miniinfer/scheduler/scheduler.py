@@ -167,6 +167,9 @@ class Scheduler:
         2. 尝试 prefill 批次
         3. 如果 prefill 为空 → 走 decode 路径
         """
+        # 打印当前调度器状态（空闲页数等）
+        self._print_scheduler_info()
+
         # Step 1: 过滤已完成的请求
         self._filter_batch(self.running_batch)
         running_bs = len(self.running_batch.reqs)
@@ -175,12 +178,17 @@ class Scheduler:
         prefill_batch = self._get_new_batch_prefill(device)
 
         if prefill_batch is not None:
+            self._print_batch_info(prefill_batch, "PREFILL/MIXED")
             return prefill_batch
 
         # Step 3: 没有 prefill → 回退到纯 decode
         if running_bs > 0:
-            return self._get_decode_batch(device)
+            decode_batch = self._get_decode_batch(device)
+            if decode_batch is not None:
+                self._print_batch_info(decode_batch, "DECODE")
+            return decode_batch
 
+        logger.info("[Scheduler] No batch to execute this round")
         return None
 
     # ======================== Prefill 批次构建 ========================
@@ -204,12 +212,15 @@ class Scheduler:
 
         # 创建 PrefillAdder —— 核心预算控制
         # 精确传入 running_reqs，按每个请求的 min(剩余输出, CLIP) * ratio 预留
+        # BUG FIX: 在 mixed batch 场景下，need to account for running batch size
+        # 避免 total batch size 超过 request pool 容量
+        effective_max_batch_size = self.max_batch_size - len(running_reqs)
         adder = PrefillAdder(
             available_kv_tokens=available_kv,
             running_reqs=running_reqs,
             new_token_ratio=self.new_token_ratio,
             max_extend_len=self.max_extend_len,
-            max_batch_size=self.max_batch_size,
+            max_batch_size=effective_max_batch_size,
             chunk_size=(
                 self.chunked_prefill_size if self.enable_chunked_prefill else None
             ),
@@ -218,6 +229,7 @@ class Scheduler:
 
         # 如果预算不足，直接返回
         if adder.no_remaining_budget():
+            logger.debug(f"No budget for prefill: available_kv={available_kv}")
             return None
 
         # ---- 处理 chunking 中的请求（续 chunk）----
@@ -228,18 +240,6 @@ class Scheduler:
             req = chunked_req.req
             cached_len = chunked_req.cached_len + chunked_req.chunk_size
             remaining_len = req.total_input_len - cached_len
-
-            # 关键: 恢复 fill_ids 为完整序列。
-            # 上一轮 PrefillAdder 会破坏性地截断 fill_ids，
-            # 而续 chunk 需要完整的 fill_ids 才能正确切片出后续 token。
-            req.fill_ids = req.origin_input_ids + req.output_ids
-
-            # 释放上一轮分配的 req_pool slot，防止泄漏。
-            # update_unfinished_req_radix_cache 已将 KV 写入 radix cache，
-            # prefix_indices 指向 radix cache 中的 KV 位置，旧 slot 不再需要。
-            if getattr(req, 'req_pool_idx', -1) >= 0:
-                self.kv_cache_mgr.request_pool.free([req.req_pool_idx])
-                req.req_pool_idx = -1
 
             # 更新 req 的 extend_input_len 供 add_chunked_req 使用
             req.extend_input_len = remaining_len
@@ -475,6 +475,7 @@ class Scheduler:
 
             # 标记为被收缩，重新放回 waiting 队列头部
             req.is_retracted = True
+            req.ever_retracted = True
             req.finished = False
             req.is_chunked = False
             # 重置 KV 相关状态，下次重新 prefill
@@ -484,6 +485,7 @@ class Scheduler:
             req.cache_protected_len = 0
             req.last_node = None
             req.extend_input_len = 0
+            req.req_pool_idx = -1  # 重置 req_pool_idx，避免读取已释放的数据
             self.waiting_queue.insert(0, req)
 
             # 更新可用量
@@ -679,6 +681,76 @@ class Scheduler:
                 # 写回 radix cache（如果启用）
                 self.kv_cache_mgr.update_finished_req_radix_cache(req)
                 self.finished_reqs.append(req)
+
+    # ======================== 调试和监控 ========================
+
+    def _print_scheduler_info(self):
+        """打印当前调度器状态，包括空闲页数"""
+        free_pages = len(self.kv_cache_mgr.token_allocator.free_pages)
+        total_pages = self.kv_cache_mgr.token_allocator.num_pages
+        used_pages = total_pages - free_pages
+        available_tokens = self.kv_cache_mgr.available_tokens()
+
+        logger.info(
+            f"\n{'=' * 80}\n"
+            f"[Scheduler Round] KV Cache Status:\n"
+            f"  Free Pages: {free_pages}/{total_pages} "
+            f"(Used: {used_pages}, {used_pages/total_pages*100:.1f}%)\n"
+            f"  Available Tokens: {available_tokens}\n"
+            f"  Page Size: {self.page_size}\n"
+            f"  Waiting Queue: {len(self.waiting_queue)} reqs\n"
+            f"  Running Batch: {len(self.running_batch.reqs)} reqs\n"
+            f"  Chunking Reqs: {len(self.chunking_reqs)} reqs\n"
+            f"  New Token Ratio: {self.new_token_ratio:.3f}\n"
+            f"{'=' * 80}"
+        )
+
+    def _print_batch_info(self, batch: ScheduledBatch, batch_type: str):
+        """打印要执行的 batch 详细信息"""
+        if batch is None:
+            return
+
+        logger.info(f"\n[Batch Info] Type: {batch_type}")
+        logger.info(f"  Forward Mode: {batch.forward_mode.name}")
+        logger.info(f"  Batch Size: {len(batch.reqs)}")
+
+        if batch.input_ids is not None:
+            logger.info(f"  Input IDs shape: {batch.input_ids.shape}")
+
+        # 打印每个请求的详细信息
+        logger.info(f"  Requests Details:")
+        for i, req in enumerate(batch.reqs):
+            input_len = len(req.origin_input_ids)
+            output_len = len(req.output_ids)
+            total_len = input_len + output_len
+
+            req_info = (
+                f"    [{i}] req_id={req.req_id}, "
+                f"input_len={input_len}, output_len={output_len}, "
+                f"total_len={total_len}"
+            )
+
+            # 如果是 chunked 请求，添加额外信息
+            if req.is_chunked:
+                req_info += f", chunked_prefill_len={req.chunked_prefill_len}"
+
+            # 如果有 extend_input_len，打印
+            if hasattr(req, "extend_input_len") and req.extend_input_len > 0:
+                req_info += f", extend_len={req.extend_input_len}"
+
+            logger.info(req_info)
+
+        # 如果是 MIXED batch，额外打印 decode 请求信息
+        if batch.decoding_reqs:
+            logger.info(f"  Decoding Requests: {len(batch.decoding_reqs)}")
+
+        # 打印 seq_lens 如果有的话
+        if batch.seq_lens is not None:
+            logger.info(
+                f"  Seq Lens: {batch.seq_lens.tolist() if batch.seq_lens.numel() <= 10 else f'[{batch.seq_lens.numel()} items]'}"
+            )
+
+        logger.info(f"{'-' * 80}")
 
     # ======================== 监控 API ========================
 

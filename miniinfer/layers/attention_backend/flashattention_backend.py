@@ -250,12 +250,22 @@ class FlashAttention2Backend(AttentionBackend):
             # RequestPool stores per-token KV indices (kv_loc). FlashAttention expects per-block indices.
             # Each sequence is laid out in pages of `page_size`, so the block id is kv_loc // page_size.
             kv_locs = self.kv_cache_mgr.get_page_table(forward_batch, max_seq_len_k)
+            # Debug: check kv_locs
+            if getattr(forward_batch, "debug_decode", False):
+                print(f"  [_build_block_table] max_seq_len_k: {max_seq_len_k}")
+                print(f"  [_build_block_table] kv_locs shape: {kv_locs.shape}")
+                print(
+                    f"  [_build_block_table] kv_locs[:, :5]: {kv_locs[:, :5].tolist()}"
+                )
             # Take the first token of each page to form the block table.
             # Flash Attention requires block_table to have contiguous last dimension.
             # Strided slicing (::page_size) creates non-contiguous memory, so we must
             # call contiguous() right after the slice before any further operations.
             block_indices = kv_locs[:, :: self.page_size].contiguous()
-            return (block_indices // self.page_size).to(torch.int32).contiguous()
+            block_table = (block_indices // self.page_size).to(torch.int32).contiguous()
+            if getattr(forward_batch, "debug_decode", False):
+                print(f"  [_build_block_table] block_table: {block_table.tolist()}")
+            return block_table
 
         if forward_batch.forward_mode.is_decode():
             cache_seqlens = seqlens_in_batch.to(torch.int32)
@@ -263,10 +273,12 @@ class FlashAttention2Backend(AttentionBackend):
                 cache_seqlens = torch.clamp(cache_seqlens - 1, min=0)
             metadata.cache_seqlens_int32 = cache_seqlens
             metadata.max_seq_len_k = int(cache_seqlens.max().item())
-            metadata.cu_seqlen_q = torch.arange(
+            # Note: For decode, each sequence has seqlen_q=1
+            metadata.max_seq_len_q = 1
+            metadata.cu_seqlens_q = torch.arange(
                 0, batch_size + 1, dtype=torch.int32, device=device
             )
-            metadata.cu_seqlen_k = torch.nn.functional.pad(
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
             )
             metadata.block_table = _build_block_table(metadata.max_seq_len_k)
@@ -377,7 +389,17 @@ class FlashAttention2Backend(AttentionBackend):
         save_kv_cache=True,
         **kwargs,
     ) -> torch.Tensor:
-        # print("Using FA2 decode: q shape:", q.shape)
+        # Debug: print shapes for first layer
+        debug_decode = (
+            getattr(forward_batch, "debug_decode", False) and layer.layer_id == 0
+        )
+        if debug_decode:
+            print(f"\n[FA2 forward_decode layer 0]")
+            print(f"  q shape: {q.shape}")
+            print(f"  k shape: {k.shape}")
+            print(f"  batch_size: {forward_batch.batch_size}")
+            print(f"  out_cache_loc: {forward_batch.out_cache_loc.tolist()}")
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -396,6 +418,12 @@ class FlashAttention2Backend(AttentionBackend):
 
         # Do multi-head attention
         key_cache, value_cache = self.kv_cache_mgr.get_kv_buffer(layer.layer_id)
+
+        if debug_decode:
+            print(f"  key_cache original shape: {key_cache.shape}")
+            print(f"  metadata.block_table: {metadata.block_table.tolist()}")
+            print(f"  metadata.cache_seqlens: {metadata.cache_seqlens_int32.tolist()}")
+
         key_cache = key_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         )  # [N_pages, page_size, nheads, headdim]
@@ -403,18 +431,24 @@ class FlashAttention2Backend(AttentionBackend):
             -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
         )  # [N_pages, page_size, nheads, headdim]
 
+        if debug_decode:
+            print(f"  key_cache view shape: {key_cache.shape}")
+
         block_table = metadata.block_table
         cache_seqlens = metadata.cache_seqlens_int32
         batch_size = forward_batch.batch_size
-        # flash_attn_with_kvcache expects q with shape (batch, seqlen_q, nheads, headdim) for decode.
 
-        q_reshaped = (
-            q.unsqueeze(1)
-            .contiguous()
-            .view(batch_size, -1, layer.tp_q_head_num, layer.head_dim)
+        # Reshape q: flash_attn_with_kvcache expects [batch, seqlen_q, nheads, headdim]
+        # For decode, seqlen_q=1
+        q_reshaped = q.contiguous().view(
+            batch_size, 1, layer.tp_q_head_num, layer.head_dim
         )
 
+        if debug_decode:
+            print(f"  q_reshaped shape: {q_reshaped.shape}")
+
         # FA2 decode: use flash_attn_with_kvcache
+        # Include cu_seqlens_q and max_seqlen_q for proper batch handling
         o = flash_attn_with_kvcache(
             q=q_reshaped,
             k_cache=key_cache,
@@ -426,8 +460,10 @@ class FlashAttention2Backend(AttentionBackend):
             **kwargs,
         )
 
+        if debug_decode:
+            print(f"  output shape: {o.shape}")
+
         if isinstance(o, tuple):
             o = o[0]
-        if o.dim() == 4:
-            o = o.contiguous().view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        # Output shape: [batch_size, seqlen_q=1, nheads, headdim]
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)

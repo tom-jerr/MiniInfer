@@ -26,7 +26,8 @@ def rms_norm_kernel(
     x_f32_vals = x_vals.to(tl.float32)
     mean_square = tl.sum(x_f32_vals * x_f32_vals, axis=0) / N
     rstd = tl.rsqrt(mean_square + eps)
-    output = x_vals * rstd.to(x_vals.dtype) * w_vals
+    # Match HF: normalize in fp32, convert back to input dtype, then multiply weight
+    output = (x_f32_vals * rstd).to(x_vals.dtype) * w_vals
     output_row_start_ptr = output_ptr + row_idx * stride_y_row
     tl.store(output_row_start_ptr + offsets, output, mask=mask)
 
@@ -94,13 +95,14 @@ def add_rms_norm_kernel(
     x_new_row_start_ptr = x_new_ptr + row_idx * stride_x_new_row
     tl.store(x_new_row_start_ptr + offsets, acc, mask=mask)
 
-    # RMSNorm on acc
-    # acc_f32 = acc.to(tl.float32)
-    mean_square = tl.sum(acc * acc, axis=0) / N
+    # RMSNorm on acc - must use float32 for numerical stability
+    acc_f32 = acc.to(tl.float32)
+    mean_square = tl.sum(acc_f32 * acc_f32, axis=0) / N
     rstd = tl.rsqrt(mean_square + eps)
 
     w_vals = tl.load(w_ptr + offsets, mask=mask, other=0.0)
-    output = acc * rstd * w_vals
+    # Match HF: normalize in fp32, convert back to input dtype, then multiply weight
+    output = (acc_f32 * rstd).to(acc.dtype) * w_vals
 
     output_row_start_ptr = output_ptr + row_idx * stride_y_row
     tl.store(output_row_start_ptr + offsets, output, mask=mask)

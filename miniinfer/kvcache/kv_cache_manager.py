@@ -182,20 +182,36 @@ class KVCacheManager:
         prefix_tensors = [r.prefix_indices for r in batch.reqs]
         # Allocate req slots
         req_pool_indices = self.request_pool.alloc(bs)
+        if req_pool_indices is None:
+            raise RuntimeError(
+                f"Failed to allocate request pool slots: "
+                f"requested {bs} slots, but request pool is full. "
+                f"This usually indicates a scheduling bug where batch size exceeds max_num_seqs."
+            )
         # Persist request-pool indices on the Req objects for correct release/update flows.
-        if req_pool_indices is not None:
-            for req, pool_idx in zip(batch.reqs, req_pool_indices):
-                req.req_pool_idx = int(pool_idx)
+        for req, pool_idx in zip(batch.reqs, req_pool_indices):
+            req.req_pool_idx = int(pool_idx)
         req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device
         )
 
         # Allocate KV cache slots
+        # 检查物理空闲空间，而非 available_tokens()（包含 evictable）
         if (
-            self.available_tokens() < extend_num_tokens
+            self.token_allocator.available_size() < extend_num_tokens
             and self.prefix_cache is not None
         ):
-            self.prefix_cache.evict(extend_num_tokens)
+            needed_to_evict = extend_num_tokens - self.token_allocator.available_size()
+            needed_to_evict = (
+                (needed_to_evict + self.page_size - 1)
+                // self.page_size
+                * self.page_size
+            )  # 向上对齐到 page_size
+            logger.debug(
+                "prepare_for_extend: need to evict for extend batch, "
+                f"extend_num_tokens={extend_num_tokens}, available_size={self.token_allocator.available_size()}, needed_to_evict={needed_to_evict}"
+            )
+            self.prefix_cache.evict(needed_to_evict)
 
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=self.device))
@@ -215,10 +231,13 @@ class KVCacheManager:
 
         # 检查分配是否成功
         if out_cache_loc is None:
+            physical_available = self.token_allocator.available_size()
+            logical_available = self.available_tokens()
             raise RuntimeError(
                 f"Failed to allocate KV cache for extend batch: "
                 f"need {extend_num_tokens} tokens ({bs} requests), "
-                f"available {self.available_tokens()} tokens"
+                f"physical_available {physical_available} tokens (free pages), "
+                f"logical_available {logical_available} tokens (includes evictable radix)"
             )
 
         # Write prefix cache and new extend cache to request pool
@@ -316,18 +335,36 @@ class KVCacheManager:
         batch.extend_lens = all_extend_lens
 
         # ============ KV cache 分配 ============
-        # Evict if needed
-        if self.available_tokens() < total_new_tokens and self.prefix_cache is not None:
-            self.prefix_cache.evict(total_new_tokens)
+        # Evict if needed - 检查物理空闲空间
+        if (
+            self.token_allocator.available_size() < total_new_tokens
+            and self.prefix_cache is not None
+        ):
+            needed_to_evict = total_new_tokens - self.token_allocator.available_size()
+            needed_to_evict = (
+                (needed_to_evict + self.page_size - 1)
+                // self.page_size
+                * self.page_size
+            )  # 向上对齐到 page_size
+            logger.debug(
+                "prepare_for_mixed: need to evict for extend batch, "
+                f"extend_num_tokens={total_new_tokens}, available_size={self.token_allocator.available_size()}, needed_to_evict={needed_to_evict}"
+            )
+            self.prefix_cache.evict(needed_to_evict)
 
         # --- Extend 请求: 分配新的 req_pool slot + KV cache ---
         extend_bs = len(extend_reqs)
         extend_req_pool_indices = []
         if extend_bs > 0:
             pool_indices = self.request_pool.alloc(extend_bs)
-            if pool_indices is not None:
-                for req, pool_idx in zip(extend_reqs, pool_indices):
-                    req.req_pool_idx = int(pool_idx)
+            if pool_indices is None:
+                raise RuntimeError(
+                    f"Failed to allocate request pool slots for extend requests: "
+                    f"requested {extend_bs} slots, but request pool is full. "
+                    f"This usually indicates a scheduling bug where batch size exceeds max_num_seqs."
+                )
+            for req, pool_idx in zip(extend_reqs, pool_indices):
+                req.req_pool_idx = int(pool_idx)
             extend_req_pool_indices = list(pool_indices)
 
             last_loc = [
@@ -348,9 +385,13 @@ class KVCacheManager:
                 extend_num_tokens=extend_num_tokens,
             )
             if extend_out_cache_loc is None:
+                physical_available = self.token_allocator.available_size()
+                logical_available = self.available_tokens()
                 raise RuntimeError(
                     f"Failed to allocate KV cache for mixed batch extend part: "
-                    f"need {extend_num_tokens} tokens, available {self.available_tokens()}"
+                    f"need {extend_num_tokens} tokens, "
+                    f"physical_available {physical_available} tokens (free pages), "
+                    f"logical_available {logical_available} tokens (includes evictable radix)"
                 )
 
             # Write prefix + extend indices to request pool
@@ -434,12 +475,24 @@ class KVCacheManager:
         batch.output_ids = None
         token_per_req = 1  # decode
 
-        # Allocate KV cache slots
+        # Allocate KV cache slots - 检查物理空闲空间
         if (
-            self.available_tokens() < bs * token_per_req
+            self.token_allocator.available_size() < bs * token_per_req
             and self.prefix_cache is not None
         ):
-            self.prefix_cache.evict(bs * token_per_req)
+            needed_to_evict = (
+                bs * token_per_req
+            ) - self.token_allocator.available_size()
+            needed_to_evict = (
+                (needed_to_evict + self.page_size - 1)
+                // self.page_size
+                * self.page_size
+            )  # 向上对齐到 page_size
+            logger.debug(
+                "prepare_for_decode: need to evict for decode batch, "
+                f"num_tokens={bs * token_per_req}, available_size={self.token_allocator.available_size()}, needed_to_evict={needed_to_evict}"
+            )
+            self.prefix_cache.evict(needed_to_evict)
 
         last_loc = self.request_pool.req_to_token_pool()[
             batch.req_pool_indices, batch.seq_lens - 1
@@ -474,21 +527,41 @@ class KVCacheManager:
             cache_to_radix: 是否缓存到 radix tree
         """
         # 读取所有 KV indices
-        req_pool_idx = (
-            int(req.req_pool_idx)
-            if getattr(req, "req_pool_idx", -1) >= 0
-            else int(req.req_id)
-        )
+        req_pool_idx = int(getattr(req, "req_pool_idx", -1))
+        if req_pool_idx < 0:
+            raise RuntimeError(
+                f"release_request called with invalid req_pool_idx={req_pool_idx} "
+                f"for req_id={req.req_id}. This indicates request lifecycle metadata corruption."
+            )
         token_ids = req.origin_input_ids + req.output_ids
         num_tokens = len(token_ids)
         kv_indices = self.request_pool.read(req_pool_idx, slice(0, num_tokens))
+
         if is_insert and self.prefix_cache is not None:
-            # 插入到前缀缓存
+            # 计算 page 对齐长度
+            page_aligned_len = (num_tokens // self.page_size) * self.page_size
+
+            # 插入到前缀缓存（会截断到 page 对齐）
+            # insert 返回匹配的前缀长度（insert 之前已在 cache 中的部分）
             new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
-            self.token_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
-            )
+
+            # 释放逻辑：
+            # - kv_indices[0:cache_protected_len] 由请求开始时的 lock 保护，不释放
+            # - kv_indices[cache_protected_len:new_prefix_len] insert 前已存在（重复部分），可释放
+            # - kv_indices[new_prefix_len:page_aligned_len] 被新创建的节点持有，不应释放
+            # - kv_indices[page_aligned_len:num_tokens] 被截断未保存到 radix tree，应释放
+
+            # 释放重复部分（如果有）
+            if new_prefix_len > req.cache_protected_len:
+                self.token_allocator.free(
+                    kv_indices[req.cache_protected_len : new_prefix_len]
+                )
+
+            # 释放被截断的部分（如果有）
+            if page_aligned_len < num_tokens:
+                self.token_allocator.free(kv_indices[page_aligned_len:])
         else:
+            # 没有 prefix cache，释放所有未保护的部分
             self.token_allocator.free(kv_indices[req.cache_protected_len :])
 
         self.request_pool.free([req_pool_idx])  # param is list
@@ -497,15 +570,34 @@ class KVCacheManager:
 
     def update_finished_req_radix_cache(self, req: Req, is_insert: bool = True):
         """更新前缀缓存"""
-        if is_insert and self.prefix_cache is not None:
-            token_ids = req.origin_input_ids + req.output_ids
-            num_tokens = len(token_ids)
-            kv_indices = self.request_pool.read(req.req_pool_idx, slice(0, num_tokens))
-            new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
-            self.token_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
+        if int(getattr(req, "req_pool_idx", -1)) < 0:
+            raise RuntimeError(
+                f"update_finished_req_radix_cache called with invalid req_pool_idx="
+                f"{getattr(req, 'req_pool_idx', -1)} for req_id={req.req_id}"
             )
+        token_ids = req.origin_input_ids + req.output_ids
+        num_tokens = len(token_ids)
+        kv_indices = self.request_pool.read(req.req_pool_idx, slice(0, num_tokens))
+
+        if is_insert and self.prefix_cache is not None:
+            # 计算 page 对齐长度
+            page_aligned_len = (num_tokens // self.page_size) * self.page_size
+
+            # 插入到前缀缓存
+            new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
+
+            # 同 release_request 的释放逻辑
+            # 释放重复部分（如果有）
+            if new_prefix_len > req.cache_protected_len:
+                self.token_allocator.free(
+                    kv_indices[req.cache_protected_len : new_prefix_len]
+                )
+
+            # 释放被截断的部分（如果有）
+            if page_aligned_len < num_tokens:
+                self.token_allocator.free(kv_indices[page_aligned_len:])
         else:
+            # 没有 prefix cache，释放所有未保护的部分
             self.token_allocator.free(kv_indices[req.cache_protected_len :])
 
         self.request_pool.free([req.req_pool_idx])  # param is list
@@ -519,7 +611,14 @@ class KVCacheManager:
         token_ids = req.fill_ids
         kv_indices = self.request_pool.read(req.req_pool_idx, slice(0, len(token_ids)))
         new_prefix_len = self.prefix_cache.insert(token_ids, kv_indices)
-        self.token_allocator.free(kv_indices[req.cache_protected_len : new_prefix_len])
+
+        # 注意：这里不释放内存！
+        # 原因：kv_indices 中 [cache_protected_len:new_prefix_len] 部分是重复的，
+        # 但 [new_prefix_len:] 部分可能被新节点持有。
+        # 如果在这里释放，后续 update_finished_req_radix_cache 或 release_request
+        # 会再次尝试释放相同的页面，导致 double free。
+        # 正确的做法是在 release_request 统一处理释放逻辑。
+
         # update req metadata
         new_indices, new_last_node = self.prefix_cache.match_prefix(token_ids)
         self.request_pool.write(
@@ -561,11 +660,20 @@ class KVCacheManager:
 
     def available_tokens(self) -> int:
         """返回可用的 token 槽位数"""
-        return (
+        available = (
             self.token_allocator.available_size() + self.prefix_cache.evictable_size()
             if self.prefix_cache is not None
             else self.token_allocator.available_size()
         )
+        # Logical availability can never exceed total KV capacity.
+        if available > self.size:
+            logger.warning(
+                "available_tokens overflow detected: available=%d > size=%d; clamping",
+                available,
+                self.size,
+            )
+            return self.size
+        return available
 
     def can_allocate(self, num_tokens: int) -> bool:
         """检查是否可以分配指定数量的 tokens"""

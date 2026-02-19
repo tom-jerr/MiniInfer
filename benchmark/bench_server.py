@@ -9,7 +9,7 @@ from miniinfer.engine.llm_engine import LLMEngine
 import logging
 
 logging.basicConfig(
-    level=logging.DEBUG,  # 想要 INFO 就改 INFO
+    level=logging.ERROR,  # 想要 INFO 就改 INFO
     format="%(asctime)s %(levelname)s %(name)s:%(lineno)d - %(message)s",
     force=True,  # Python 3.8+：确保生效（避免被别的库提前配置）
 )

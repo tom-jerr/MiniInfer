@@ -27,13 +27,12 @@ class RMSNorm(nn.Module, WeightLoaderMixin):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        # Ensure weight has the same dtype as x to avoid precision issues
-        weight = self.weight
-        return (x * weight).to(orig_dtype)
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        # Match HF implementation: convert back to input_dtype before multiplying weight
+        return self.weight * x.to(input_dtype)
 
     def forward(
         self,

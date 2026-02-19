@@ -61,6 +61,7 @@ class Req:
 
         # ============ finish related ============
         self.is_retracted = False
+        self.ever_retracted = False
         self.finished = False
         self.finished_reason = ""
 
@@ -308,6 +309,7 @@ def compute_position_torch(
     return positions.to(torch.int64)
 
 
-@torch.compile(dynamic=True)
+# Temporarily disable torch.compile to debug batch issues
+# @torch.compile(dynamic=True)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)

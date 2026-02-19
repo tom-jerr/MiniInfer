@@ -385,11 +385,29 @@ class PagedTokenAllocator(ITokenAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+            # Page 0 is a reserved/padded slot and must never enter free pages.
+            valid_mask = (free_page_indices >= 1) & (
+                free_page_indices <= self.num_pages
+            )
+            if not torch.all(valid_mask):
+                invalid = free_page_indices[~valid_mask]
+                logger.warning(
+                    "Dropping invalid free page ids: %s", invalid.detach().cpu().tolist()
+                )
+            free_page_indices = free_page_indices[valid_mask]
+            if free_page_indices.numel() == 0:
+                return
             self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            # 去重：防止 radix tree split 节点时同一个 page 被多个节点持有
+            self.free_pages = torch.unique(self.free_pages)
         else:
             self.free_group.append(free_index)
 
         assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+        assert torch.all(self.free_pages >= 1) and torch.all(
+            self.free_pages <= self.num_pages
+        )
+        assert len(self.free_pages) <= self.num_pages
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -427,12 +445,10 @@ class PagedTokenAllocator(ITokenAllocator):
         return self.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
     def available_size(self) -> int:
-        # Only count explicitly freed pages; each page contains `page_size` token slots.
+        # Only count allocatable pages currently present in `free_pages`.
+        # NOTE: `free_group` is not used by alloc paths in current implementation.
         free_pages = len(self.free_pages)
-        free_group_tokens = sum(
-            len(free_idx) for free_idx in getattr(self, "free_group", [])
-        )
-        return (free_pages + free_group_tokens) * self.page_size
+        return free_pages * self.page_size
 
 
 class RequestPool(IRequestPool):

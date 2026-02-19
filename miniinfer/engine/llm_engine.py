@@ -648,17 +648,30 @@ class LLMEngine:
                 # 将已推理的 token 插入 radix cache
                 # update_unfinished_req_radix_cache 会：
                 # 1. 将当前 fill_ids 对应的 KV 写入 radix cache
-                # 2. 更新 req.cache_protected_len, prefix_indices, last_node
+                # 2. 恢复 fill_ids 为完整序列（origin_input_ids + output_ids），以便后续 chunk 正确切片
+                # 3. 释放之前的 req_pool_idx，已经写入了 radix cache
                 self.kv_cache_mgr.update_unfinished_req_radix_cache(req)
+                req.fill_ids = req.origin_input_ids + req.output_ids
+                self.kv_cache_mgr.request_pool.free([req.req_pool_idx])
+                req.req_pool_idx = -1
                 logger.debug(
                     f"Updated radix cache for chunked prefill req_id={req.req_id}, "
                     f"cache_protected_len={req.cache_protected_len}, "
                     f"prefix_indices={req.prefix_indices}, "
-                    f"last_node={req.last_node}"
+                    f"last_node={req.last_node}, "
+                    f"req_pool_idx=" + str(req.req_pool_idx)
+                    if req.req_pool_idx != -1
+                    else "no req_pool_idx"
                 )
                 continue
 
             # ============ 正常请求处理 ============
+            # retract 后请求会被重新 prefill。若不清理 detokenizer 状态，
+            # 旧 token 文本会和重跑后的新 token 文本串接，导致输出错位/乱码。
+            if req.is_retracted:
+                self.detokenizer.cleanup(req.req_id)
+                req.is_retracted = False
+
             token_id = next_token_ids[i]
             req.output_ids.append(token_id)
 

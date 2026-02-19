@@ -54,6 +54,9 @@ class TreeNode:
     def evicted(self):
         return self.value is None
 
+    def __lt__(self, other: "TreeNode"):
+        return self.last_access_time < other.last_access_time
+
 
 class RadixCache(IPrefixCache):
 
@@ -115,9 +118,18 @@ class RadixCache(IPrefixCache):
         return value, node
 
     def insert(self, key: List[int], value=None):
+        # In paged mode we can only safely own full pages in radix cache.
+        # Keep insert aligned with match_prefix semantics to avoid dangling refs.
+        if self.page_size > 1:
+            aligned_len = self._align_len(len(key))
+            if aligned_len == 0:
+                return 0
+            if aligned_len != len(key):
+                key = key[:aligned_len]
+                if value is not None:
+                    value = value[:aligned_len]
         if value is None:
-            value = torch.tensor(key, dtype=torch.int64)
-        logger.debug(f"Inserting val of length {len(value)}")
+            value = torch.tensor(key, dtype=torch.int64, device=self.device)
         return self._insert_helper(self.root, key, value)
 
     def evict(self, num_tokens: int):
@@ -129,13 +141,19 @@ class RadixCache(IPrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            before_available = self.token_allocator.available_size()
             self.token_allocator.free(x.value)
-            num_evicted += len(x.value)
+            after_available = self.token_allocator.available_size()
+            # Count net newly available token slots instead of inferred pages.
+            # This avoids overcounting when stale/duplicate page refs exist.
+            num_evicted += max(0, after_available - before_available)
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = x.parent.last_access_time
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+        # self.pretty_print()
+        logger.debug(f"Evicted {num_evicted} tokens, requested {num_tokens}")
 
     def inc_lock_ref(self, node: TreeNode):
         delta = 0
@@ -164,11 +182,16 @@ class RadixCache(IPrefixCache):
         return delta
 
     def evictable_size(self):
-        return self.evictable_size_
+        aligned = self.evictable_size_ // self.page_size * self.page_size
+        if self.token_allocator is None:
+            return aligned
+        # Evictable cache must be bounded by currently used physical capacity.
+        used = max(0, self.token_allocator.size - self.token_allocator.available_size())
+        return min(aligned, used)
 
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
-        return self.protected_size_
+        return self.protected_size_ // self.page_size * self.page_size
 
     def total_size(self):
         total_size = 0
@@ -213,7 +236,7 @@ class RadixCache(IPrefixCache):
         if len(key) == 0:
             return 0
         child_key = self.get_child_key_fn(key)
-        # logger.debug(f"Inserting key with child key {child_key}")
+        logger.debug(f"Inserting key length {len(child_key)}")
         total_prefix_len = 0
 
         while len(key) > 0 and child_key in node.children.keys():
@@ -230,7 +253,7 @@ class RadixCache(IPrefixCache):
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
-                logger.debug(f"Descending to child key {child_key}")
+                logger.debug(f"Descending to child key length {len(child_key)}")
 
         if len(key):
             new_node = TreeNode()
@@ -239,8 +262,8 @@ class RadixCache(IPrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
-            logger.debug(f"Created new node with key {child_key}")
-
+            logger.debug(f"Created new node with key length {len(child_key)}")
+        # self.pretty_print()
         return total_prefix_len
 
     def _collect_leaves(self):

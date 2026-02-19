@@ -298,7 +298,8 @@ class PrefillAdder:
         # --- 总 token 预算检查 ---
         # 修改: 当启用 chunked prefill 时，不直接返回 NO_TOKEN，
         # 而是尝试分块处理请求
-        if total_tokens >= self.rem_total_tokens:
+        # 注意: 使用 > 而非 >=，允许 total_tokens == rem_total_tokens 的边界情况通过
+        if total_tokens > self.rem_total_tokens:
             # 如果 chunked prefill 未启用，直接拒绝
             if self.rem_chunk_tokens is None:
                 return AddReqResult.NO_TOKEN
