@@ -467,3 +467,74 @@ class FlashAttention2Backend(AttentionBackend):
             o = o[0]
         # Output shape: [batch_size, seqlen_q=1, nheads, headdim]
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    # ==================== CUDA Graph Support ====================
+
+    def init_cuda_graph_metadata(
+        self,
+        batch_size: int,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seq_len_k: int,
+    ) -> None:
+        """
+        Initialize metadata for CUDA graph capture.
+
+        Unlike init_forward_metadata(), this uses pre-allocated static tensors
+        that will be reused during graph replay. The tensors are NOT copied -
+        they are used directly as references so updates propagate.
+
+        Args:
+            batch_size: Number of sequences in the batch
+            block_table: Pre-allocated block table [batch_size, max_blocks]
+            cache_seqlens: Pre-allocated sequence lengths [batch_size]
+            max_seq_len_k: Maximum sequence length for keys
+        """
+        device = cache_seqlens.device
+
+        metadata = FlashAttention2Metadata()
+        # Use the provided tensors directly (not copies)
+        metadata.cache_seqlens_int32 = cache_seqlens
+        metadata.max_seq_len_k = max_seq_len_k
+        metadata.max_seq_len_q = 1  # Decode always has seqlen_q=1
+        # cu_seqlens_q for decode: simple 0, 1, 2, ..., batch_size
+        metadata.cu_seqlens_q = torch.arange(
+            0, batch_size + 1, dtype=torch.int32, device=device
+        )
+        # cu_seqlens_k from cumsum of cache_seqlens
+        metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+        )
+        metadata.block_table = block_table
+
+        self.forward_metadata = metadata
+
+    def update_cuda_graph_metadata(
+        self,
+        cache_seqlens: torch.Tensor,
+        max_seq_len_k: int,
+    ) -> None:
+        """
+        Update metadata values before CUDA graph replay.
+
+        This is called after copying actual sequence data into static buffers
+        but before graph replay. It updates derived values that depend on the
+        actual sequence lengths.
+
+        Note: block_table and cache_seqlens_int32 are already updated via
+        direct buffer copies. This method updates computed values.
+
+        Args:
+            cache_seqlens: Updated sequence lengths
+            max_seq_len_k: Updated maximum sequence length
+        """
+        if self.forward_metadata is None:
+            raise RuntimeError(
+                "forward_metadata not initialized. Call init_cuda_graph_metadata first."
+            )
+
+        self.forward_metadata.max_seq_len_k = max_seq_len_k
+        # Update cu_seqlens_k with new cache_seqlens
+        self.forward_metadata.cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+        )

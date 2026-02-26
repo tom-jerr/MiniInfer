@@ -23,6 +23,7 @@ from miniinfer.layers.sample import Sampler, SamplingBatchInfo
 from miniinfer.layers.attention_backend.flashattention_backend import (
     FlashAttention2Backend,
 )
+from miniinfer.engine.cuda_graph_runner import CudaGraphRunner
 import logging
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,10 @@ class ModelRunner:
             self.model = None
         self.sampler = Sampler()
         self.init_load_model()
+
+        # CUDA Graph support
+        self.cuda_graph_runner: CudaGraphRunner = None
+        self.use_cuda_graph: bool = not config.enforce_eager
 
         # 如果提供了 kv_cache_mgr，立即初始化 attn_backend
         if kv_cache_mgr is not None:
@@ -131,7 +136,16 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         return_hidden_states: bool = False,
     ) -> BaseModelOutput:
-        # TODO: support CUDA Graph
+        # Use CUDA Graph if available and enabled
+        if (
+            self.use_cuda_graph
+            and self.cuda_graph_runner is not None
+            and self.cuda_graph_runner.is_available()
+            and not return_hidden_states  # CUDA Graph doesn't support hidden states
+        ):
+            return self.cuda_graph_runner.replay(forward_batch)
+
+        # Fallback to eager mode
         self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
             forward_batch.input_ids,
@@ -139,6 +153,58 @@ class ModelRunner:
             forward_batch,
             return_hidden_states=return_hidden_states,
         )
+
+    def init_cuda_graph(
+        self,
+        max_batch_size: int = 256,
+        max_context_len: int = 4096,
+    ) -> None:
+        """
+        Initialize CUDA Graph runner and warmup.
+
+        Should be called after model and KV cache are fully initialized.
+        This captures CUDA graphs for all power-of-2 batch sizes from 1 to max_batch_size.
+
+        Args:
+            max_batch_size: Maximum batch size to capture (typically max_num_seqs)
+            max_context_len: Maximum context length for block table sizing
+        """
+        if not self.use_cuda_graph:
+            logger.info("CUDA Graph disabled (enforce_eager=True)")
+            return
+
+        if self.attn_backend is None:
+            raise RuntimeError(
+                "Attention backend not initialized. "
+                "Call set_kv_cache_mgr() first before init_cuda_graph()."
+            )
+
+        if self.kv_cache_mgr is None:
+            raise RuntimeError(
+                "KV cache manager not initialized. "
+                "Call set_kv_cache_mgr() first before init_cuda_graph()."
+            )
+
+        logger.info(
+            f"Initializing CUDA Graph runner with max_bs={max_batch_size}, "
+            f"max_context_len={max_context_len}"
+        )
+
+        self.cuda_graph_runner = CudaGraphRunner(
+            model=self.model,
+            attn_backend=self.attn_backend,
+            kv_cache_mgr=self.kv_cache_mgr,
+            max_batch_size=max_batch_size,
+            max_context_len=max_context_len,
+            page_size=self.kv_cache_mgr.page_size,
+            vocab_size=self.model_config.vocab_size,
+            dtype=self.config.dtype,
+            device=self.device,
+        )
+
+        # Warmup: capture all graphs
+        self.cuda_graph_runner.warmup()
+        logger.info("CUDA Graph warmup complete")
 
     def sample(
         self,

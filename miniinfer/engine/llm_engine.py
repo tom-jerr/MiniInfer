@@ -479,6 +479,19 @@ class LLMEngine:
         # Scheduler (传入 tokenizer 和 model_runner)
         self.scheduler = Scheduler(self.config, self.tokenizer, self.kv_cache_mgr)
 
+        # 步骤 5: 初始化 CUDA Graph (如果未禁用)
+        if not self.config.enforce_eager:
+            logger.info("Step 5: Initializing CUDA Graph for decode acceleration...")
+            cuda_graph_max_bs = self.config.cuda_graph_max_bs
+            if cuda_graph_max_bs <= 0:
+                cuda_graph_max_bs = self.config.max_num_seqs
+            self.model_runner.init_cuda_graph(
+                max_batch_size=cuda_graph_max_bs,
+                max_context_len=self.config.max_context_len,
+            )
+        else:
+            logger.info("Step 5: CUDA Graph disabled (enforce_eager=True)")
+
         self._started = True
 
     def start(self):

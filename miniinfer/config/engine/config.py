@@ -45,6 +45,11 @@ class EngineConfig:
     hf_config: Optional[AutoConfig] = field(default=None, repr=False)
     eos: int = -1
 
+    # ============ CUDA Graph 配置 ============
+    # 是否启用 CUDA Graph 加速 decode 阶段 (enforce_eager=True 时禁用)
+    # cuda_graph_max_bs: 0 表示使用 max_num_seqs
+    cuda_graph_max_bs: int = 0
+
     # 别名支持（兼容旧配置）
     @property
     def model(self) -> str:
