@@ -131,6 +131,7 @@ set_target_properties(miniinfer_kernels PROPERTIES
 ```
 
 常见 GPU 架构：
+
 - RTX 20 系列: 75
 - RTX 30 系列: 86
 - RTX 40 系列: 89

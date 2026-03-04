@@ -6,15 +6,15 @@ from .position_encoding import RotaryEmbedding
 from .sample import make_sampler, Sampler
 
 __all__ = [
-    "apply_activation",
-    "get_activation",
-    "get_attention",
-    "causal_mask",
-    "AttentionImpl",
-    "VocabEmbedding",
-    "LMHead",
-    "RMSNorm",
-    "RotaryEmbedding",
-    "make_sampler",
-    "Sampler",
+  "apply_activation",
+  "get_activation",
+  "get_attention",
+  "causal_mask",
+  "AttentionImpl",
+  "VocabEmbedding",
+  "LMHead",
+  "RMSNorm",
+  "RotaryEmbedding",
+  "make_sampler",
+  "Sampler",
 ]

@@ -16,7 +16,6 @@ BreakBeforeBraces: Attach
 AllowShortBlocksOnASingleLine: Empty
 AllowShortFunctionsOnASingleLine: Inline
 AllowShortIfStatementsOnASingleLine: Never
-AllowShortLokernelsOnASingleLine: false
 
 # 指针和引用对齐
 PointerAlignment: Left

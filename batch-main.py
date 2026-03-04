@@ -24,22 +24,22 @@ Shanghai[a] is a direct-administered municipality and the most populous urban ar
 shanghai_wikipedia += "Based on the previous information, "
 
 prompts = [
-    shanghai_wikipedia + "Where is Shanghai?",
-    shanghai_wikipedia + "How much is the population of Shanghai?",
-    shanghai_wikipedia + "What is the GDP of Shanghai?",
-    shanghai_wikipedia + "What is the population of Shanghai?",
-    shanghai_wikipedia + "What is the second largest city proper in China?",
-    shanghai_wikipedia + "What is Shanghai known for?",
-    shanghai_wikipedia + "What are the rivers in Shanghai?",
-    shanghai_wikipedia + "Shanghai is the major center for what?",
-    "What is the capital of France?",
-    "Where is New York City?",
-    "Where is Tokyo?",
-    "What is the capital of China?",
-    "Where is Pittsburgh?",
-    "Where is Vancouver?",
-    "Where is Toronto?",
-    "Give me a short introduction to large language model.",
+  shanghai_wikipedia + "Where is Shanghai?",
+  shanghai_wikipedia + "How much is the population of Shanghai?",
+  shanghai_wikipedia + "What is the GDP of Shanghai?",
+  shanghai_wikipedia + "What is the population of Shanghai?",
+  shanghai_wikipedia + "What is the second largest city proper in China?",
+  shanghai_wikipedia + "What is Shanghai known for?",
+  shanghai_wikipedia + "What are the rivers in Shanghai?",
+  shanghai_wikipedia + "Shanghai is the major center for what?",
+  "What is the capital of France?",
+  "Where is New York City?",
+  "Where is Tokyo?",
+  "What is the capital of China?",
+  "Where is Pittsburgh?",
+  "Where is Vancouver?",
+  "Where is Toronto?",
+  "Give me a short introduction to large language model.",
 ]
 
 # shuffle prompts
@@ -47,77 +47,77 @@ random.shuffle(prompts)
 
 
 def main():
-    print(f"Using PyTorch version with model: {args.model}")
+  print(f"Using PyTorch version with model: {args.model}")
 
-    # Load model and tokenizer
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+  # Load model and tokenizer
+  device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+  print(f"Using device: {device}")
 
-    # Load the transformers model
-    torch_model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=torch.float16 if device.type == "cuda" else torch.float32,
-        device_map=device,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+  # Load the transformers model
+  torch_model = AutoModelForCausalLM.from_pretrained(
+    args.model,
+    dtype=torch.float16 if device.type == "cuda" else torch.float32,
+    device_map=device,
+  )
+  tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    # Wrap with our custom model
-    tiny_llm_model = Qwen2Model(torch_model)
+  # Wrap with our custom model
+  tiny_llm_model = Qwen2Model(torch_model)
 
-    # Prepare prompts with chat template
-    encoded_prompts = []
-    for idx, prompt in enumerate(prompts):
-        print(f"Prompt {idx}: {prompt[:100]}...")  # Show first 100 chars
+  # Prepare prompts with chat template
+  encoded_prompts = []
+  for idx, prompt in enumerate(prompts):
+    print(f"Prompt {idx}: {prompt[:100]}...")  # Show first 100 chars
 
-        # Apply chat template if tokenizer supports it
-        if hasattr(tokenizer, "apply_chat_template"):
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ]
-            try:
-                formatted_prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            except Exception as e:
-                print(f"Warning: Could not apply chat template: {e}")
-                formatted_prompt = prompt
-        else:
-            formatted_prompt = prompt
+    # Apply chat template if tokenizer supports it
+    if hasattr(tokenizer, "apply_chat_template"):
+      messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": prompt},
+      ]
+      try:
+        formatted_prompt = tokenizer.apply_chat_template(
+          messages,
+          tokenize=False,
+          add_generation_prompt=True,
+        )
+      except Exception as e:
+        print(f"Warning: Could not apply chat template: {e}")
+        formatted_prompt = prompt
+    else:
+      formatted_prompt = prompt
 
-        encoded_prompts.append(formatted_prompt)
+    encoded_prompts.append(formatted_prompt)
 
-    print("\nStarting batch generation with:")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Prefill step: {args.prefill_step}")
-    print(f"  Max sequence length: {args.max_seq_len}")
-    print(f"  Number of prompts: {len(encoded_prompts)}")
+  print("\nStarting batch generation with:")
+  print(f"  Batch size: {args.batch_size}")
+  print(f"  Prefill step: {args.prefill_step}")
+  print(f"  Max sequence length: {args.max_seq_len}")
+  print(f"  Number of prompts: {len(encoded_prompts)}")
 
-    # Run batch generation
-    result = batch_generate(
-        tiny_llm_model,
-        tokenizer,
-        encoded_prompts,
-        max_seq_len=args.max_seq_len,
-        batch_size=args.batch_size,
-        prefill_step=args.prefill_step,
-    )
+  # Run batch generation
+  result = batch_generate(
+    tiny_llm_model,
+    tokenizer,
+    encoded_prompts,
+    max_seq_len=args.max_seq_len,
+    batch_size=args.batch_size,
+    prefill_step=args.prefill_step,
+  )
 
-    print("\n" + "=" * 80)
-    print("RESULTS:")
-    print("=" * 80)
+  print("\n" + "=" * 80)
+  print("RESULTS:")
+  print("=" * 80)
 
-    # Sort results by prompt index for consistent output
-    result.sort(key=lambda x: x[0])
+  # Sort results by prompt index for consistent output
+  result.sort(key=lambda x: x[0])
 
-    for prompt_idx, text in result:
-        print(f"\n--- Prompt {prompt_idx} ---")
-        print(f"Q: {prompts[prompt_idx]}")
-        print(f"A: {text}")
-        print("-" * 40)
+  for prompt_idx, text in result:
+    print(f"\n--- Prompt {prompt_idx} ---")
+    print(f"Q: {prompts[prompt_idx]}")
+    print(f"A: {text}")
+    print("-" * 40)
 
 
 if __name__ == "__main__":
-    main()
+  main()

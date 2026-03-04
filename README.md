@@ -18,7 +18,7 @@ MiniInfer 是一个学习性质的大语言模型推理引擎，从零实现了�
 
 ## 🙏 致谢
 
-- **[mini-sglang](https://github.com/sgl-project/mini-sglang) - 提供了 KV Cache 相关的设计思路和部分代码实现
+- \*\*[mini-sglang](https://github.com/sgl-project/mini-sglang) - 提供了 KV Cache 相关的设计思路和部分代码实现
 - **[tiny-llm](https://github.com/skyzh/tiny-llm)** - 最初的项目框架代码参考
 - **[nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)** - 重构后项目框架代码参考
 - **[vLLM](https://github.com/vllm-project/vllm)** - 高性能 LLM 推理引擎，PagedAttention 和 Continuous Batching 的创新实现给了我们很大启发

@@ -33,12 +33,12 @@ from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 from miniinfer.utils.profiler_utils import profile_methods
 from miniinfer.scheduler.prefill_adder import PrefillAdder, AddReqResult
 from miniinfer.scheduler.scheduler_batch import (
-    Req,
-    ChunkedReq,
-    ScheduledBatch,
-    ForwardBatch,
-    ForwardMode,
-    BatchResult,
+  Req,
+  ChunkedReq,
+  ScheduledBatch,
+  ForwardBatch,
+  ForwardMode,
+  BatchResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,718 +61,674 @@ _DECODE_STARVATION_TICKS = 3
 
 @profile_methods("Scheduler")
 class Scheduler:
+  """
+  调度器 - 防 decode 饿死 + 防 OOM
+
+  核心机制:
+  1. new_token_ratio 动态调节:
+     - 初始 0.3，每次 decode 内存不足 (retract) 时步进增大
+     - 连续若干轮 decode 顺利时步进缩小，释放更多 prefill 空间
+  2. PrefillAdder 预算:
+     - rem_total_tokens = available_kv - decode_reserve (page 对齐)
+     - rem_input_tokens = min(rem_total_tokens, max_extend_len) (page 对齐)
+  3. Decode 内存检查 (check_decode_mem):
+     - 估算下一步所有 decode 请求需要的 page 数
+     - 不足时从 batch 尾部收缩请求 (retract)，被收缩的请求回到 waiting 队列
+  4. Decode 饿死保护:
+     - 如果 running_batch 已等待超过 _DECODE_STARVATION_TICKS 轮未被调度，
+       强制跳过 prefill，立即执行 decode
+  """
+
+  def __init__(
+    self,
+    config: EngineConfig,
+    tokenizer: Any,
+    kv_cache_mgr: KVCacheManager,
+  ):
+    self.engine_config = config
+    self.tokenizer = tokenizer
+    self.kv_cache_mgr = kv_cache_mgr
+    self.max_batch_size = config.max_num_seqs
+    self.max_extend_len = getattr(config, "max_extend_len", 8192)
+    self.page_size = getattr(config, "page_size", 256)
+    self.gpu_memory_utilization = getattr(config, "gpu_memory_utilization", 0.6)
+
+    self.enable_chunked_prefill = getattr(config, "enable_chunked_prefill", False)
+    self.chunked_prefill_size = getattr(config, "chunked_prefill_size", 4096)
+
+    # ============ 动态 new_token_ratio ============
+    self.new_token_ratio = _INIT_NEW_TOKEN_RATIO
+    self.num_continuous_retract = 0  # 连续收缩次数
+    self.num_continuous_decode_ok = 0  # 连续 decode 顺利次数
+
+    # ============ 请求队列 ============
+    self.waiting_queue: List[Req] = []
+    self.running_batch: ScheduledBatch = ScheduledBatch(reqs=[])
+    self.chunking_reqs: List[ChunkedReq] = []
+    self.cur_batch: Optional[ScheduledBatch] = None
+    self.last_batch: Optional[ScheduledBatch] = None
+    self.num_retracted_reqs: int = 0
+
+    # ============ 已完成的请求 ============
+    self.finished_reqs: List[Req] = []
+
+    # EOS token id
+    self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    logger.info(
+      f"Scheduler initialized: max_batch_size={self.max_batch_size}, "
+      f"max_extend_len={self.max_extend_len}, "
+      f"page_size={self.page_size}, "
+      f"enable_chunked_prefill={self.enable_chunked_prefill}, "
+      f"new_token_ratio={self.new_token_ratio}"
+    )
+
+  # ======================== 公共 API ========================
+
+  def step(self):
+    batch = self.schedule()
+    self.cur_batch = batch
+    if batch is None:
+      return []
+
+    result = self.run_batch(batch)
+    output_texts = self.process_batch_result(batch, result)
+    return output_texts
+
+  def add(self, req: Req):
+    """添加新请求到等待队列"""
+    self.waiting_queue.append(req)
+
+  def has_unfinished(self) -> bool:
+    return (
+      len(self.waiting_queue) > 0 or len(self.running_batch.reqs) > 0 or len(self.chunking_reqs) > 0
+    )
+
+  def get_num_unfinished(self) -> int:
+    return len(self.waiting_queue) + len(self.running_batch.reqs) + len(self.chunking_reqs)
+
+  # ======================== 调度主循环 ========================
+
+  def schedule(self, device: torch.device = None) -> Optional[ScheduledBatch]:
     """
-    调度器 - 防 decode 饿死 + 防 OOM
+    调度主循环 — Sarathi-Serve 风格 stall-free batching
 
-    核心机制:
-    1. new_token_ratio 动态调节:
-       - 初始 0.3，每次 decode 内存不足 (retract) 时步进增大
-       - 连续若干轮 decode 顺利时步进缩小，释放更多 prefill 空间
-    2. PrefillAdder 预算:
-       - rem_total_tokens = available_kv - decode_reserve (page 对齐)
-       - rem_input_tokens = min(rem_total_tokens, max_extend_len) (page 对齐)
-    3. Decode 内存检查 (check_decode_mem):
-       - 估算下一步所有 decode 请求需要的 page 数
-       - 不足时从 batch 尾部收缩请求 (retract)，被收缩的请求回到 waiting 队列
-    4. Decode 饿死保护:
-       - 如果 running_batch 已等待超过 _DECODE_STARVATION_TICKS 轮未被调度，
-         强制跳过 prefill，立即执行 decode
+    当开启 chunked prefill 时:
+    1. 过滤已完成请求
+    2. 尝试构建 mixed batch (decode + prefill)，decode 优先
+    3. 如果 prefill 队列为空且有 decode → 走纯 decode 路径
+
+    当未开启 chunked prefill 时:
+    1. 过滤已完成请求
+    2. 尝试 prefill 批次
+    3. 如果 prefill 为空 → 走 decode 路径
     """
-
-    def __init__(
-        self,
-        config: EngineConfig,
-        tokenizer: Any,
-        kv_cache_mgr: KVCacheManager,
-    ):
-        self.engine_config = config
-        self.tokenizer = tokenizer
-        self.kv_cache_mgr = kv_cache_mgr
-        self.max_batch_size = config.max_num_seqs
-        self.max_extend_len = getattr(config, "max_extend_len", 8192)
-        self.page_size = getattr(config, "page_size", 256)
-        self.gpu_memory_utilization = getattr(config, "gpu_memory_utilization", 0.6)
-
-        self.enable_chunked_prefill = getattr(config, "enable_chunked_prefill", False)
-        self.chunked_prefill_size = getattr(config, "chunked_prefill_size", 4096)
-
-        # ============ 动态 new_token_ratio ============
-        self.new_token_ratio = _INIT_NEW_TOKEN_RATIO
-        self.num_continuous_retract = 0  # 连续收缩次数
-        self.num_continuous_decode_ok = 0  # 连续 decode 顺利次数
-
-        # ============ 请求队列 ============
-        self.waiting_queue: List[Req] = []
-        self.running_batch: ScheduledBatch = ScheduledBatch(reqs=[])
-        self.chunking_reqs: List[ChunkedReq] = []
-        self.cur_batch: Optional[ScheduledBatch] = None
-        self.last_batch: Optional[ScheduledBatch] = None
-        self.num_retracted_reqs: int = 0
-
-        # ============ 已完成的请求 ============
-        self.finished_reqs: List[Req] = []
-
-        # EOS token id
-        self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
-
-        logger.info(
-            f"Scheduler initialized: max_batch_size={self.max_batch_size}, "
-            f"max_extend_len={self.max_extend_len}, "
-            f"page_size={self.page_size}, "
-            f"enable_chunked_prefill={self.enable_chunked_prefill}, "
-            f"new_token_ratio={self.new_token_ratio}"
-        )
-
-    # ======================== 公共 API ========================
-
-    def step(self):
-        batch = self.schedule()
-        self.cur_batch = batch
-        if batch is None:
-            return []
-
-        result = self.run_batch(batch)
-        output_texts = self.process_batch_result(batch, result)
-        return output_texts
-
-    def add(self, req: Req):
-        """添加新请求到等待队列"""
-        self.waiting_queue.append(req)
-
-    def has_unfinished(self) -> bool:
-        return (
-            len(self.waiting_queue) > 0
-            or len(self.running_batch.reqs) > 0
-            or len(self.chunking_reqs) > 0
-        )
-
-    def get_num_unfinished(self) -> int:
-        return (
-            len(self.waiting_queue)
-            + len(self.running_batch.reqs)
-            + len(self.chunking_reqs)
-        )
-
-    # ======================== 调度主循环 ========================
-
-    def schedule(self, device: torch.device = None) -> Optional[ScheduledBatch]:
-        """
-        调度主循环 — Sarathi-Serve 风格 stall-free batching
-
-        当开启 chunked prefill 时:
-        1. 过滤已完成请求
-        2. 尝试构建 mixed batch (decode + prefill)，decode 优先
-        3. 如果 prefill 队列为空且有 decode → 走纯 decode 路径
-
-        当未开启 chunked prefill 时:
-        1. 过滤已完成请求
-        2. 尝试 prefill 批次
-        3. 如果 prefill 为空 → 走 decode 路径
-        """
-        # 打印当前调度器状态（空闲页数等）
-        self._print_scheduler_info()
-
-        # Step 1: 过滤已完成的请求
-        self._filter_batch(self.running_batch)
-        running_bs = len(self.running_batch.reqs)
-
-        # Step 2: 尝试拼 prefill/mixed 批次
-        prefill_batch = self._get_new_batch_prefill(device)
-
-        if prefill_batch is not None:
-            self._print_batch_info(prefill_batch, "PREFILL/MIXED")
-            return prefill_batch
-
-        # Step 3: 没有 prefill → 回退到纯 decode
-        if running_bs > 0:
-            decode_batch = self._get_decode_batch(device)
-            if decode_batch is not None:
-                self._print_batch_info(decode_batch, "DECODE")
-            return decode_batch
-
-        logger.info("[Scheduler] No batch to execute this round")
-        return None
-
-    # ======================== Prefill 批次构建 ========================
-
-    def _get_new_batch_prefill(self, device: torch.device) -> Optional[ScheduledBatch]:
-        """
-        尝试构建一个 prefill 批次
-
-        预算计算:
-        1. available_kv = kv_cache_mgr.available_tokens()
-        2. PrefillAdder 内部从 available_kv 中扣除 decode 预留
-        3. 先处理 chunking_reqs 中尚未完成的 chunk
-        4. 再从 waiting_queue 中取新请求
-        """
-        running_reqs = self.running_batch.reqs
-
-        if not self.waiting_queue and not self.chunking_reqs:
-            return None
-
-        available_kv = self.kv_cache_mgr.available_tokens()
-
-        # 创建 PrefillAdder —— 核心预算控制
-        # 精确传入 running_reqs，按每个请求的 min(剩余输出, CLIP) * ratio 预留
-        # BUG FIX: 在 mixed batch 场景下，need to account for running batch size
-        # 避免 total batch size 超过 request pool 容量
-        effective_max_batch_size = self.max_batch_size - len(running_reqs)
-        adder = PrefillAdder(
-            available_kv_tokens=available_kv,
-            running_reqs=running_reqs,
-            new_token_ratio=self.new_token_ratio,
-            max_extend_len=self.max_extend_len,
-            max_batch_size=effective_max_batch_size,
-            chunk_size=(
-                self.chunked_prefill_size if self.enable_chunked_prefill else None
-            ),
-            page_size=self.page_size,
-        )
-
-        # 如果预算不足，直接返回
-        if adder.no_remaining_budget():
-            logger.debug(f"No budget for prefill: available_kv={available_kv}")
-            return None
-
-        # ---- 处理 chunking 中的请求（续 chunk）----
-        continuing_chunks = []
-        remaining_chunks = []
-
-        for chunked_req in self.chunking_reqs:
-            req = chunked_req.req
-            cached_len = chunked_req.cached_len + chunked_req.chunk_size
-            remaining_len = req.total_input_len - cached_len
-
-            # 更新 req 的 extend_input_len 供 add_chunked_req 使用
-            req.extend_input_len = remaining_len
-            still_truncated = adder.add_chunked_req(req)
-            actual_chunk_size = req.extend_input_len
-
-            new_chunked = ChunkedReq(req, cached_len, actual_chunk_size)
-            continuing_chunks.append(new_chunked)
-            if still_truncated is not None:
-                # 还有后续 chunk，留到下一轮
-                remaining_chunks.append(
-                    ChunkedReq(req, cached_len + actual_chunk_size, 0)
-                )
-                logger.debug(
-                    f"Continuing chunked req_id={req.req_id}, "
-                    f"cached_len={cached_len}, "
-                    f"actual_chunk_size={actual_chunk_size}, "
-                    f"remaining_len={remaining_len - actual_chunk_size}"
-                )
-            else:
-                logger.debug(
-                    f"Finished chunked req_id={req.req_id}, "
-                    f"cached_len={cached_len}, "
-                    f"actual_chunk_size={actual_chunk_size}"
-                )
-
-        self.chunking_reqs = remaining_chunks
-
-        # ---- 从 waiting_queue 中添加新的 prefill 请求 ----
-        prefill_reqs = []
-        new_chunked_reqs = []
-        remaining_waiting = []
-
-        for req in self.waiting_queue:
-            if adder.no_remaining_budget():
-                remaining_waiting.append(req)
-                continue
-
-            # 计算 prefix 匹配
-            self.kv_cache_mgr.prefix_for_waiting_req(req)
-
-            result = adder.try_add_prefill(req)
-
-            if result == AddReqResult.NO_TOKEN:
-                # KV cache 不足，后续请求也无法添加
-                remaining_waiting.append(req)
-                remaining_waiting.extend(
-                    self.waiting_queue[self.waiting_queue.index(req) + 1 :]
-                )
-                break
-            elif result == AddReqResult.OTHER:
-                # 软限制（chunk 预算用尽等），跳过但继续尝试
-                remaining_waiting.append(req)
-                continue
-
-            # CONTINUE: 添加成功
-            if adder.new_chunked_req is req:
-                # 被截断为 chunk
-                chunked_req = ChunkedReq(
-                    req=req,
-                    cached_len=req.cache_protected_len,
-                    chunk_size=req.extend_input_len,
-                )
-                new_chunked_reqs.append(chunked_req)
-                adder.new_chunked_req = None  # reset
-            else:
-                prefill_reqs.append(req)
-
-        self.waiting_queue = remaining_waiting
-
-        # ---- 合并结果 ----
-        all_extend_reqs = (
-            prefill_reqs
-            + [c.req for c in continuing_chunks]
-            + [c.req for c in new_chunked_reqs]
-        )
-        all_chunked_reqs = continuing_chunks + new_chunked_reqs
-
-        if not all_extend_reqs:
-            return None
-
-        # 更新 chunking_reqs（未完成的 chunk 留到下一轮）
-        for chunked_req in all_chunked_reqs:
-            if not chunked_req.is_last_chunk:
-                self.chunking_reqs.append(chunked_req)
-
-        # ---- 构建 mixed batch: prefill + decode ----
-        # 当开启 chunked prefill 且有 running decode 请求时，
-        # 将 decode 请求附加到 prefill 批次，组成 mixed batch，
-        # 所有请求统一使用 extend kernel 处理（decode 视为 extend_len=1）
-        decode_reqs = []
-        if self.enable_chunked_prefill and running_reqs:
-            decode_reqs = list(running_reqs)  # 复制列表，不修改原 running_batch
-
-        # 合并所有请求: prefill extend + decode (as extend_len=1)
-        all_batch_reqs = all_extend_reqs + decode_reqs
-
-        batch = ScheduledBatch.init_new(all_batch_reqs, device=device)
-        batch.decoding_reqs = decode_reqs if decode_reqs else None
-
-        if decode_reqs:
-            batch.forward_mode = ForwardMode.MIXED
-        else:
-            batch.forward_mode = ForwardMode.EXTEND
-
-        self._prepare_chunked_input_ids(batch, all_chunked_reqs)
-        self.kv_cache_mgr.prepare_for_mixed(batch, all_extend_reqs, decode_reqs)
-
-        # 非 chunked 请求完成 prefill 后加入 running_batch
-        for req in all_extend_reqs:
-            if not req.is_chunked:
-                self.running_batch.reqs.append(req)
-                self._update_running_batch_metadata(batch, req)
-
-        return batch
-
-    # ======================== Decode 批次构建 ========================
-
-    def _get_decode_batch(self, device: torch.device) -> Optional[ScheduledBatch]:
-        """
-        构建 decode 批次
-
-        核心防 OOM 逻辑:
-        1. check_decode_mem: 估算下一步需要的 KV page 数
-        2. 如果不足 → 收缩批次 (retract) 并调高 new_token_ratio
-        3. 如果连续多轮没有 retract → 逐步降低 new_token_ratio
-        4. alloc_for_decode: 按 page_size 追加 KV 内存
-        """
-        if len(self.running_batch.reqs) == 0:
-            return None
-
-        # ---- 内存检查 + 收缩 ----
-        retracted = self._check_decode_mem()
-
-        if retracted:
-            # 有收缩 → 调高 new_token_ratio（给 decode 更多预留）
-            self.num_continuous_retract += 1
-            self.num_continuous_decode_ok = 0
-            if self.num_continuous_retract >= _RETRACT_THRESHOLD:
-                old_ratio = self.new_token_ratio
-                self.new_token_ratio = min(
-                    self.new_token_ratio + _NTR_GROW_STEP, _MAX_NEW_TOKEN_RATIO
-                )
-                if self.new_token_ratio != old_ratio:
-                    logger.info(
-                        f"new_token_ratio raised: {old_ratio:.3f} → "
-                        f"{self.new_token_ratio:.3f} "
-                        f"(continuous_retract={self.num_continuous_retract})"
-                    )
-        else:
-            # 没有收缩 → 逐步降低 new_token_ratio（释放 prefill 空间）
-            self.num_continuous_retract = 0
-            self.num_continuous_decode_ok += 1
-            if self.num_continuous_decode_ok >= 5:
-                old_ratio = self.new_token_ratio
-                self.new_token_ratio = max(
-                    self.new_token_ratio - _NTR_DECAY_STEP, _MIN_NEW_TOKEN_RATIO
-                )
-                self.num_continuous_decode_ok = 0
-                if self.new_token_ratio != old_ratio:
-                    logger.debug(
-                        f"new_token_ratio lowered: {old_ratio:.3f} → "
-                        f"{self.new_token_ratio:.3f}"
-                    )
-
-        if len(self.running_batch.reqs) == 0:
-            return None
-
-        # ---- 为 decode 分配 KV 内存 ----
-        self.kv_cache_mgr.prepare_for_decode(self.running_batch)
-        self.running_batch.forward_mode = ForwardMode.DECODE
-        return self.running_batch
-
-    def _check_decode_mem(self) -> bool:
-        """
-        检查 decode 内存是否充足，不足时收缩批次
-
-        估算: 每个 decode 请求下一步需要 1 个 token，
-        如果需要跨 page 边界则需要分配新的 page。
-
-        Returns:
-            True 如果有请求被收缩 (retracted)
-        """
-        if len(self.running_batch.reqs) == 0:
-            return False
-
-        available = self.kv_cache_mgr.available_tokens()
-        bs = len(self.running_batch.reqs)
-
-        # 精确估算 decode 需要的新 page 数
-        # 当 seq_len 跨越 page 边界时需要分配整个新 page
-        if self.running_batch.seq_lens_cpu is not None:
-            seq_lens_next = self.running_batch.seq_lens_cpu + 1
-            num_new_pages = (seq_lens_next % self.page_size == 1).int().sum().item()
-            needed = num_new_pages * self.page_size
-        else:
-            # 回退到保守估算：最坏情况每个请求都需要新 page
-            needed = bs * self.page_size
-
+    # 打印当前调度器状态（空闲页数等）
+    self._print_scheduler_info()
+
+    # Step 1: 过滤已完成的请求
+    self._filter_batch(self.running_batch)
+    running_bs = len(self.running_batch.reqs)
+
+    # Step 2: 尝试拼 prefill/mixed 批次
+    prefill_batch = self._get_new_batch_prefill(device)
+
+    if prefill_batch is not None:
+      self._print_batch_info(prefill_batch, "PREFILL/MIXED")
+      return prefill_batch
+
+    # Step 3: 没有 prefill → 回退到纯 decode
+    if running_bs > 0:
+      decode_batch = self._get_decode_batch(device)
+      if decode_batch is not None:
+        self._print_batch_info(decode_batch, "DECODE")
+      return decode_batch
+
+    logger.info("[Scheduler] No batch to execute this round")
+    return None
+
+  # ======================== Prefill 批次构建 ========================
+
+  def _get_new_batch_prefill(self, device: torch.device) -> Optional[ScheduledBatch]:
+    """
+    尝试构建一个 prefill 批次
+
+    预算计算:
+    1. available_kv = kv_cache_mgr.available_tokens()
+    2. PrefillAdder 内部从 available_kv 中扣除 decode 预留
+    3. 先处理 chunking_reqs 中尚未完成的 chunk
+    4. 再从 waiting_queue 中取新请求
+    """
+    running_reqs = self.running_batch.reqs
+
+    if not self.waiting_queue and not self.chunking_reqs:
+      return None
+
+    available_kv = self.kv_cache_mgr.available_tokens()
+
+    # 创建 PrefillAdder —— 核心预算控制
+    # 精确传入 running_reqs，按每个请求的 min(剩余输出, CLIP) * ratio 预留
+    # BUG FIX: 在 mixed batch 场景下，need to account for running batch size
+    # 避免 total batch size 超过 request pool 容量
+    effective_max_batch_size = self.max_batch_size - len(running_reqs)
+    adder = PrefillAdder(
+      available_kv_tokens=available_kv,
+      running_reqs=running_reqs,
+      new_token_ratio=self.new_token_ratio,
+      max_extend_len=self.max_extend_len,
+      max_batch_size=effective_max_batch_size,
+      chunk_size=(self.chunked_prefill_size if self.enable_chunked_prefill else None),
+      page_size=self.page_size,
+    )
+
+    # 如果预算不足，直接返回
+    if adder.no_remaining_budget():
+      logger.debug(f"No budget for prefill: available_kv={available_kv}")
+      return None
+
+    # ---- 处理 chunking 中的请求（续 chunk）----
+    continuing_chunks = []
+    remaining_chunks = []
+
+    for chunked_req in self.chunking_reqs:
+      req = chunked_req.req
+      cached_len = chunked_req.cached_len + chunked_req.chunk_size
+      remaining_len = req.total_input_len - cached_len
+
+      # 更新 req 的 extend_input_len 供 add_chunked_req 使用
+      req.extend_input_len = remaining_len
+      still_truncated = adder.add_chunked_req(req)
+      actual_chunk_size = req.extend_input_len
+
+      new_chunked = ChunkedReq(req, cached_len, actual_chunk_size)
+      continuing_chunks.append(new_chunked)
+      if still_truncated is not None:
+        # 还有后续 chunk，留到下一轮
+        remaining_chunks.append(ChunkedReq(req, cached_len + actual_chunk_size, 0))
         logger.debug(
-            f"Check decode mem: available={available}, needed={needed}, "
-            f"running_bs={bs}"
+          f"Continuing chunked req_id={req.req_id}, "
+          f"cached_len={cached_len}, "
+          f"actual_chunk_size={actual_chunk_size}, "
+          f"remaining_len={remaining_len - actual_chunk_size}"
+        )
+      else:
+        logger.debug(
+          f"Finished chunked req_id={req.req_id}, "
+          f"cached_len={cached_len}, "
+          f"actual_chunk_size={actual_chunk_size}"
         )
 
-        # 增加安全裕量：即使本步不需要新 page，也需要为后续几步预留
-        needed = max(needed, bs)
+    self.chunking_reqs = remaining_chunks
 
-        if available >= needed:
-            return False
+    # ---- 从 waiting_queue 中添加新的 prefill 请求 ----
+    prefill_reqs = []
+    new_chunked_reqs = []
+    remaining_waiting = []
 
-        # 内存不足 → 从 batch 尾部开始收缩
-        retract_count = 0
-        while len(self.running_batch.reqs) > 0:
-            # 重新估算剩余请求的实际需求
-            remaining_bs = len(self.running_batch.reqs)
-            if self.running_batch.seq_lens_cpu is not None and remaining_bs > 0:
-                remaining_seq_lens = self.running_batch.seq_lens_cpu[:remaining_bs] + 1
-                remaining_pages = (
-                    (remaining_seq_lens % self.page_size == 1).int().sum().item()
-                )
-                remaining_needed = max(remaining_pages * self.page_size, remaining_bs)
-            else:
-                remaining_needed = remaining_bs
+    for req in self.waiting_queue:
+      if adder.no_remaining_budget():
+        remaining_waiting.append(req)
+        continue
 
-            if available >= remaining_needed:
-                break
+      # 计算 prefix 匹配
+      self.kv_cache_mgr.prefix_for_waiting_req(req)
 
-            req = self.running_batch.reqs.pop()
-            retract_count += 1
+      result = adder.try_add_prefill(req)
 
-            # 释放这个请求的 KV cache
-            self.kv_cache_mgr.release_request(req, is_insert=True)
+      if result == AddReqResult.NO_TOKEN:
+        # KV cache 不足，后续请求也无法添加
+        remaining_waiting.append(req)
+        remaining_waiting.extend(self.waiting_queue[self.waiting_queue.index(req) + 1 :])
+        break
+      elif result == AddReqResult.OTHER:
+        # 软限制（chunk 预算用尽等），跳过但继续尝试
+        remaining_waiting.append(req)
+        continue
 
-            # 标记为被收缩，重新放回 waiting 队列头部
-            req.is_retracted = True
-            req.ever_retracted = True
-            req.finished = False
-            req.is_chunked = False
-            # 重置 KV 相关状态，下次重新 prefill
-            req.output_ids = []
-            req.fill_ids = []
-            req.prefix_indices = None
-            req.cache_protected_len = 0
-            req.last_node = None
-            req.extend_input_len = 0
-            req.req_pool_idx = -1  # 重置 req_pool_idx，避免读取已释放的数据
-            self.waiting_queue.insert(0, req)
+      # CONTINUE: 添加成功
+      if adder.new_chunked_req is req:
+        # 被截断为 chunk
+        chunked_req = ChunkedReq(
+          req=req,
+          cached_len=req.cache_protected_len,
+          chunk_size=req.extend_input_len,
+        )
+        new_chunked_reqs.append(chunked_req)
+        adder.new_chunked_req = None  # reset
+      else:
+        prefill_reqs.append(req)
 
-            # 更新可用量
-            available = self.kv_cache_mgr.available_tokens()
+    self.waiting_queue = remaining_waiting
 
-        # 同步 running_batch 的元数据
-        if retract_count > 0:
-            self._rebuild_running_batch_metadata()
-            self.num_retracted_reqs += retract_count
-            logger.warning(
-                f"Decode retract: removed {retract_count} reqs, "
-                f"running_bs={len(self.running_batch.reqs)}, "
-                f"available={available}"
-            )
+    # ---- 合并结果 ----
+    all_extend_reqs = (
+      prefill_reqs + [c.req for c in continuing_chunks] + [c.req for c in new_chunked_reqs]
+    )
+    all_chunked_reqs = continuing_chunks + new_chunked_reqs
 
-        return retract_count > 0
+    if not all_extend_reqs:
+      return None
 
-    def _rebuild_running_batch_metadata(self):
-        """收缩后重建 running_batch 的元数据"""
-        batch = self.running_batch
-        if len(batch.reqs) == 0:
-            batch.req_pool_indices = None
-            batch.seq_lens = None
-            batch.seq_lens_cpu = None
-            return
+    # 更新 chunking_reqs（未完成的 chunk 留到下一轮）
+    for chunked_req in all_chunked_reqs:
+      if not chunked_req.is_last_chunk:
+        self.chunking_reqs.append(chunked_req)
 
-        # 从 req 上的 req_pool_idx 重建
-        pool_indices = []
-        for req in batch.reqs:
-            pool_indices.append(req.req_pool_idx)
+    # ---- 构建 mixed batch: prefill + decode ----
+    # 当开启 chunked prefill 且有 running decode 请求时，
+    # 将 decode 请求附加到 prefill 批次，组成 mixed batch，
+    # 所有请求统一使用 extend kernel 处理（decode 视为 extend_len=1）
+    decode_reqs = []
+    if self.enable_chunked_prefill and running_reqs:
+      decode_reqs = list(running_reqs)  # 复制列表，不修改原 running_batch
 
-        if pool_indices:
-            device = (
-                batch.req_pool_indices.device
-                if batch.req_pool_indices is not None
-                else "cuda"
-            )
-            batch.req_pool_indices = torch.tensor(
-                pool_indices, dtype=torch.int64, device=device
-            )
-            # seq_lens 需要从请求本身推算
-            seq_lens = [
-                len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
-            ]
-            batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
-            batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+    # 合并所有请求: prefill extend + decode (as extend_len=1)
+    all_batch_reqs = all_extend_reqs + decode_reqs
+
+    batch = ScheduledBatch.init_new(all_batch_reqs, device=device)
+    batch.decoding_reqs = decode_reqs if decode_reqs else None
+
+    if decode_reqs:
+      batch.forward_mode = ForwardMode.MIXED
+    else:
+      batch.forward_mode = ForwardMode.EXTEND
+
+    self._prepare_chunked_input_ids(batch, all_chunked_reqs)
+    self.kv_cache_mgr.prepare_for_mixed(batch, all_extend_reqs, decode_reqs)
+
+    # 非 chunked 请求完成 prefill 后加入 running_batch
+    for req in all_extend_reqs:
+      if not req.is_chunked:
+        self.running_batch.reqs.append(req)
+        self._update_running_batch_metadata(batch, req)
+
+    return batch
+
+  # ======================== Decode 批次构建 ========================
+
+  def _get_decode_batch(self, device: torch.device) -> Optional[ScheduledBatch]:
+    """
+    构建 decode 批次
+
+    核心防 OOM 逻辑:
+    1. check_decode_mem: 估算下一步需要的 KV page 数
+    2. 如果不足 → 收缩批次 (retract) 并调高 new_token_ratio
+    3. 如果连续多轮没有 retract → 逐步降低 new_token_ratio
+    4. alloc_for_decode: 按 page_size 追加 KV 内存
+    """
+    if len(self.running_batch.reqs) == 0:
+      return None
+
+    # ---- 内存检查 + 收缩 ----
+    retracted = self._check_decode_mem()
+
+    if retracted:
+      # 有收缩 → 调高 new_token_ratio（给 decode 更多预留）
+      self.num_continuous_retract += 1
+      self.num_continuous_decode_ok = 0
+      if self.num_continuous_retract >= _RETRACT_THRESHOLD:
+        old_ratio = self.new_token_ratio
+        self.new_token_ratio = min(self.new_token_ratio + _NTR_GROW_STEP, _MAX_NEW_TOKEN_RATIO)
+        if self.new_token_ratio != old_ratio:
+          logger.info(
+            f"new_token_ratio raised: {old_ratio:.3f} → "
+            f"{self.new_token_ratio:.3f} "
+            f"(continuous_retract={self.num_continuous_retract})"
+          )
+    else:
+      # 没有收缩 → 逐步降低 new_token_ratio（释放 prefill 空间）
+      self.num_continuous_retract = 0
+      self.num_continuous_decode_ok += 1
+      if self.num_continuous_decode_ok >= 5:
+        old_ratio = self.new_token_ratio
+        self.new_token_ratio = max(self.new_token_ratio - _NTR_DECAY_STEP, _MIN_NEW_TOKEN_RATIO)
+        self.num_continuous_decode_ok = 0
+        if self.new_token_ratio != old_ratio:
+          logger.debug(f"new_token_ratio lowered: {old_ratio:.3f} → " f"{self.new_token_ratio:.3f}")
+
+    if len(self.running_batch.reqs) == 0:
+      return None
+
+    # ---- 为 decode 分配 KV 内存 ----
+    self.kv_cache_mgr.prepare_for_decode(self.running_batch)
+    self.running_batch.forward_mode = ForwardMode.DECODE
+    return self.running_batch
+
+  def _check_decode_mem(self) -> bool:
+    """
+    检查 decode 内存是否充足，不足时收缩批次
+
+    估算: 每个 decode 请求下一步需要 1 个 token，
+    如果需要跨 page 边界则需要分配新的 page。
+
+    Returns:
+        True 如果有请求被收缩 (retracted)
+    """
+    if len(self.running_batch.reqs) == 0:
+      return False
+
+    available = self.kv_cache_mgr.available_tokens()
+    bs = len(self.running_batch.reqs)
+
+    # 精确估算 decode 需要的新 page 数
+    # 当 seq_len 跨越 page 边界时需要分配整个新 page
+    if self.running_batch.seq_lens_cpu is not None:
+      seq_lens_next = self.running_batch.seq_lens_cpu + 1
+      num_new_pages = (seq_lens_next % self.page_size == 1).int().sum().item()
+      needed = num_new_pages * self.page_size
+    else:
+      # 回退到保守估算：最坏情况每个请求都需要新 page
+      needed = bs * self.page_size
+
+    logger.debug(f"Check decode mem: available={available}, needed={needed}, " f"running_bs={bs}")
+
+    # 增加安全裕量：即使本步不需要新 page，也需要为后续几步预留
+    needed = max(needed, bs)
+
+    if available >= needed:
+      return False
+
+    # 内存不足 → 从 batch 尾部开始收缩
+    retract_count = 0
+    while len(self.running_batch.reqs) > 0:
+      # 重新估算剩余请求的实际需求
+      remaining_bs = len(self.running_batch.reqs)
+      if self.running_batch.seq_lens_cpu is not None and remaining_bs > 0:
+        remaining_seq_lens = self.running_batch.seq_lens_cpu[:remaining_bs] + 1
+        remaining_pages = (remaining_seq_lens % self.page_size == 1).int().sum().item()
+        remaining_needed = max(remaining_pages * self.page_size, remaining_bs)
+      else:
+        remaining_needed = remaining_bs
+
+      if available >= remaining_needed:
+        break
+
+      req = self.running_batch.reqs.pop()
+      retract_count += 1
+
+      # 释放这个请求的 KV cache
+      self.kv_cache_mgr.release_request(req, is_insert=True)
+
+      # 标记为被收缩，重新放回 waiting 队列头部
+      req.is_retracted = True
+      req.ever_retracted = True
+      req.finished = False
+      req.is_chunked = False
+      # 重置 KV 相关状态，下次重新 prefill
+      req.output_ids = []
+      req.fill_ids = []
+      req.prefix_indices = None
+      req.cache_protected_len = 0
+      req.last_node = None
+      req.extend_input_len = 0
+      req.req_pool_idx = -1  # 重置 req_pool_idx，避免读取已释放的数据
+      self.waiting_queue.insert(0, req)
+
+      # 更新可用量
+      available = self.kv_cache_mgr.available_tokens()
+
+    # 同步 running_batch 的元数据
+    if retract_count > 0:
+      self._rebuild_running_batch_metadata()
+      self.num_retracted_reqs += retract_count
+      logger.warning(
+        f"Decode retract: removed {retract_count} reqs, "
+        f"running_bs={len(self.running_batch.reqs)}, "
+        f"available={available}"
+      )
+
+    return retract_count > 0
+
+  def _rebuild_running_batch_metadata(self):
+    """收缩后重建 running_batch 的元数据"""
+    batch = self.running_batch
+    if len(batch.reqs) == 0:
+      batch.req_pool_indices = None
+      batch.seq_lens = None
+      batch.seq_lens_cpu = None
+      return
+
+    # 从 req 上的 req_pool_idx 重建
+    pool_indices = []
+    for req in batch.reqs:
+      pool_indices.append(req.req_pool_idx)
+
+    if pool_indices:
+      device = batch.req_pool_indices.device if batch.req_pool_indices is not None else "cuda"
+      batch.req_pool_indices = torch.tensor(pool_indices, dtype=torch.int64, device=device)
+      # seq_lens 需要从请求本身推算
+      seq_lens = [len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs]
+      batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+      batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+    else:
+      batch.req_pool_indices = None
+      batch.seq_lens = None
+      batch.seq_lens_cpu = None
+
+  # ======================== 批次辅助方法 ========================
+
+  def _prepare_chunked_input_ids(
+    self,
+    batch: ScheduledBatch,
+    chunked_reqs: List[ChunkedReq],
+  ):
+    """为 chunked 请求准备特殊的 input_ids"""
+    # TODO: 实现 chunked input_ids 的构建
+    pass
+
+  def _update_running_batch_metadata(self, batch: ScheduledBatch, req: Req):
+    """当请求从 extend batch 移到 running_batch 时同步元数据"""
+    try:
+      req_idx_in_batch = batch.reqs.index(req)
+    except ValueError:
+      return
+
+    if batch.req_pool_indices is None or batch.seq_lens is None:
+      return
+
+    req_pool_idx = batch.req_pool_indices[req_idx_in_batch : req_idx_in_batch + 1]
+    seq_len = batch.seq_lens[req_idx_in_batch : req_idx_in_batch + 1]
+    seq_len_cpu = (
+      batch.seq_lens_cpu[req_idx_in_batch : req_idx_in_batch + 1]
+      if batch.seq_lens_cpu is not None
+      else None
+    )
+
+    if self.running_batch.req_pool_indices is None:
+      self.running_batch.req_pool_indices = req_pool_idx
+      self.running_batch.seq_lens = seq_len
+      self.running_batch.seq_lens_cpu = seq_len_cpu
+    else:
+      self.running_batch.req_pool_indices = torch.cat(
+        [self.running_batch.req_pool_indices, req_pool_idx]
+      )
+      self.running_batch.seq_lens = torch.cat([self.running_batch.seq_lens, seq_len])
+      if seq_len_cpu is not None and self.running_batch.seq_lens_cpu is not None:
+        self.running_batch.seq_lens_cpu = torch.cat([self.running_batch.seq_lens_cpu, seq_len_cpu])
+
+  def _filter_batch(self, batch: ScheduledBatch):
+    """过滤掉已完成的请求，并同步更新相关元数据"""
+    if not batch.reqs:
+      return
+
+    original_len = len(batch.reqs)
+
+    keep_indices = []
+    kept_reqs = []
+    for i, req in enumerate(batch.reqs):
+      if not req.finished:
+        keep_indices.append(i)
+        kept_reqs.append(req)
+
+    batch.reqs = kept_reqs
+
+    if len(keep_indices) == original_len:
+      return
+
+    if len(keep_indices) > 0 and batch.req_pool_indices is not None:
+      keep_indices_tensor = torch.tensor(keep_indices, device=batch.req_pool_indices.device)
+      batch.req_pool_indices = batch.req_pool_indices[keep_indices_tensor]
+      batch.seq_lens = batch.seq_lens[keep_indices_tensor]
+      if batch.seq_lens_cpu is not None:
+        batch.seq_lens_cpu = batch.seq_lens_cpu[keep_indices]
+    elif len(keep_indices) == 0:
+      batch.req_pool_indices = None
+      batch.seq_lens = None
+      batch.seq_lens_cpu = None
+
+  # ======================== 前向 & 结果处理 ========================
+
+  def run_batch(self, batch: ScheduledBatch) -> Any:
+    forward_batch = ForwardBatch.init_new(batch)
+    out = self.modelrunner.forward(forward_batch)
+    logits_output = out.logits
+    next_token_ids = self.modelrunner.sample(logits_output, forward_batch)
+
+    return BatchResult(
+      logits=logits_output,
+      next_token_ids=next_token_ids,
+    )
+
+  def process_batch_result(self, batch: ScheduledBatch, result: BatchResult) -> List[str]:
+    """处理批次推理结果"""
+    if batch is None or len(batch.reqs) == 0:
+      return []
+
+    next_token_ids = result.next_token_ids
+    if isinstance(next_token_ids, torch.Tensor):
+      next_token_ids = next_token_ids.cpu().tolist()
+
+    output_texts = []
+    finished_req_ids = []
+    for i, req in enumerate(batch.reqs):
+      token_id = next_token_ids[i]
+      req.output_ids.append(token_id)
+
+      delta_text, is_finished = self.incremental_decoder.decode(
+        req_id=req.req_id,
+        token_id=token_id,
+        eos_token_id=self.eos_token_id,
+      )
+      output_texts.append(delta_text)
+
+      if len(req.output_ids) >= req.max_tokens:
+        is_finished = True
+        remaining = self.incremental_decoder.flush(req.req_id)
+        if remaining:
+          output_texts[-1] += remaining
+
+      if is_finished:
+        req.finished = True
+        if token_id == self.eos_token_id:
+          req.finished_reason = "eos"
         else:
-            batch.req_pool_indices = None
-            batch.seq_lens = None
-            batch.seq_lens_cpu = None
+          req.finished_reason = "max_tokens"
+        finished_req_ids.append(req.req_id)
 
-    # ======================== 批次辅助方法 ========================
+    self._handle_finished_requests(batch, finished_req_ids)
+    return output_texts
 
-    def _prepare_chunked_input_ids(
-        self,
-        batch: ScheduledBatch,
-        chunked_reqs: List[ChunkedReq],
-    ):
-        """为 chunked 请求准备特殊的 input_ids"""
-        # TODO: 实现 chunked input_ids 的构建
-        pass
+  def _handle_finished_requests(self, batch: ScheduledBatch, finished_req_ids: List[int]):
+    """处理已完成的请求：释放 KV cache，移入 finished 列表"""
+    if not finished_req_ids:
+      return
 
-    def _update_running_batch_metadata(self, batch: ScheduledBatch, req: Req):
-        """当请求从 extend batch 移到 running_batch 时同步元数据"""
-        try:
-            req_idx_in_batch = batch.reqs.index(req)
-        except ValueError:
-            return
+    finished_req_id_set = set(finished_req_ids)
+    for req in batch.reqs:
+      if req.req_id in finished_req_id_set:
+        # 写回 radix cache（如果启用）
+        self.kv_cache_mgr.update_finished_req_radix_cache(req)
+        self.finished_reqs.append(req)
 
-        if batch.req_pool_indices is None or batch.seq_lens is None:
-            return
+  # ======================== 调试和监控 ========================
 
-        req_pool_idx = batch.req_pool_indices[req_idx_in_batch : req_idx_in_batch + 1]
-        seq_len = batch.seq_lens[req_idx_in_batch : req_idx_in_batch + 1]
-        seq_len_cpu = (
-            batch.seq_lens_cpu[req_idx_in_batch : req_idx_in_batch + 1]
-            if batch.seq_lens_cpu is not None
-            else None
-        )
+  def _print_scheduler_info(self):
+    """打印当前调度器状态，包括空闲页数"""
+    free_pages = len(self.kv_cache_mgr.token_allocator.free_pages)
+    total_pages = self.kv_cache_mgr.token_allocator.num_pages
+    used_pages = total_pages - free_pages
+    available_tokens = self.kv_cache_mgr.available_tokens()
 
-        if self.running_batch.req_pool_indices is None:
-            self.running_batch.req_pool_indices = req_pool_idx
-            self.running_batch.seq_lens = seq_len
-            self.running_batch.seq_lens_cpu = seq_len_cpu
-        else:
-            self.running_batch.req_pool_indices = torch.cat(
-                [self.running_batch.req_pool_indices, req_pool_idx]
-            )
-            self.running_batch.seq_lens = torch.cat(
-                [self.running_batch.seq_lens, seq_len]
-            )
-            if seq_len_cpu is not None and self.running_batch.seq_lens_cpu is not None:
-                self.running_batch.seq_lens_cpu = torch.cat(
-                    [self.running_batch.seq_lens_cpu, seq_len_cpu]
-                )
+    logger.info(
+      f"\n{'=' * 80}\n"
+      f"[Scheduler Round] KV Cache Status:\n"
+      f"  Free Pages: {free_pages}/{total_pages} "
+      f"(Used: {used_pages}, {used_pages/total_pages*100:.1f}%)\n"
+      f"  Available Tokens: {available_tokens}\n"
+      f"  Page Size: {self.page_size}\n"
+      f"  Waiting Queue: {len(self.waiting_queue)} reqs\n"
+      f"  Running Batch: {len(self.running_batch.reqs)} reqs\n"
+      f"  Chunking Reqs: {len(self.chunking_reqs)} reqs\n"
+      f"  New Token Ratio: {self.new_token_ratio:.3f}\n"
+      f"{'=' * 80}"
+    )
 
-    def _filter_batch(self, batch: ScheduledBatch):
-        """过滤掉已完成的请求，并同步更新相关元数据"""
-        if not batch.reqs:
-            return
+  def _print_batch_info(self, batch: ScheduledBatch, batch_type: str):
+    """打印要执行的 batch 详细信息"""
+    if batch is None:
+      return
 
-        original_len = len(batch.reqs)
+    logger.info(f"\n[Batch Info] Type: {batch_type}")
+    logger.info(f"  Forward Mode: {batch.forward_mode.name}")
+    logger.info(f"  Batch Size: {len(batch.reqs)}")
 
-        keep_indices = []
-        kept_reqs = []
-        for i, req in enumerate(batch.reqs):
-            if not req.finished:
-                keep_indices.append(i)
-                kept_reqs.append(req)
+    if batch.input_ids is not None:
+      logger.info(f"  Input IDs shape: {batch.input_ids.shape}")
 
-        batch.reqs = kept_reqs
+    # 打印每个请求的详细信息
+    logger.info(f"  Requests Details:")
+    for i, req in enumerate(batch.reqs):
+      input_len = len(req.origin_input_ids)
+      output_len = len(req.output_ids)
+      total_len = input_len + output_len
 
-        if len(keep_indices) == original_len:
-            return
+      req_info = (
+        f"    [{i}] req_id={req.req_id}, "
+        f"input_len={input_len}, output_len={output_len}, "
+        f"total_len={total_len}"
+      )
 
-        if len(keep_indices) > 0 and batch.req_pool_indices is not None:
-            keep_indices_tensor = torch.tensor(
-                keep_indices, device=batch.req_pool_indices.device
-            )
-            batch.req_pool_indices = batch.req_pool_indices[keep_indices_tensor]
-            batch.seq_lens = batch.seq_lens[keep_indices_tensor]
-            if batch.seq_lens_cpu is not None:
-                batch.seq_lens_cpu = batch.seq_lens_cpu[keep_indices]
-        elif len(keep_indices) == 0:
-            batch.req_pool_indices = None
-            batch.seq_lens = None
-            batch.seq_lens_cpu = None
+      # 如果是 chunked 请求，添加额外信息
+      if req.is_chunked:
+        req_info += f", chunked_prefill_len={req.chunked_prefill_len}"
 
-    # ======================== 前向 & 结果处理 ========================
+      # 如果有 extend_input_len，打印
+      if hasattr(req, "extend_input_len") and req.extend_input_len > 0:
+        req_info += f", extend_len={req.extend_input_len}"
 
-    def run_batch(self, batch: ScheduledBatch) -> Any:
-        forward_batch = ForwardBatch.init_new(batch)
-        out = self.modelrunner.forward(forward_batch)
-        logits_output = out.logits
-        next_token_ids = self.modelrunner.sample(logits_output, forward_batch)
+      logger.info(req_info)
 
-        return BatchResult(
-            logits=logits_output,
-            next_token_ids=next_token_ids,
-        )
+    # 如果是 MIXED batch，额外打印 decode 请求信息
+    if batch.decoding_reqs:
+      logger.info(f"  Decoding Requests: {len(batch.decoding_reqs)}")
 
-    def process_batch_result(
-        self, batch: ScheduledBatch, result: BatchResult
-    ) -> List[str]:
-        """处理批次推理结果"""
-        if batch is None or len(batch.reqs) == 0:
-            return []
+    # 打印 seq_lens 如果有的话
+    if batch.seq_lens is not None:
+      logger.info(
+        f"  Seq Lens: {batch.seq_lens.tolist() if batch.seq_lens.numel() <= 10 else f'[{batch.seq_lens.numel()} items]'}"
+      )
 
-        next_token_ids = result.next_token_ids
-        if isinstance(next_token_ids, torch.Tensor):
-            next_token_ids = next_token_ids.cpu().tolist()
+    logger.info(f"{'-' * 80}")
 
-        output_texts = []
-        finished_req_ids = []
-        for i, req in enumerate(batch.reqs):
-            token_id = next_token_ids[i]
-            req.output_ids.append(token_id)
+  # ======================== 监控 API ========================
 
-            delta_text, is_finished = self.incremental_decoder.decode(
-                req_id=req.req_id,
-                token_id=token_id,
-                eos_token_id=self.eos_token_id,
-            )
-            output_texts.append(delta_text)
+  def get_budget_stats(self) -> dict:
+    """获取当前 token 预算统计信息"""
+    running_bs = len(self.running_batch.reqs)
+    available = self.kv_cache_mgr.available_tokens()
+    return {
+      "max_extend_len": self.max_extend_len,
+      "running_bs": running_bs,
+      "waiting_queue_len": len(self.waiting_queue),
+      "chunking_reqs": len(self.chunking_reqs),
+      "available_kv_tokens": available,
+      "new_token_ratio": self.new_token_ratio,
+      "num_continuous_retract": self.num_continuous_retract,
+      "num_retracted_total": self.num_retracted_reqs,
+      "decode_waiting_ticks": self.decode_waiting_ticks,
+      "enable_chunked_prefill": self.enable_chunked_prefill,
+    }
 
-            if len(req.output_ids) >= req.max_tokens:
-                is_finished = True
-                remaining = self.incremental_decoder.flush(req.req_id)
-                if remaining:
-                    output_texts[-1] += remaining
-
-            if is_finished:
-                req.finished = True
-                if token_id == self.eos_token_id:
-                    req.finished_reason = "eos"
-                else:
-                    req.finished_reason = "max_tokens"
-                finished_req_ids.append(req.req_id)
-
-        self._handle_finished_requests(batch, finished_req_ids)
-        return output_texts
-
-    def _handle_finished_requests(
-        self, batch: ScheduledBatch, finished_req_ids: List[int]
-    ):
-        """处理已完成的请求：释放 KV cache，移入 finished 列表"""
-        if not finished_req_ids:
-            return
-
-        finished_req_id_set = set(finished_req_ids)
-        for req in batch.reqs:
-            if req.req_id in finished_req_id_set:
-                # 写回 radix cache（如果启用）
-                self.kv_cache_mgr.update_finished_req_radix_cache(req)
-                self.finished_reqs.append(req)
-
-    # ======================== 调试和监控 ========================
-
-    def _print_scheduler_info(self):
-        """打印当前调度器状态，包括空闲页数"""
-        free_pages = len(self.kv_cache_mgr.token_allocator.free_pages)
-        total_pages = self.kv_cache_mgr.token_allocator.num_pages
-        used_pages = total_pages - free_pages
-        available_tokens = self.kv_cache_mgr.available_tokens()
-
-        logger.info(
-            f"\n{'=' * 80}\n"
-            f"[Scheduler Round] KV Cache Status:\n"
-            f"  Free Pages: {free_pages}/{total_pages} "
-            f"(Used: {used_pages}, {used_pages/total_pages*100:.1f}%)\n"
-            f"  Available Tokens: {available_tokens}\n"
-            f"  Page Size: {self.page_size}\n"
-            f"  Waiting Queue: {len(self.waiting_queue)} reqs\n"
-            f"  Running Batch: {len(self.running_batch.reqs)} reqs\n"
-            f"  Chunking Reqs: {len(self.chunking_reqs)} reqs\n"
-            f"  New Token Ratio: {self.new_token_ratio:.3f}\n"
-            f"{'=' * 80}"
-        )
-
-    def _print_batch_info(self, batch: ScheduledBatch, batch_type: str):
-        """打印要执行的 batch 详细信息"""
-        if batch is None:
-            return
-
-        logger.info(f"\n[Batch Info] Type: {batch_type}")
-        logger.info(f"  Forward Mode: {batch.forward_mode.name}")
-        logger.info(f"  Batch Size: {len(batch.reqs)}")
-
-        if batch.input_ids is not None:
-            logger.info(f"  Input IDs shape: {batch.input_ids.shape}")
-
-        # 打印每个请求的详细信息
-        logger.info(f"  Requests Details:")
-        for i, req in enumerate(batch.reqs):
-            input_len = len(req.origin_input_ids)
-            output_len = len(req.output_ids)
-            total_len = input_len + output_len
-
-            req_info = (
-                f"    [{i}] req_id={req.req_id}, "
-                f"input_len={input_len}, output_len={output_len}, "
-                f"total_len={total_len}"
-            )
-
-            # 如果是 chunked 请求，添加额外信息
-            if req.is_chunked:
-                req_info += f", chunked_prefill_len={req.chunked_prefill_len}"
-
-            # 如果有 extend_input_len，打印
-            if hasattr(req, "extend_input_len") and req.extend_input_len > 0:
-                req_info += f", extend_len={req.extend_input_len}"
-
-            logger.info(req_info)
-
-        # 如果是 MIXED batch，额外打印 decode 请求信息
-        if batch.decoding_reqs:
-            logger.info(f"  Decoding Requests: {len(batch.decoding_reqs)}")
-
-        # 打印 seq_lens 如果有的话
-        if batch.seq_lens is not None:
-            logger.info(
-                f"  Seq Lens: {batch.seq_lens.tolist() if batch.seq_lens.numel() <= 10 else f'[{batch.seq_lens.numel()} items]'}"
-            )
-
-        logger.info(f"{'-' * 80}")
-
-    # ======================== 监控 API ========================
-
-    def get_budget_stats(self) -> dict:
-        """获取当前 token 预算统计信息"""
-        running_bs = len(self.running_batch.reqs)
-        available = self.kv_cache_mgr.available_tokens()
-        return {
-            "max_extend_len": self.max_extend_len,
-            "running_bs": running_bs,
-            "waiting_queue_len": len(self.waiting_queue),
-            "chunking_reqs": len(self.chunking_reqs),
-            "available_kv_tokens": available,
-            "new_token_ratio": self.new_token_ratio,
-            "num_continuous_retract": self.num_continuous_retract,
-            "num_retracted_total": self.num_retracted_reqs,
-            "decode_waiting_ticks": self.decode_waiting_ticks,
-            "enable_chunked_prefill": self.enable_chunked_prefill,
-        }
-
-    def get_request_output(self, req_id: int) -> Optional[str]:
-        """获取指定请求的完整输出文本"""
-        return self.incremental_decoder.get_full_text(req_id)
+  def get_request_output(self, req_id: int) -> Optional[str]:
+    """获取指定请求的完整输出文本"""
+    return self.incremental_decoder.get_full_text(req_id)
