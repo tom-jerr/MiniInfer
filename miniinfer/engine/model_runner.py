@@ -24,11 +24,13 @@ from miniinfer.layers.attention_backend.flashattention_backend import (
     FlashAttention2Backend,
 )
 from miniinfer.engine.cuda_graph_runner import CudaGraphRunner
+from miniinfer.utils.profiler_utils import profile_methods
 import logging
 
 logger = logging.getLogger(__name__)
 
 
+@profile_methods("ModelRunner")
 class ModelRunner:
     """
     单机版模型执行器

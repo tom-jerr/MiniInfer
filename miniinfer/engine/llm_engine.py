@@ -31,6 +31,7 @@ import zmq
 
 from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 from miniinfer.config.engine.config import EngineConfig
+from miniinfer.utils.profiler_utils import profile_methods, stage
 from .model_runner import ModelRunner
 from miniinfer.scheduler.scheduler import Scheduler
 from miniinfer.scheduler.scheduler_batch import (
@@ -78,6 +79,7 @@ class StepOutput:
         return len(self.outputs) > 0
 
 
+@profile_methods("LLMEngine")
 class LLMEngine:
     """
     LLM 推理引擎
@@ -187,11 +189,12 @@ class LLMEngine:
                 messages.append({"role": "system", "content": self.system_prompt})
             messages.append({"role": "user", "content": prompt})
             try:
-                encoded = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                )
+                with stage("stage::Tokenizer.apply_chat_template"):
+                    encoded = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                    )
                 if isinstance(encoded, torch.Tensor):
                     return encoded.tolist()
                 if isinstance(encoded, dict) and "input_ids" in encoded:
@@ -205,7 +208,8 @@ class LLMEngine:
                     "apply_chat_template failed (%s); falling back to tokenizer.encode",
                     e,
                 )
-        return self.tokenizer.encode(prompt)
+        with stage("stage::Tokenizer.encode"):
+            return self.tokenizer.encode(prompt)
 
     # ======== calculate max total tokens =========
     def _estimate_model_weight_memory(self) -> int:
@@ -432,52 +436,59 @@ class LLMEngine:
 
         # 步骤 1: 先创建 ModelRunner 并加载模型（不传入 kv_cache_mgr）
         logger.info("Step 1: Loading model...")
-        self.model_runner = ModelRunner(
-            self.config, kv_cache_mgr=None, rank=0, events=self.events
-        )
+        with stage("stage::LLMEngine.init.model_runner"):
+            self.model_runner = ModelRunner(
+                self.config, kv_cache_mgr=None, rank=0, events=self.events
+            )
 
         # 步骤 2: 模型加载完成后，基于实际已分配显存计算 max_total_tokens
         logger.info(
             "Step 2: Calculating max_total_tokens based on actual GPU memory usage..."
         )
-        self.max_total_tokens = self._calc_max_total_tokens()
+        with stage("stage::LLMEngine.init.calc_max_total_tokens"):
+            self.max_total_tokens = self._calc_max_total_tokens()
 
         # 步骤 3: 初始化 KV Cache 管理器
         logger.info("Step 3: Initializing KV Cache Manager...")
-        self.kv_cache_mgr = KVCacheManager(
-            size=self.max_total_tokens,
-            max_requests=config.max_num_seqs,
-            max_context_len=config.max_context_len,
-            num_layers=config.hf_config.num_hidden_layers,
-            num_heads=config.hf_config.num_key_value_heads,  # 使用 KV head 数量，支持 GQA
-            head_dim=config.hf_config.hidden_size
-            // config.hf_config.num_attention_heads,
-            dtype=config.dtype,
-            device="cuda",
-            enable_prefix_cache=config.enable_prefix_cache,
-            page_size=config.page_size,
-            max_extend_tokens=config.max_extend_len,
-        )
+        with stage("stage::LLMEngine.init.kv_cache_mgr"):
+            self.kv_cache_mgr = KVCacheManager(
+                size=self.max_total_tokens,
+                max_requests=config.max_num_seqs,
+                max_context_len=config.max_context_len,
+                num_layers=config.hf_config.num_hidden_layers,
+                num_heads=config.hf_config.num_key_value_heads,  # 使用 KV head 数量，支持 GQA
+                head_dim=config.hf_config.hidden_size
+                // config.hf_config.num_attention_heads,
+                dtype=config.dtype,
+                device="cuda",
+                enable_prefix_cache=config.enable_prefix_cache,
+                page_size=config.page_size,
+                max_extend_tokens=config.max_extend_len,
+            )
 
         # 步骤 4: 设置 ModelRunner 的 kv_cache_mgr 并初始化 attn_backend
         logger.info("Step 4: Initializing attention backend...")
-        self.model_runner.set_kv_cache_mgr(self.kv_cache_mgr)
+        with stage("stage::LLMEngine.init.set_kv_cache_mgr"):
+            self.model_runner.set_kv_cache_mgr(self.kv_cache_mgr)
 
         # Tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model,
-            use_fast=True,
-            trust_remote_code=True,
-        )
+        with stage("stage::Tokenizer.from_pretrained"):
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model,
+                use_fast=True,
+                trust_remote_code=True,
+            )
         # Stream detokenizer
-        self.detokenizer = IncrementalDecoder(
-            tokenizer=self.tokenizer,
-            skip_special_tokens=True,
-        )
+        with stage("stage::LLMEngine.init.detokenizer"):
+            self.detokenizer = IncrementalDecoder(
+                tokenizer=self.tokenizer,
+                skip_special_tokens=True,
+            )
         self.config.eos = self.tokenizer.eos_token_id
 
         # Scheduler (传入 tokenizer 和 model_runner)
-        self.scheduler = Scheduler(self.config, self.tokenizer, self.kv_cache_mgr)
+        with stage("stage::LLMEngine.init.scheduler"):
+            self.scheduler = Scheduler(self.config, self.tokenizer, self.kv_cache_mgr)
 
         # 步骤 5: 初始化 CUDA Graph (如果未禁用)
         if not self.config.enforce_eager:
@@ -485,10 +496,11 @@ class LLMEngine:
             cuda_graph_max_bs = self.config.cuda_graph_max_bs
             if cuda_graph_max_bs <= 0:
                 cuda_graph_max_bs = self.config.max_num_seqs
-            self.model_runner.init_cuda_graph(
-                max_batch_size=cuda_graph_max_bs,
-                max_context_len=self.config.max_context_len,
-            )
+            with stage("stage::LLMEngine.init.cuda_graph"):
+                self.model_runner.init_cuda_graph(
+                    max_batch_size=cuda_graph_max_bs,
+                    max_context_len=self.config.max_context_len,
+                )
         else:
             logger.info("Step 5: CUDA Graph disabled (enforce_eager=True)")
 
@@ -578,22 +590,27 @@ class LLMEngine:
 
         # 单进程模式
         # 1. 调度获取 batch
-        batch = self.scheduler.schedule(self.model_runner.device)
+        with stage("stage::LLMEngine.step.schedule"):
+            batch = self.scheduler.schedule(self.model_runner.device)
         if batch is None or len(batch.reqs) == 0:
             return StepOutput(outputs=[])
 
         # 2. 执行 forward
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
-        output = self.model_runner.forward(forward_batch)
-        logits = output.logits
+        with stage("stage::LLMEngine.step.forward_batch_init"):
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+        with stage("stage::LLMEngine.step.forward"):
+            output = self.model_runner.forward(forward_batch)
+            logits = output.logits
         # if self.debug_logit_topk > 0:
         # self._debug_print_topk_next_tokens(logits, forward_batch)
         # 3. 采样
-        next_tokens = self.model_runner.sample(logits, forward_batch)
+        with stage("stage::LLMEngine.step.sample"):
+            next_tokens = self.model_runner.sample(logits, forward_batch)
 
         # 4. 处理结果并增量解码
-        result = BatchResult(logits=logits, next_token_ids=next_tokens)
-        outputs = self._process_step_result(batch, result)
+        with stage("stage::LLMEngine.step.process_result"):
+            result = BatchResult(logits=logits, next_token_ids=next_tokens)
+            outputs = self._process_step_result(batch, result)
 
         # 5. 统计 token 数
         num_prefill = 0
@@ -811,34 +828,63 @@ class LLMEngine:
         if not self._started:
             self.start()
 
+        # 归一化输入
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        elif (
+            isinstance(prompts, list)
+            and len(prompts) > 0
+            and isinstance(prompts[0], int)
+        ):
+            prompts = [prompts]
+
         if sampling_params is None:
             sampling_params = SamplingParams()
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
 
-        pbar = None
-        if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True) if use_tqdm else None
+
+        # 添加所有请求
+        for prompt, param in zip(prompts, sampling_params):
+            self.add_request(prompt, param)
 
         # 收集结果
         results: Dict[int, Dict[str, Any]] = {}
         request_ids = []
-
         prefill_throughput = decode_throughput = 0.0
 
-        # 使用流式生成收集结果
-        for output in self.stream_generate(prompts, sampling_params):
-            if output.request_id not in results:
-                results[output.request_id] = {
-                    "text": "",
-                    "token_ids": [],
-                    "request_id": output.request_id,
-                }
-                request_ids.append(output.request_id)
+        while not self.is_finished():
+            t = perf_counter()
+            step_output = self.step()
+            step_time = max(perf_counter() - t, 1e-9)
 
-            results[output.request_id]["text"] += output.delta_text
-            results[output.request_id]["token_ids"] = output.output_token_ids
+            if pbar:
+                if step_output.num_prefill_tokens > 0:
+                    prefill_throughput = step_output.num_prefill_tokens / step_time
+                if step_output.num_decode_tokens > 0:
+                    decode_throughput = step_output.num_decode_tokens / step_time
+                pbar.set_postfix(
+                    {
+                        "Prefill": f"{int(prefill_throughput)}tok/s",
+                        "Decode": f"{int(decode_throughput)}tok/s",
+                    }
+                )
 
-            if output.finished and pbar:
-                pbar.update(1)
+            for output in step_output.outputs:
+                if output.request_id not in results:
+                    results[output.request_id] = {
+                        "text": "",
+                        "token_ids": [],
+                        "request_id": output.request_id,
+                    }
+                    request_ids.append(output.request_id)
+
+                results[output.request_id]["text"] += output.delta_text
+                results[output.request_id]["token_ids"] = output.output_token_ids
+
+                if output.finished and pbar:
+                    pbar.update(1)
 
         if pbar:
             pbar.close()

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from miniinfer.utils.profiler_utils import profile_methods
 
 if TYPE_CHECKING:
     from miniinfer.models.fused_qwen2 import Qwen2ForCausalLM
@@ -56,6 +57,7 @@ class CapturedGraph:
     graph_batch: Any = None
 
 
+@profile_methods("CudaGraphRunner")
 class CudaGraphRunner:
     """
     Manages CUDA graph capture and replay for decode phase.

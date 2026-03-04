@@ -30,6 +30,7 @@ import torch
 
 from miniinfer.config.engine.config import EngineConfig
 from miniinfer.kvcache.kv_cache_manager import KVCacheManager
+from miniinfer.utils.profiler_utils import profile_methods
 from miniinfer.scheduler.prefill_adder import PrefillAdder, AddReqResult
 from miniinfer.scheduler.scheduler_batch import (
     Req,
@@ -58,6 +59,7 @@ _MIN_DECODE_PAGES = 2
 _DECODE_STARVATION_TICKS = 3
 
 
+@profile_methods("Scheduler")
 class Scheduler:
     """
     调度器 - 防 decode 饿死 + 防 OOM

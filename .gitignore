@@ -14,3 +14,4 @@ output
 *.txt
 output/
 *.ncu-rep
+.vscode
