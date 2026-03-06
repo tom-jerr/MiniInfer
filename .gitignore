@@ -14,5 +14,6 @@ output
 *.txt
 output/
 *.ncu-rep
+*.nsys-rep
 .vscode
 *.json
