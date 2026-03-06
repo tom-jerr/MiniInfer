@@ -315,7 +315,14 @@ class CudaGraphRunner:
     captured = self.graphs[padded_bs]
 
     # Build block table for the actual batch
-    max_seq_len_k = int(forward_batch.seq_lens.max().item())
+    # Use precomputed max_seq_len from CPU to avoid GPU sync
+    max_seq_len_k = forward_batch.max_seq_len
+    if max_seq_len_k is None:
+      # Fallback: compute from CPU tensor if available, else GPU tensor
+      if forward_batch.seq_lens_cpu is not None:
+        max_seq_len_k = int(forward_batch.seq_lens_cpu.max().item())
+      else:
+        max_seq_len_k = int(forward_batch.seq_lens.max().item())
     actual_block_table = self.kv_cache_mgr.get_page_table(forward_batch, max_seq_len_k)
     # Convert to block indices
     actual_blocks = (actual_block_table[:, :: self.page_size].contiguous() // self.page_size).to(
@@ -325,7 +332,13 @@ class CudaGraphRunner:
     # Copy actual data into static buffers
     captured.input_ids[:actual_bs].copy_(forward_batch.input_ids)
     captured.positions[:actual_bs].copy_(forward_batch.positions)
-    captured.cache_seqlens[:actual_bs].copy_(forward_batch.seq_lens.to(torch.int32))
+    # Use precomputed int32 version if available
+    seq_lens_int32 = (
+      forward_batch.seq_lens_int32
+      if forward_batch.seq_lens_int32 is not None
+      else forward_batch.seq_lens.to(torch.int32)
+    )
+    captured.cache_seqlens[:actual_bs].copy_(seq_lens_int32)
     captured.seq_lens_int64[:actual_bs].copy_(forward_batch.seq_lens)
     captured.out_cache_loc[:actual_bs].copy_(forward_batch.out_cache_loc)
     captured.req_pool_indices[:actual_bs].copy_(forward_batch.req_pool_indices)
@@ -346,10 +359,10 @@ class CudaGraphRunner:
       captured.block_table[actual_bs:padded_bs] = captured.block_table[0]
 
     # Update metadata for attention backend with actual max_seq_len_k
-    # This is a cheap operation that just updates tensor values
+    # Use the precomputed max_seq_len_k to avoid GPU sync
     self.attn_backend.update_cuda_graph_metadata(
       cache_seqlens=captured.cache_seqlens,
-      max_seq_len_k=int(captured.cache_seqlens[:padded_bs].max().item()),
+      max_seq_len_k=max_seq_len_k,
     )
 
     # Replay the captured graph

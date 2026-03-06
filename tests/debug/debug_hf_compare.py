@@ -29,7 +29,7 @@ def compare_weights(model_path: str, device: str = "cuda"):
   # Load HuggingFace model
   hf_model = AutoModelForCausalLM.from_pretrained(
     model_path,
-    torch_dtype=torch.float16,
+    dtype=torch.float16,
     trust_remote_code=True,
   ).to(device)
   hf_model.eval()

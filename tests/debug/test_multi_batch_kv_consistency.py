@@ -983,7 +983,7 @@ def main():
 
     hf_model = AutoModelForCausalLM.from_pretrained(
       args.model,
-      torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+      dtype=torch.float16 if device == "cuda" else torch.float32,
       trust_remote_code=True,
     ).to(device)
     hf_model.eval()

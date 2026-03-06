@@ -221,12 +221,24 @@ class ForwardBatch:
   attn_backend: AttentionBackend = None
   # sequences that participate in this forward step (for sampling metadata)
   all_seqs: List[Req] = None
+
+  # ============ sampling related ============
+  # Optional pre-built tensors to avoid rebuilding per-step sampling params in ModelRunner.
+  sampling_temperatures: Optional[torch.Tensor] = None
+  sampling_top_ps: Optional[torch.Tensor] = None
+  sampling_top_ks: Optional[torch.Tensor] = None
+  # CPU-side metadata to avoid GPU->CPU sync in sampling.
+  sampling_max_top_k: Optional[int] = None
   # ============ some metadata for k ============
   seq_lens: torch.Tensor = None
+  # Pre-converted int32 version to avoid GPU dtype conversion overhead
+  seq_lens_int32: Optional[torch.Tensor] = None
 
   # =========== TODO: Maybe remove ===========
   seq_lens_sum: int = 0
   seq_lens_cpu: Optional[torch.Tensor] = None
+  # Max sequence length (computed on CPU to avoid GPU sync)
+  max_seq_len: Optional[int] = None
 
   # ============ some metadata for q
   # extend_num_tokens: Optional[int] = None
@@ -237,7 +249,15 @@ class ForwardBatch:
   extend_seq_lens_cpu: Optional[List[int]] = None
 
   @classmethod
-  def init_new(cls, batch: ScheduledBatch, attn_backend: AttentionBackend):
+  def init_new(cls, batch: ScheduledBatch, attn_backend: Optional[AttentionBackend] = None):
+    # Compute max_seq_len from CPU tensor to avoid GPU sync
+    max_seq_len = None
+    if batch.seq_lens_cpu is not None:
+      max_seq_len = int(batch.seq_lens_cpu.max().item())
+
+    # Pre-convert seq_lens to int32 to avoid repeated conversions in FA backends
+    seq_lens_int32 = batch.seq_lens.to(torch.int32) if batch.seq_lens is not None else None
+
     forward_batch = cls(
       forward_mode=batch.forward_mode,
       batch_size=len(batch.reqs),
@@ -245,22 +265,56 @@ class ForwardBatch:
       req_pool_indices=batch.req_pool_indices,
       out_cache_loc=batch.out_cache_loc,
       seq_lens=batch.seq_lens,
+      seq_lens_int32=seq_lens_int32,
       seq_lens_cpu=batch.seq_lens_cpu,
+      max_seq_len=max_seq_len,
       attn_backend=attn_backend,
       all_seqs=batch.reqs,
     )
 
+    # Pre-build per-sequence sampling params on the target device.
+    # This avoids repeatedly converting Python lists to tensors inside ModelRunner.sample().
+    if batch.reqs:
+      dev = batch.device if batch.device is not None else batch.input_ids.device
+      # Compute max_top_k on CPU to avoid `.item()` sync in batched top-k.
+      # Ensure it's always >= 1 so top-k path can safely run even when empty.
+      forward_batch.sampling_max_top_k = max(
+        1, max((int(r.sampling_params.top_k) for r in batch.reqs), default=0)
+      )
+      forward_batch.sampling_temperatures = torch.tensor(
+        [r.sampling_params.temperature for r in batch.reqs],
+        device=dev,
+        dtype=torch.float32,
+      )
+      forward_batch.sampling_top_ps = torch.tensor(
+        [r.sampling_params.top_p for r in batch.reqs],
+        device=dev,
+        dtype=torch.float32,
+      )
+      forward_batch.sampling_top_ks = torch.tensor(
+        [r.sampling_params.top_k for r in batch.reqs],
+        device=dev,
+        dtype=torch.int64,
+      )
+
     if batch.forward_mode.is_extend():
       # forward_batch.extend_num_tokens = batch.input_ids.shape[0]
-      forward_batch.extend_seq_lens = batch.extend_lens
-      forward_batch.extend_prefix_lens = torch.tensor(batch.prefix_lens, dtype=torch.int64).to(
-        batch.device
+      extend_lens_cpu = batch.extend_lens or []
+      total_extend_tokens = int(sum(extend_lens_cpu)) if extend_lens_cpu else 0
+
+      forward_batch.extend_seq_lens = torch.tensor(
+        extend_lens_cpu, dtype=torch.int64, device=batch.device
+      )
+      forward_batch.extend_prefix_lens = torch.tensor(
+        batch.prefix_lens or [], dtype=torch.int64, device=batch.device
       )
       forward_batch.extend_prefix_lens_cpu = batch.prefix_lens
-      forward_batch.extend_seq_lens_cpu = batch.extend_lens
+      forward_batch.extend_seq_lens_cpu = extend_lens_cpu
       # positions and start loc for extend
-      forward_batch.positions = compute_position_torch(
-        forward_batch.extend_prefix_lens, forward_batch.extend_seq_lens
+      forward_batch.positions = compute_positions_extend(
+        extend_prefix_lens=forward_batch.extend_prefix_lens,
+        extend_seq_lens=forward_batch.extend_seq_lens,
+        total_tokens=total_extend_tokens,
       )
     else:
       forward_batch.positions = clamp_position(batch.seq_lens)
@@ -270,7 +324,7 @@ class ForwardBatch:
   def debug_metadata(self):
     print("ForwardBatch metadata:")
     print(f"  forward_mode: {self.forward_mode}")
-    print(f"  attn_backend type: {self.attn_backend.type()}")
+    print(f"  attn_backend type: {self.attn_backend.type() if self.attn_backend else None}")
     print(f"  batch_size: {self.batch_size}")
     print(f"  input_ids: {self.input_ids}")
     print(f"  req_pool_indices: {self.req_pool_indices}")
@@ -297,6 +351,29 @@ def compute_position_torch(extend_prefix_lens: torch.Tensor, extend_seq_lens: to
   # extend_start_loc = torch.zeros_like(extend_seq_lens)
   # extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
   return positions.to(torch.int64)
+
+
+def compute_positions_extend(
+  extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, total_tokens: int
+) -> torch.Tensor:
+  """
+  Vectorized position builder for EXTEND/MIXED forward.
+
+  For each sequence i:
+    positions_i = [prefix_len_i, prefix_len_i+1, ..., prefix_len_i+extend_len_i-1]
+  Then concatenate across sequences.
+  """
+  if total_tokens <= 0:
+    return torch.empty((0,), dtype=torch.int64, device=extend_prefix_lens.device)
+
+  # Exclusive start offsets in the concatenated extend token array.
+  start_offsets = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens  # [bs]
+
+  prefix_rep = torch.repeat_interleave(extend_prefix_lens, extend_seq_lens)  # [total]
+  start_rep = torch.repeat_interleave(start_offsets, extend_seq_lens)  # [total]
+  token_idx = torch.arange(total_tokens, device=extend_prefix_lens.device, dtype=torch.int64)
+  within = token_idx - start_rep
+  return (prefix_rep + within).to(torch.int64)
 
 
 # Temporarily disable torch.compile to debug batch issues

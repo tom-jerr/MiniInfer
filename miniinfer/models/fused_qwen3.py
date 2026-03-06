@@ -1,3 +1,12 @@
+"""
+Qwen3 模型实现（融合 QKV/Gate-Up 投影）
+
+与 Qwen2 的主要区别:
+1. QKV 投影无 bias (attention_bias=False)
+2. head_dim 独立配置（Qwen3-0.6B: head_dim=128, 而 hidden_size/num_heads=64）
+3. QK-Norm: 在 RoPE 之前对 Q/K 进行 per-head RMSNorm
+"""
+
 from typing import Any, Dict, Optional
 
 from miniinfer.scheduler.scheduler_batch import ForwardBatch
@@ -18,65 +27,69 @@ from miniinfer.layers import (
   get_attention,
   linear,
 )
-from miniinfer.config.model.qwen2 import Qwen2Config
+from miniinfer.config.model.qwen3 import Qwen3Config
 from miniinfer.loader.weight import WeightLoaderMixin
 
 
-class Qwen2Attention(nn.Module, WeightLoaderMixin):
+class Qwen3Attention(nn.Module, WeightLoaderMixin):
   def __init__(
     self,
     hidden_size: int,
     num_heads: int,
     num_kv_heads: int,
-    head_dim: Optional[int] = None,
+    head_dim: int,
     layer_id: int = 0,
-    rope_theta: float = 1000000,
-    max_position_embeddings: int = 32768,
+    rope_theta: float = 1000000.0,
+    max_position_embeddings: int = 40960,
+    rms_norm_eps: float = 1e-6,
   ):
     super().__init__()
     self.hidden_size = hidden_size
     self.num_heads = num_heads
     self.num_kv_heads = num_kv_heads
-    self.head_dim = head_dim if head_dim is not None else hidden_size // num_heads
+    self.head_dim = head_dim
     self.num_key_value_groups = num_heads // num_kv_heads
-    self.scaling = self.head_dim**-0.5
-    self.q_size = self.num_heads * self.head_dim
-    self.kv_size = self.num_kv_heads * self.head_dim
-    self.rope_theta = rope_theta
-    self.max_position_embeddings = max_position_embeddings
+    self.scaling = head_dim**-0.5
+    self.q_size = num_heads * head_dim
+    self.kv_size = num_kv_heads * head_dim
 
-    # 融合的 QKV 投影
-    total_qkv_heads = self.num_heads + 2 * self.num_kv_heads
-    self.qkv_proj = nn.Linear(self.hidden_size, total_qkv_heads * self.head_dim, bias=True)
+    # 融合的 QKV 投影（无 bias，Qwen3 的 attention_bias=False）
+    total_qkv_heads = num_heads + 2 * num_kv_heads
+    self.qkv_proj = nn.Linear(hidden_size, total_qkv_heads * head_dim, bias=False)
+    self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
 
-    self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+    # QK-Norm: per-head RMSNorm，应用在 RoPE 之前
+    self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+    self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
     self.rope = RotaryEmbedding(
-      head_size=self.head_dim,
-      rotary_dim=self.head_dim,
-      max_position_embeddings=self.max_position_embeddings,
-      base=self.rope_theta,
+      head_size=head_dim,
+      rotary_dim=head_dim,
+      max_position_embeddings=max_position_embeddings,
+      base=rope_theta,
       is_neox_style=True,
       dtype=torch.float16,
     )
 
     self.attn = AttentionImpl(
-      self.num_heads,
-      self.head_dim,
+      num_heads,
+      head_dim,
       self.scaling,
-      num_kv_heads=self.num_kv_heads,
+      num_kv_heads=num_kv_heads,
       layer_id=layer_id,
     )
 
   def load_weights(self, state_dict: Dict[str, torch.Tensor], prefix: str, device, dtype):
     qkv_w_key = f"{prefix}.qkv_proj.weight"
-    qkv_b_key = f"{prefix}.qkv_proj.bias"
     o_w_key = f"{prefix}.o_proj.weight"
 
     with torch.no_grad():
       self.qkv_proj.weight.copy_(self._to_device(state_dict[qkv_w_key], device, dtype))
-      self.qkv_proj.bias.copy_(self._to_device(state_dict[qkv_b_key], device, dtype))
       self.o_proj.weight.copy_(self._to_device(state_dict[o_w_key], device, dtype))
+
+    # QK-Norm 权重
+    self.q_norm.load_weights(state_dict, f"{prefix}.q_norm", device, dtype)
+    self.k_norm.load_weights(state_dict, f"{prefix}.k_norm", device, dtype)
 
   def forward(
     self,
@@ -86,13 +99,21 @@ class Qwen2Attention(nn.Module, WeightLoaderMixin):
   ) -> torch.Tensor:
     qkv = self.qkv_proj(hidden_states)
     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+    # QK-Norm: reshape 到 per-head 后做 RMSNorm，再 reshape 回来
+    # split 后的 tensor 可能不连续，用 reshape 代替 view
+    # q: [T, num_heads * head_dim] → [T * num_heads, head_dim] → norm → [T, num_heads * head_dim]
+    T = q.shape[0]
+    q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(T, -1)
+    k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(T, -1)
+
     q, k = self.rope(positions, q, k)
     attn_output = self.attn(q, k, v, forward_batch)
     output = self.o_proj(attn_output)
     return output
 
 
-class Qwen2MLP(nn.Module, WeightLoaderMixin):
+class Qwen3MLP(nn.Module, WeightLoaderMixin):
   def __init__(
     self,
     hidden_size: int,
@@ -103,10 +124,8 @@ class Qwen2MLP(nn.Module, WeightLoaderMixin):
     # 融合的 Gate+Up 投影
     self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
     self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-    # TODO(lzy): only support silu for now
     if hidden_act != "silu":
-      raise ValueError(f"Unsupported activation: {hidden_act}. " "Only silu is supported for now.")
-    # SiluAndMul is a function, not a class
+      raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
     self.act_fn = SiluAndMul
 
   def load_weights(self, state_dict: Dict[str, torch.Tensor], prefix: str, device, dtype):
@@ -118,35 +137,31 @@ class Qwen2MLP(nn.Module, WeightLoaderMixin):
       self.down_proj.weight.copy_(self._to_device(state_dict[down_w_key], device, dtype))
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    # 融合投影 + 拆分
     gate_up = self.gate_up_proj(x)
     output = self.act_fn(gate_up)
     down = self.down_proj(output)
     return down
 
 
-class Qwen2TransformerBlock(nn.Module, WeightLoaderMixin):
+class Qwen3TransformerBlock(nn.Module, WeightLoaderMixin):
   def __init__(
     self,
-    config: Qwen2Config,
+    config: Qwen3Config,
     layer_id: int = 0,
   ):
     super().__init__()
     self.hidden_size = config.hidden_size
-    rope_theta = getattr(config, "rope_theta", 1000000)
-    rope_scaling = getattr(config, "rope_scaling", None)
-    max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
-    head_dim = getattr(config, "head_dim", None)
-    self.self_attn = Qwen2Attention(
+    self.self_attn = Qwen3Attention(
       hidden_size=config.hidden_size,
       num_heads=config.num_attention_heads,
       num_kv_heads=config.num_key_value_heads,
-      head_dim=head_dim,
+      head_dim=config.head_dim,
       layer_id=layer_id,
-      rope_theta=rope_theta,
-      max_position_embeddings=max_position_embeddings,
+      rope_theta=config.rope_theta,
+      max_position_embeddings=config.max_position_embeddings,
+      rms_norm_eps=config.rms_norm_eps,
     )
-    self.mlp = Qwen2MLP(
+    self.mlp = Qwen3MLP(
       hidden_size=config.hidden_size,
       intermediate_size=config.intermediate_size,
       hidden_act=config.hidden_act,
@@ -168,7 +183,7 @@ class Qwen2TransformerBlock(nn.Module, WeightLoaderMixin):
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
     residual: Optional[torch.Tensor],
-  ) -> torch.Tensor:
+  ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if residual is None:
       residual = hidden_states
       hidden_states = self.input_layernorm(hidden_states)
@@ -186,10 +201,10 @@ class Qwen2TransformerBlock(nn.Module, WeightLoaderMixin):
     return hidden_states, residual
 
 
-class Qwen2Model(nn.Module, WeightLoaderMixin):
+class Qwen3Model(nn.Module, WeightLoaderMixin):
   def __init__(
     self,
-    config: Qwen2Config,
+    config: Qwen3Config,
     device: torch.device,
     precision: torch.dtype = torch.float16,
   ):
@@ -205,22 +220,10 @@ class Qwen2Model(nn.Module, WeightLoaderMixin):
 
     self.layers = nn.ModuleList()
     for layer_id in range(config.num_hidden_layers):
-      layer = Qwen2TransformerBlock(config=config, layer_id=layer_id).to(device).to(precision)
+      layer = Qwen3TransformerBlock(config=config, layer_id=layer_id).to(device).to(precision)
       self.layers.append(layer)
 
     self.norm = RMSNorm(dim=config.hidden_size, eps=config.rms_norm_eps).to(device)
-
-  @classmethod
-  def from_state_dict(
-    cls,
-    config: Qwen2Config,
-    state_dict: Dict[str, torch.Tensor],
-    device: torch.device,
-    precision: torch.dtype = torch.float16,
-  ) -> "Qwen2Model":
-    model = cls(config=config, device=device, precision=precision)
-    model.load_weights(state_dict)
-    return model
 
   def load_weights(self, state_dict: Dict[str, torch.Tensor]) -> None:
     device, dtype = self.device, self.precision
@@ -247,7 +250,6 @@ class Qwen2Model(nn.Module, WeightLoaderMixin):
     residual = None
     for layer in self.layers:
       if return_hidden_states:
-        # Post-residual layer output: x2 = residual (x1) + mlp_out
         all_hidden_states.append(hidden_states if residual is None else hidden_states + residual)
       hidden_states, residual = layer(
         positions=positions,
@@ -262,16 +264,15 @@ class Qwen2Model(nn.Module, WeightLoaderMixin):
       hidden_states = self.norm(hidden_states)
 
     if return_hidden_states:
-      # attention: do not contain the last layer hidden_states
       return hidden_states, all_hidden_states
 
     return hidden_states
 
 
-class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
+class Qwen3ForCausalLM(nn.Module, WeightLoaderMixin):
   def __init__(
     self,
-    config: Qwen2Config,
+    config: Qwen3Config,
     device: torch.device,
     precision: torch.dtype = torch.float16,
   ):
@@ -280,7 +281,7 @@ class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
     self.config = config
     self.device = device
 
-    self.qwen2 = Qwen2Model(
+    self.qwen3 = Qwen3Model(
       config=config,
       device=device,
       precision=precision,
@@ -288,25 +289,13 @@ class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
 
     self.lm_head = LMHead(vocab_size=config.vocab_size, embedding_dim=config.hidden_size).to(device)
 
-  @classmethod
-  def from_state_dict(
-    cls,
-    config: Qwen2Config,
-    state_dict: Dict[str, torch.Tensor],
-    device: torch.device,
-    precision: torch.dtype = torch.float16,
-  ) -> "Qwen2ForCausalLM":
-    model = cls(config=config, device=device, precision=precision)
-    model.load_weights(state_dict)
-    return model
-
   def load_weights(self, state_dict: Dict[str, torch.Tensor]) -> None:
     device, dtype = self.device, self.precision
 
-    self.qwen2.load_weights(state_dict)
+    self.qwen3.load_weights(state_dict)
 
-    # HF causal-LM checkpoints usually store the output head as `lm_head.weight`
-    # at the root, not under `model.`. We try that first for correctness.
+    # Qwen3-0.6B 使用 tie_word_embeddings=True，lm_head 与 embed_tokens 共享权重
+    # 但 HF 仍会导出 lm_head.weight，优先使用它
     self.lm_head.load_weights(state_dict, "lm_head", device, dtype)
 
   @torch.no_grad()
@@ -317,7 +306,7 @@ class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
     forward_batch: ForwardBatch,
     return_hidden_states: bool = False,
   ) -> BaseModelOutput:
-    qwen_out = self.qwen2(
+    qwen_out = self.qwen3(
       input_ids=input_ids,
       positions=positions,
       forward_batch=forward_batch,
@@ -330,28 +319,25 @@ class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
       hidden_states = qwen_out
       all_hidden_states = None
 
-    # Memory optimization:
-    # In EXTEND/MIXED mode, `hidden_states` typically contains all tokens in the flattened prefill chunk,
-    # which can be thousands of tokens. Projecting all of them to vocab with lm_head materializes a huge
-    # [total_tokens, vocab_size] tensor and can easily OOM on mid-size GPUs.
-    #
-    # For generation/sampling we only need the logits of the *last token* of each sequence.
+    # EXTEND 模式下只取每个序列最后一个 token 的 hidden state 做 lm_head，节省显存
     hidden_states_for_logits = hidden_states
     if forward_batch.forward_mode.is_extend():
       extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None) or []
       if extend_lens:
         if hidden_states.dim() == 2:
-          # hidden_states: [total_tokens, hidden]
           last_token_indices = []
           cumsum = 0
           for length in extend_lens:
             last_token_indices.append(cumsum + int(length) - 1)
             cumsum += int(length)
           hidden_states_for_logits = hidden_states[
-            torch.tensor(last_token_indices, device=hidden_states.device, dtype=torch.int64)
+            torch.tensor(
+              last_token_indices,
+              device=hidden_states.device,
+              dtype=torch.int64,
+            )
           ]
         elif hidden_states.dim() == 3:
-          # hidden_states: [batch, seq, hidden]
           bsz = hidden_states.size(0)
           idx = torch.tensor(
             [int(l) - 1 for l in extend_lens[:bsz]],

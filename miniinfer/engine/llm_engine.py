@@ -1,38 +1,35 @@
 """
 LLMEngine - 对外暴露的统一接口
 
-两种运行模式:
-1. 单进程模式 (Simple): 所有组件在同一进程内运行
-2. 多进程模式 (Distributed): Tokenizer/Scheduler/Detokenizer 分别在独立进程
+运行模式:
+1. 单进程模式 (默认): 所有组件在同一进程内运行
+2. 多进程模式: 预留接口（当前未实现）
 
 Usage:
     # 单进程模式 (默认)
     engine = LLMEngine(model_path="...")
     outputs = engine.generate(prompts, sampling_params)
 
-    # 多进程模式
-    engine = LLMEngine(model_path="...", use_multiprocess=True)
-    engine.start()
-    outputs = engine.generate(prompts, sampling_params)
-    engine.stop()
+    # 多进程模式 (当前未实现，会抛 NotImplementedError)
+    # engine = LLMEngine(model_path="...", use_multiprocess=True)
 """
 
 import atexit
 import logging
-import uuid
 from dataclasses import dataclass, field, fields
 from time import perf_counter
-from typing import List, Optional, Union, Dict, Any, Iterator, Generator
+from typing import List, Optional, Union, Dict, Any, Generator, Sequence
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-import torch.multiprocessing as mp
 import torch
-import zmq
 
 from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 from miniinfer.config.engine.config import EngineConfig
+from miniinfer.utils.memory_utils import calc_max_total_tokens
 from miniinfer.utils.profiler_utils import profile_methods, stage
 from .model_runner import ModelRunner
+from .overlap_executor import OverlapExecutor
+from .incremental_batch_tokenizer import IncrementalBatchTokenizer
 from miniinfer.scheduler.scheduler import Scheduler
 from miniinfer.scheduler.scheduler_batch import (
   Req,
@@ -41,9 +38,6 @@ from miniinfer.scheduler.scheduler_batch import (
   BatchResult,
 )
 
-# from .process_controller import ProcessController
-# from .ipc.zmq_channel import create_socket, send_pyobj, recv_pyobj
-# from .ipc.protocol import Request, Response, MessageType, GenerateRequest
 from ..utils.sampling_params import SamplingParams
 from .detokenizer import IncrementalDecoder
 
@@ -84,9 +78,8 @@ class LLMEngine:
   """
   LLM 推理引擎
 
-  支持两种模式:
-  - 单进程模式: 所有组件在同一进程，适合调试和小规模部署
-  - 多进程模式: Tokenizer/Scheduler/Detokenizer 分离，适合生产环境
+  当前仅支持单进程模式。
+  多进程模式接口保留，但暂未实现（use_multiprocess=True 会抛异常）。
   """
 
   def __init__(
@@ -121,9 +114,12 @@ class LLMEngine:
     self._started = False
 
     if use_multiprocess:
-      pass
-    else:
-      self._init_single_process_mode()
+      raise NotImplementedError(
+        "Multiprocess mode is not implemented yet. " "Please use use_multiprocess=False."
+      )
+
+    self._init_single_process_mode()
+    self._req_by_id: Dict[int, Req] = {}
 
     atexit.register(self.stop)
 
@@ -139,16 +135,19 @@ class LLMEngine:
 
     with torch.no_grad():
       if forward_batch.forward_mode.is_extend():
-        extend_lens = forward_batch.extend_seq_lens_cpu or []
-        last_token_indices: List[int] = []
-        cumsum = 0
-        for length in extend_lens:
-          last_token_indices.append(cumsum + int(length) - 1)
-          cumsum += int(length)
-        if not last_token_indices:
-          return
-        idx = torch.tensor(last_token_indices, device=logits.device)
-        logits_for_sampling = logits[idx]
+        if logits.size(0) == forward_batch.batch_size:
+          logits_for_sampling = logits
+        else:
+          extend_lens = forward_batch.extend_seq_lens_cpu or []
+          last_token_indices: List[int] = []
+          cumsum = 0
+          for length in extend_lens:
+            last_token_indices.append(cumsum + int(length) - 1)
+            cumsum += int(length)
+          if not last_token_indices:
+            return
+          idx = torch.tensor(last_token_indices, device=logits.device, dtype=torch.int64)
+          logits_for_sampling = logits[idx]
       else:
         logits_for_sampling = logits
 
@@ -162,266 +161,33 @@ class LLMEngine:
           candidates.append((int(tid), val, repr(text)))
         print("req=%s top%d next_token candidates: %s", req.req_id, k, candidates)
 
-  # ======== prompt encoding ========
-  def _should_apply_chat_template(self) -> bool:
-    if self.use_chat_template is True:
-      return hasattr(self.tokenizer, "apply_chat_template")
-    if self.use_chat_template is False:
-      return False
-    # auto
-    if not hasattr(self.tokenizer, "apply_chat_template"):
-      return False
-    model_name = str(getattr(self.config, "model", "")).lower()
-    return ("instruct" in model_name) or ("chat" in model_name)
-
+  # ======== prompt encoding (compat) ========
   def _encode_prompt(self, prompt: str) -> List[int]:
     """
     Encode a user prompt into token ids.
 
-    For chat/instruct models, use the tokenizer chat template (when available)
-    so the model sees the expected system/user/assistant framing.
+    Kept for backward-compat/tests; production code uses `self.prompt_tokenizer`.
     """
-    if self._should_apply_chat_template():
-      messages = []
-      if self.system_prompt:
-        messages.append({"role": "system", "content": self.system_prompt})
-      messages.append({"role": "user", "content": prompt})
-      try:
-        with stage("stage::Tokenizer.apply_chat_template"):
-          encoded = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-          )
-        if isinstance(encoded, torch.Tensor):
-          return encoded.tolist()
-        if isinstance(encoded, dict) and "input_ids" in encoded:
-          ids = encoded["input_ids"]
-          if isinstance(ids, torch.Tensor):
-            return ids.tolist()
-          return list(ids)
-        return list(encoded)
-      except Exception as e:
-        logger.warning(
-          "apply_chat_template failed (%s); falling back to tokenizer.encode",
-          e,
-        )
-    with stage("stage::Tokenizer.encode"):
-      return self.tokenizer.encode(prompt)
-
-  # ======== calculate max total tokens =========
-  def _estimate_model_weight_memory(self) -> int:
-    """
-    估算模型权重占用的 GPU 内存（字节）
-
-    对于 Transformer 模型，主要参数包括：
-    1. Embedding: vocab_size × hidden_size
-    2. Transformer layers: num_layers × layer_params
-    3. LM Head: vocab_size × hidden_size
-
-    Returns:
-        估算的模型权重字节数
-    """
-    hf_config = self.config.hf_config
-    dtype_size = torch.tensor([], dtype=self.config.dtype).element_size()
-
-    # 1. Embedding 层
-    embedding_params = hf_config.vocab_size * hf_config.hidden_size
-
-    # 2. 每个 Transformer 层的参数
-    # - Q/K/V projections
-    qkv_params = (
-      hf_config.hidden_size
-      * (hf_config.num_attention_heads * (hf_config.hidden_size // hf_config.num_attention_heads))
-      * 3
-    )  # Q, K, V
-
-    # - O projection
-    o_params = hf_config.hidden_size * hf_config.hidden_size
-
-    # - MLP (gate_proj, up_proj, down_proj)
-    mlp_params = hf_config.hidden_size * hf_config.intermediate_size * 3
-
-    # - LayerNorm (input norm + post attention norm)
-    ln_params = hf_config.hidden_size * 2
-
-    # 每层总参数
-    layer_params = qkv_params + o_params + mlp_params + ln_params
-
-    # 所有层的参数
-    all_layers_params = layer_params * hf_config.num_hidden_layers
-
-    # 3. 最终 LayerNorm
-    final_ln_params = hf_config.hidden_size
-
-    # 4. LM Head
-    lm_head_params = hf_config.vocab_size * hf_config.hidden_size
-
-    # 总参数量
-    total_params = embedding_params + all_layers_params + final_ln_params + lm_head_params
-
-    # 总字节数
-    total_bytes = total_params * dtype_size
-
-    # 添加安全系数 1.5，考虑内存碎片、padding、额外缓冲区等
-    # PyTorch 在加载和存储权重时可能有额外开销
-    safety_factor = 1.5
-    estimated_bytes = int(total_bytes * safety_factor)
-
-    logger.info(
-      f"Estimated model weight memory: {estimated_bytes / (1024**3):.2f}GB "
-      f"(params: {total_params / 1e9:.2f}B, dtype: {self.config.dtype}, "
-      f"with safety_factor={safety_factor})"
-    )
-
-    return estimated_bytes
-
-  def _get_available_gpu_memory(self) -> int:
-    """
-    获取 GPU 可用内存（字节）
-
-    Returns:
-        可用显存字节数（考虑 gpu_memory_utilization 和已分配内存）
-    """
-    # 获取当前设备
-    device = torch.cuda.current_device()
-
-    # 使用 mem_get_info 获取 GPU 真实空闲显存（考虑所有占用：
-    # CUDA context、驱动开销、其他进程、PyTorch 分配等）
-    free_memory, total_memory = torch.cuda.mem_get_info(device)
-
-    # 目标：最多使用 total_memory * gpu_memory_utilization
-    # 已占用 = total - free（包含所有消费者：模型权重 + CUDA ctx + 其他进程...）
-    used_memory = total_memory - free_memory
-    available_memory = int(total_memory * self.gpu_memory_utilization) - used_memory
-
-    logger.info(
-      f"GPU Memory - Total: {total_memory / (1024**3):.2f}GB, "
-      f"Used: {used_memory / (1024**3):.2f}GB, "
-      f"Free: {free_memory / (1024**3):.2f}GB, "
-      f"Available for KV Cache (with {self.gpu_memory_utilization:.1%} utilization): "
-      f"{available_memory / (1024**3):.2f}GB"
-    )
-
-    return max(0, available_memory)
-
-  def _get_cell_size_per_token(self) -> int:
-    """
-    计算每个 token 的 KV cache 大小（字节）
-
-    KV cache 大小 = 2 (K + V) × num_layers × num_heads × head_dim × dtype_size
-
-    Returns:
-        每个 token 占用的字节数
-    """
-    # 获取数据类型的字节大小
-    dtype_size = torch.tensor([], dtype=self.config.dtype).element_size()
-
-    # 计算：2 (K, V) × 层数 × head数 × head维度 × 数据类型大小
-    bytes_per_token = (
-      2
-      * self.config.hf_config.num_hidden_layers
-      * self.config.hf_config.num_key_value_heads
-      * (self.config.hf_config.hidden_size // self.config.hf_config.num_attention_heads)
-      * dtype_size
-    )
-
-    logger.info(
-      f"KV Cache per token: {bytes_per_token} bytes "
-      f"(layers={self.config.hf_config.num_hidden_layers}, "
-      f"heads={self.config.hf_config.num_key_value_heads}, "
-      f"head_dim={self.config.hf_config.hidden_size // self.config.hf_config.num_attention_heads}, "
-      f"dtype={self.config.dtype})"
-    )
-
-    return bytes_per_token
-
-  def _calc_max_total_tokens(self) -> int:
-    """
-    计算 KV cache 可以容纳的最大 token 数量
-
-    通过以下步骤计算:
-    1. 查询 GPU 内存 - 获取当前 GPU 的实际已分配内存（模型已加载）
-    2. 计算 token 大小 - 根据模型配置计算每个 token 占用的字节数
-    3. 计算最大容量 - 用剩余内存除以每个 token 大小
-
-    注意：
-    - 此方法在模型加载后调用，使用实际已分配的显存
-    - MHAKVCacheStorage 实际分配 (size + page_size) tokens 的空间
-    - 需要为激活值、中间结果等预留约 20% 的内存
-    - 最小 KV cache 大小为 2 * page_size，确保至少能处理一个请求
-
-    Returns:
-        max_total_num_tokens: KV cache 最大 token 容量
-    """
-    # 获取可用内存（模型已加载，这是实际剩余的显存）
-    available_memory = self._get_available_gpu_memory()
-
-    # 计算每个 token 的大小
-    bytes_per_token = self._get_cell_size_per_token()
-    if bytes_per_token == 0:
-      logger.error("bytes_per_token is 0, cannot calculate max_total_tokens")
-      return 0
-
-    # 预留内存给激活值、中间结果等，约 20%
-    # 由于模型已经加载，available_memory 是真实剩余显存
-    # 需要在 KV cache 和 forward pass activations 之间分配
-    reserved_ratio = 0.20
-    usable_memory = int(available_memory * (1.0 - reserved_ratio))
-
-    # 由于 MHAKVCacheStorage 实际分配 (size + page_size) 的空间
-    # 所以：(max_total_tokens + page_size) * bytes_per_token <= usable_memory
-    # 因此：max_total_tokens <= usable_memory / bytes_per_token - page_size
-    page_size = self.config.page_size
-    raw_tokens = usable_memory // bytes_per_token
-    max_total_num_tokens = raw_tokens - page_size
-
-    # 对齐到 page_size，确保 Flash Attention paged attention 的 view 操作正确工作
-    max_total_num_tokens = (max_total_num_tokens // page_size) * page_size
-
-    # 确保至少有最小容量 (2 * page_size)，以便能处理基本请求
-    # 最小容量 = 1 page 用于 prefill + 1 page 用于 decode
-    min_kv_tokens = 2 * page_size
-    max_total_num_tokens = max(max_total_num_tokens, min_kv_tokens)
-
-    # 检查是否显存严重不足
-    if max_total_num_tokens <= min_kv_tokens:
-      logger.warning(
-        f"KV cache capacity ({max_total_num_tokens} tokens) is at minimum. "
-        f"Available GPU memory may be insufficient. "
-        f"Consider using a smaller model or increasing GPU memory."
+    prompt_tokenizer = getattr(self, "prompt_tokenizer", None)
+    if prompt_tokenizer is None:
+      prompt_tokenizer = IncrementalBatchTokenizer(
+        self.tokenizer,
+        use_chat_template=self.use_chat_template,
+        model_name=str(getattr(self.config, "model", "")),
+        system_prompt=self.system_prompt,
       )
+    with stage("stage::Tokenizer.encode_one"):
+      return prompt_tokenizer.encode_one(prompt)
 
-    logger.info(
-      f"Calculated max_total_tokens: {max_total_num_tokens} "
-      f"(available: {available_memory / (1024**3):.2f}GB, "
-      f"usable: {usable_memory / (1024**3):.2f}GB, "
-      f"bytes_per_token: {bytes_per_token}, "
-      f"raw_tokens: {raw_tokens}, "
-      f"page_size: {page_size}, "
-      f"min_kv_tokens: {min_kv_tokens}, "
-      f"actual_allocation: {(max_total_num_tokens + page_size) * bytes_per_token / (1024**3):.2f}GB)"
-    )
-
-    return max_total_num_tokens
-
+  # ======== init helper function =========
   def _init_single_process_mode(self):
     """初始化单进程模式"""
     logger.info("Initializing LLMEngine in single-process mode")
 
-    # TP 子进程
+    # TP 子进程（暂未启用）
     self.ps = []
     self.events = []
-    ctx = mp.get_context("spawn")
-
-    # for i in range(1, self.config.tensor_parallel_size):
-    #     event = ctx.Event()
-    #     process = ctx.Process(target=ModelRunner, args=(self.config, i, event))
-    #     process.start()
-    #     self.ps.append(process)
-    #     self.events.append(event)
     # ======== engine config =============
-    self.gpu_memory_utilization = self.config.gpu_memory_utilization
     config = self.config
 
     # 步骤 1: 先创建 ModelRunner 并加载模型（不传入 kv_cache_mgr）
@@ -432,7 +198,7 @@ class LLMEngine:
     # 步骤 2: 模型加载完成后，基于实际已分配显存计算 max_total_tokens
     logger.info("Step 2: Calculating max_total_tokens based on actual GPU memory usage...")
     with stage("stage::LLMEngine.init.calc_max_total_tokens"):
-      self.max_total_tokens = self._calc_max_total_tokens()
+      self.max_total_tokens = calc_max_total_tokens(self.config, log=logger)
 
     # 步骤 3: 初始化 KV Cache 管理器
     logger.info("Step 3: Initializing KV Cache Manager...")
@@ -443,7 +209,11 @@ class LLMEngine:
         max_context_len=config.max_context_len,
         num_layers=config.hf_config.num_hidden_layers,
         num_heads=config.hf_config.num_key_value_heads,  # 使用 KV head 数量，支持 GQA
-        head_dim=config.hf_config.hidden_size // config.hf_config.num_attention_heads,
+        head_dim=getattr(
+          config.hf_config,
+          "head_dim",
+          config.hf_config.hidden_size // config.hf_config.num_attention_heads,
+        ),
         dtype=config.dtype,
         device="cuda",
         enable_prefix_cache=config.enable_prefix_cache,
@@ -462,6 +232,13 @@ class LLMEngine:
         self.config.model,
         use_fast=True,
         trust_remote_code=True,
+      )
+    with stage("stage::LLMEngine.init.prompt_tokenizer"):
+      self.prompt_tokenizer = IncrementalBatchTokenizer(
+        self.tokenizer,
+        use_chat_template=self.use_chat_template,
+        model_name=str(getattr(self.config, "model", "")),
+        system_prompt=self.system_prompt,
       )
     # Stream detokenizer
     with stage("stage::LLMEngine.init.detokenizer"):
@@ -489,75 +266,58 @@ class LLMEngine:
     else:
       logger.info("Step 5: CUDA Graph disabled (enforce_eager=True)")
 
+    # 步骤 6: 初始化 Overlap Executor (双 batch 交替执行)
+    enable_overlap = self.config.enable_overlap
+    logger.info(f"Step 6: Initializing Overlap Executor (enabled={enable_overlap})...")
+    with stage("stage::LLMEngine.init.overlap_executor"):
+      self.overlap_executor = OverlapExecutor(
+        max_running_requests=self.config.max_num_seqs,
+        max_chunks_per_request=4,
+        device="cuda",
+        enable_overlap=enable_overlap,
+      )
+    # 追踪上一个 batch 用于 overlap 判断
+    self._last_batch: Optional[ScheduledBatch] = None
+
     self._started = True
 
-  def start(self):
-    """启动引擎 (多进程模式)"""
-    if self._started:
-      return
-
-    self._started = True
-    logger.info("Engine started")
-
-  def stop(self):
-    """停止引擎"""
-    if not self._started:
-      return
-
-    logger.info("Stopping engine...")
-
-    if self.use_multiprocess:
-      # 关闭客户端 socket
-      if self.client_socket:
-        self.client_socket.close()
-      if self.response_socket:
-        self.response_socket.close()
-      if self.zmq_context:
-        self.zmq_context.term()
-
-      # 停止所有 Worker 进程
-      self.process_controller.stop_all()
-    else:
-      # 单进程模式
-      if hasattr(self, "model_runner"):
-        # ModelRunner currently has no IPC; just drop the reference
-        del self.model_runner
-
-      for p in self.ps:
-        p.join()
-
-    self._started = False
-    logger.info("Engine stopped")
-
-  def add_request(
+  # ======== add request and step function ========
+  def add_requests(
     self,
-    prompt: Union[str, List[int]],
-    sampling_params: Optional[SamplingParams] = None,
-  ) -> int:
-    """
-    添加请求到调度队列（非阻塞）
+    prompts: Sequence[Union[str, List[int]]],
+    sampling_params: Sequence[SamplingParams],
+  ) -> List[int]:
+    if not prompts:
+      return []
+    if len(prompts) != len(sampling_params):
+      raise ValueError(
+        "prompts and sampling_params length mismatch: " f"{len(prompts)} vs {len(sampling_params)}"
+      )
 
-    新请求会被添加到等待队列，不会阻塞当前正在进行的推理。
-    调用 step() 或 stream_generate() 来驱动推理。
+    token_ids_list: List[List[int]] = [[] for _ in range(len(prompts))]
+    to_encode: List[str] = []
+    to_encode_indices: List[int] = []
 
-    Args:
-        prompt: 输入 prompt (文本或 token ids)
-        sampling_params: 采样参数
+    for i, prompt in enumerate(prompts):
+      if isinstance(prompt, str):
+        to_encode.append(prompt)
+        to_encode_indices.append(i)
+      else:
+        token_ids_list[i] = list(prompt)
 
-    Returns:
-        request_id: 请求 ID，用于后续查询状态和结果
-    """
-    if sampling_params is None:
-      sampling_params = SamplingParams()
+    if to_encode:
+      with stage("stage::Tokenizer.encode_batch"):
+        encoded = self.prompt_tokenizer.encode_batch(to_encode)
+      for i, ids in zip(to_encode_indices, encoded):
+        token_ids_list[i] = ids
 
-    if isinstance(prompt, str):
-      token_ids = self._encode_prompt(prompt)
-    else:
-      token_ids = prompt
-
-    req = Req(token_ids, sampling_params)
-    self.scheduler.add(req)
-    return req.req_id
+    request_ids: List[int] = []
+    for token_ids, param in zip(token_ids_list, sampling_params):
+      req = Req(token_ids, param)
+      self.scheduler.add(req)
+      self._req_by_id[req.req_id] = req
+      request_ids.append(req.req_id)
+    return request_ids
 
   def step(self) -> StepOutput:
     """
@@ -569,20 +329,24 @@ class LLMEngine:
     Returns:
         StepOutput: 包含本步所有请求的增量输出
     """
-    if self.use_multiprocess:
-      # 多进程模式：从 response socket 接收结果
-      return StepOutput(outputs=[])
+    # Drain deferred releases first so radix/prefix cache state is up-to-date for scheduling.
+    # This matters for cases like: req1 finishes -> req2 with same prompt is added immediately.
+    if getattr(self.scheduler, "pending_release_reqs", None):
+      self.scheduler.drain_pending_releases()
 
-    # 单进程模式
     # 1. 调度获取 batch
     with stage("stage::LLMEngine.step.schedule"):
-      batch = self.scheduler.schedule(self.model_runner.device)
+      batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
     if batch is None or len(batch.reqs) == 0:
+      # No work this round; make sure any deferred releases are flushed so memory isn't leaked.
+      if getattr(self.scheduler, "pending_release_reqs", None):
+        self.scheduler.drain_pending_releases()
       return StepOutput(outputs=[])
 
-    # 2. 执行 forward
+    # 2. 执行 forward (compute stream)
     with stage("stage::LLMEngine.step.forward_batch_init"):
       forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+
     with stage("stage::LLMEngine.step.forward"):
       output = self.model_runner.forward(forward_batch)
       logits = output.logits
@@ -631,7 +395,334 @@ class LLMEngine:
       prefill_extend_lens=prefill_extend_lens,
     )
 
+  def step_overlap(self) -> StepOutput:
+    """
+    双 Batch 交替执行的推理步骤（使用 Future Placeholder）
+
+    与 step() 的区别：
+    - GPU 执行当前 batch forward 时，CPU 并行处理上一 batch 的结果
+    - 使用 OverlapExecutor 管理异步执行和结果队列
+    - 对于连续 decode batch，使用 placeholder 实现真正的 GPU/CPU overlap
+
+    Timeline (连续 decode):
+        GPU forward_stream: |-- forward(N-1) --|-- forward(N) --|-- forward(N+1) --|
+        CPU schedule_stream: [schedule(N)] ──► [run(N)] ──► [process(N-1)] ──► [schedule(N+1)]
+                                  ↑_____ 与 forward(N-1) 真正并行 _____↑
+
+    Returns:
+        StepOutput: 包含本步所有请求的增量输出
+    """
+    outputs = []
+    num_prefill = 0
+    num_decode = 0
+    prefill_prefix_lens: Dict[int, int] = {}
+    prefill_extend_lens: Dict[int, int] = {}
+
+    # =======================================================================
+    # 策略: 对于连续 decode batch，使用 placeholder 实现真正的 overlap
+    #
+    # 原本的问题：
+    #   schedule(N) 依赖 process(N-1) 后的状态（req.output_ids 更新）
+    #   这导致必须先 process 再 schedule，GPU 在 schedule 期间空闲
+    #
+    # 解决方案：
+    #   decode batch 的 input_ids 使用 placeholder (-future_index)
+    #   在 forward_stream 上 resolve_future 替换为真实 token
+    #   这允许 schedule(N) 与 forward(N-1) 并行
+    #
+    # 限制条件：
+    #   - 仅适用于连续 decode batch（batch size 相同）
+    #   - prefill 阶段仍需走保守路径
+    # =======================================================================
+
+    # 1. 首先检查是否可以使用 placeholder 路径
+    # 条件：当前有 running decode batch，且 batch size 与上一步相同。
+    #
+    # 额外约束（max_tokens 边界）：
+    # placeholder 路径的 schedule(N) 发生在 process(N-1) 之前，因此当某个请求在 N-1
+    # 处理后将因 max_tokens 结束时，schedule(N) 仍会把它纳入 decode batch，导致多跑 1 token。
+    # 这类情况可以在 schedule 时通过 (len(output_ids) + 1 >= max_tokens) 预测出来，
+    # 因此直接回退到保守路径，避免超发 token。
+    running_batch = self.scheduler.running_batch
+    has_near_max_tokens_req = False
+    if running_batch is not None and running_batch.reqs:
+      for req in running_batch.reqs:
+        max_tokens = int(getattr(req, "max_tokens", 0) or 0)
+        if max_tokens > 0 and (len(getattr(req, "output_ids", [])) + 1) >= max_tokens:
+          has_near_max_tokens_req = True
+          break
+
+    can_use_placeholder = (
+      self.config.enable_overlap
+      and not has_near_max_tokens_req
+      and len(running_batch.reqs) > 0
+      and running_batch.forward_mode.is_decode()
+      # sglang 风格：output_ids 存储了 -future_indices，
+      # _filter_batch 已同步过滤，shape 一定正确
+      and running_batch.output_ids is not None
+    )
+
+    if can_use_placeholder:
+      # ===== Placeholder 路径：真正的 overlap =====
+      # 顺序: schedule(N) → run(N) → process(N-1)
+      # GPU 在 schedule 和 run 期间继续执行 forward(N-1)
+
+      # 1a. 调度 decode batch（使用 placeholder input_ids）
+      # sglang 风格：prepare_for_decode(skip=True) 内部直接
+      # 执行 input_ids = output_ids（已由 _filter_batch 过滤到正确 shape）
+      with stage("stage::LLMEngine.step_overlap.schedule_placeholder"):
+        batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=True)
+
+      use_placeholder = (
+        batch is not None
+        and len(batch.reqs) > 0
+        and batch.forward_mode.is_decode()
+        # input_ids 包含负数占位符 → resolve_future_input_ids 会替换
+        and batch.input_ids is not None
+        and (batch.input_ids < 0).any()
+      )
+
+      # 1b. 异步执行当前 batch
+      if batch is not None and len(batch.reqs) > 0:
+        with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
+          forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+
+        with stage("stage::LLMEngine.step_overlap.run_async"):
+          record = self.overlap_executor.run_batch_async(
+            batch,
+            forward_batch,
+            self.model_runner,
+            use_placeholder=use_placeholder,
+          )
+          # When overlap is disabled at executor level (e.g., no CUDA),
+          # run_batch_async executes synchronously and does not enqueue results.
+          if not getattr(self.overlap_executor, "enable_overlap", True):
+            step_out = self._process_overlap_result(batch, record.batch_result)
+            if step_out:
+              outputs.extend(step_out.outputs)
+              num_prefill += step_out.num_prefill_tokens
+              num_decode += step_out.num_decode_tokens
+              prefill_prefix_lens.update(step_out.prefill_prefix_lens)
+              prefill_extend_lens.update(step_out.prefill_extend_lens)
+
+      # 1c. 处理上一步的结果（与 GPU forward(N) 并行）
+      if self.overlap_executor.has_pending():
+        with stage("stage::LLMEngine.step_overlap.process_overlap"):
+          step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+          if step_out:
+            outputs.extend(step_out.outputs)
+            num_prefill += step_out.num_prefill_tokens
+            num_decode += step_out.num_decode_tokens
+            prefill_prefix_lens.update(step_out.prefill_prefix_lens)
+            prefill_extend_lens.update(step_out.prefill_extend_lens)
+
+    else:
+      # ===== 保守路径：先 process 再 schedule =====
+      # 用于 prefill、首次 decode 等场景
+
+      # 2a. 先处理 pending batch
+      if self.overlap_executor.has_pending():
+        with stage("stage::LLMEngine.step_overlap.process_pending_first"):
+          step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+          if step_out:
+            outputs.extend(step_out.outputs)
+            num_prefill += step_out.num_prefill_tokens
+            num_decode += step_out.num_decode_tokens
+            prefill_prefix_lens.update(step_out.prefill_prefix_lens)
+            prefill_extend_lens.update(step_out.prefill_extend_lens)
+
+      # 2b. 调度获取当前 batch
+      with stage("stage::LLMEngine.step_overlap.schedule"):
+        batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
+
+      # 2c. 如果 overlap 被禁用，确保没有 pending batch 堆积
+      disable_overlap = not self.config.enable_overlap or batch is None
+      if disable_overlap and self.overlap_executor.has_pending():
+        with stage("stage::LLMEngine.step_overlap.sync_pending"):
+          while self.overlap_executor.has_pending():
+            step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+            if step_out:
+              outputs.extend(step_out.outputs)
+              num_prefill += step_out.num_prefill_tokens
+              num_decode += step_out.num_decode_tokens
+              prefill_prefix_lens.update(step_out.prefill_prefix_lens)
+              prefill_extend_lens.update(step_out.prefill_extend_lens)
+
+      # 2d. 异步执行当前 batch
+      if batch is not None and len(batch.reqs) > 0:
+        with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
+          forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+
+        with stage("stage::LLMEngine.step_overlap.run_async"):
+          record = self.overlap_executor.run_batch_async(
+            batch, forward_batch, self.model_runner, use_placeholder=False
+          )
+          # When overlap is disabled at executor level (e.g., enable_overlap=False or no CUDA),
+          # run_batch_async executes synchronously and does not enqueue results.
+          if not getattr(self.overlap_executor, "enable_overlap", True):
+            step_out = self._process_overlap_result(batch, record.batch_result)
+            if step_out:
+              outputs.extend(step_out.outputs)
+              num_prefill += step_out.num_prefill_tokens
+              num_decode += step_out.num_decode_tokens
+              prefill_prefix_lens.update(step_out.prefill_prefix_lens)
+              prefill_extend_lens.update(step_out.prefill_extend_lens)
+
+    # 更新 last_batch
+    self._last_batch = batch
+
+    return StepOutput(
+      outputs=outputs,
+      num_prefill_tokens=num_prefill,
+      num_decode_tokens=num_decode,
+      prefill_prefix_lens=prefill_prefix_lens,
+      prefill_extend_lens=prefill_extend_lens,
+    )
+
+  def generate(
+    self,
+    prompts: Union[List[str], List[List[int]]],
+    sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
+    use_tqdm: bool = True,
+  ) -> List[Dict[str, Any]]:
+    """
+    批量生成文本（阻塞式）
+
+    等待所有请求完成后返回结果。
+    如需流式输出，请使用 stream_generate()。
+
+    Args:
+        prompts: 输入 prompts
+        sampling_params: 采样参数
+        use_tqdm: 是否显示进度条
+
+    Returns:
+        生成结果列表，每个元素包含 text 和 token_ids
+    """
+    if not self._started:
+      self.start()
+
+    # 归一化输入
+    if isinstance(prompts, str):
+      prompts = [prompts]
+    elif isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], int):
+      prompts = [prompts]
+
+    if sampling_params is None:
+      sampling_params = SamplingParams()
+    if not isinstance(sampling_params, list):
+      sampling_params = [sampling_params] * len(prompts)
+
+    pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True) if use_tqdm else None
+
+    # 添加所有请求（batch tokenize）
+    self.add_requests(prompts, sampling_params)
+
+    # 收集结果
+    results: Dict[int, Dict[str, Any]] = {}
+    request_ids = []
+    decode_throughput = 0.0
+
+    while not self.is_finished():
+      t = perf_counter()
+      step_output = self.step_overlap()
+      step_time = max(perf_counter() - t, 1e-9)
+
+      if pbar:
+        if step_output.num_decode_tokens > 0:
+          decode_throughput = step_output.num_decode_tokens / step_time
+        pbar.set_postfix(
+          {
+            "Decode": f"{int(decode_throughput)}tok/s",
+          }
+        )
+
+      for output in step_output.outputs:
+        if output.request_id not in results:
+          results[output.request_id] = {
+            "text": "",
+            "token_ids": [],
+            "request_id": output.request_id,
+          }
+          request_ids.append(output.request_id)
+
+        results[output.request_id]["text"] += output.delta_text
+        results[output.request_id]["token_ids"] = output.output_token_ids
+
+        if output.finished and pbar:
+          pbar.update(1)
+
+    # Flush any remaining pending batches from overlap executor
+    while self.overlap_executor.has_pending():
+      step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+      if step_output:
+        for output in step_output.outputs:
+          if output.request_id not in results:
+            results[output.request_id] = {
+              "text": "",
+              "token_ids": [],
+              "request_id": output.request_id,
+            }
+            request_ids.append(output.request_id)
+          results[output.request_id]["text"] += output.delta_text
+          results[output.request_id]["token_ids"] = output.output_token_ids
+          if output.finished and pbar:
+            pbar.update(1)
+
+    if pbar:
+      pbar.close()
+
+    # 按请求 ID 顺序返回结果
+    return [results[rid] for rid in sorted(request_ids)]
+
   # ========== process helper function ============
+  def _process_overlap_result(self, batch: ScheduledBatch, result: BatchResult) -> StepOutput:
+    """
+    处理 overlap 执行中的单个 batch 结果
+
+    作为 OverlapExecutor.process_pending_batch 的回调函数。
+    """
+    # 处理结果并增量解码
+    outputs = self._process_step_result(batch, result)
+
+    # 统计 token 数
+    num_prefill = 0
+    num_decode = 0
+    prefill_prefix_lens: Dict[int, int] = {}
+    prefill_extend_lens: Dict[int, int] = {}
+
+    decode_req_set = set()
+    if batch.decoding_reqs:
+      decode_req_set = {id(r) for r in batch.decoding_reqs}
+
+    if batch.forward_mode.is_extend():
+      if batch.prefix_lens and batch.extend_lens:
+        for req, pre_len, ext_len in zip(batch.reqs, batch.prefix_lens, batch.extend_lens):
+          if id(req) in decode_req_set:
+            num_decode += 1
+          else:
+            num_prefill += ext_len
+            prefill_prefix_lens[int(req.req_id)] = int(pre_len)
+            prefill_extend_lens[int(req.req_id)] = int(ext_len)
+      else:
+        num_prefill = sum(batch.extend_lens) if batch.extend_lens else 0
+    elif batch.forward_mode.is_decode():
+      num_decode = len(batch.reqs)
+
+    # Immediately update radix cache after processing this batch result.
+    # This ensures radix cache state is fresh before the next schedule() call,
+    # eliminating the need for a separate drain step in step_overlap().
+    if getattr(self.scheduler, "pending_release_reqs", None):
+      self.scheduler.drain_pending_releases()
+
+    return StepOutput(
+      outputs=outputs,
+      num_prefill_tokens=num_prefill,
+      num_decode_tokens=num_decode,
+      prefill_prefix_lens=prefill_prefix_lens,
+      prefill_extend_lens=prefill_extend_lens,
+    )
+
   def _process_step_result(self, batch: ScheduledBatch, result: BatchResult) -> List[RequestOutput]:
     """
     处理单步推理结果，返回每个请求的增量输出
@@ -650,6 +741,11 @@ class LLMEngine:
 
     outputs = []
     finished_req_ids = []
+
+    # Decode tokens in batch to reduce Python overhead.
+    active_reqs: List[Req] = []
+    active_req_ids: List[int] = []
+    active_token_ids: List[int] = []
 
     for i, req in enumerate(batch.reqs):
       # ============ Chunked Prefill 特殊处理 ============
@@ -677,6 +773,12 @@ class LLMEngine:
         continue
 
       # ============ 正常请求处理 ============
+      # overlap placeholder 路径下可能出现 "stale batch"：
+      # schedule(N) 先于 process(N-1)，导致已经在 (N-1) 结束的请求仍出现在 batch(N) 的 record 中。
+      # 这时必须跳过该请求，避免 output_ids 超过 max_tokens 或重复解码。
+      if req.finished:
+        continue
+
       # retract 后请求会被重新 prefill。若不清理 detokenizer 状态，
       # 旧 token 文本会和重跑后的新 token 文本串接，导致输出错位/乱码。
       if req.is_retracted:
@@ -686,52 +788,128 @@ class LLMEngine:
       token_id = next_token_ids[i]
       req.output_ids.append(token_id)
 
-      # 增量解码
-      delta_text, is_eos = self.detokenizer.decode(
-        req_id=req.req_id,
-        token_id=token_id,
+      active_reqs.append(req)
+      active_req_ids.append(req.req_id)
+      active_token_ids.append(token_id)
+
+    if active_reqs:
+      decoded = self.detokenizer.decode_batch(
+        req_ids=active_req_ids,
+        token_ids=active_token_ids,
         eos_token_id=self.scheduler.eos_token_id,
+        return_full_text=True,
       )
+      for req, token_id, (delta_text, is_eos, full_text) in zip(
+        active_reqs, active_token_ids, decoded
+      ):
+        # 检查是否达到最大 token 数
+        if req.ignore_eos:
+          is_eos = False
+        is_finished = is_eos or len(req.output_ids) >= req.max_tokens
+        finish_reason = None
 
-      # 检查是否达到最大 token 数
-      if req.ignore_eos:
-        is_eos = False
-      is_finished = is_eos or len(req.output_ids) >= req.max_tokens
-      finish_reason = None
+        if is_finished:
+          # flush() is typically a no-op after decode(); keep for safety.
+          delta_text += self.detokenizer.flush(req.req_id)
 
-      if is_finished:
-        # 刷新剩余文本
-        remaining = self.detokenizer.flush(req.req_id)
-        delta_text += remaining
+          req.finished = True
+          if is_eos:
+            finish_reason = "eos"
+            req.finished_reason = "eos"
+          else:
+            finish_reason = "max_tokens"
+            req.finished_reason = "max_tokens"
+          finished_req_ids.append(req.req_id)
 
-        req.finished = True
-        if is_eos:
-          finish_reason = "eos"
-          req.finished_reason = "eos"
-        else:
-          finish_reason = "max_tokens"
-          req.finished_reason = "max_tokens"
-        finished_req_ids.append(req.req_id)
-
-      # 获取完整文本
-      full_text = self.detokenizer.get_full_text(req.req_id)
-
-      outputs.append(
-        RequestOutput(
-          request_id=req.req_id,
-          delta_text=delta_text,
-          full_text=full_text,
-          token_id=token_id,
-          output_token_ids=req.output_ids.copy(),
-          finished=is_finished,
-          finish_reason=finish_reason,
+        outputs.append(
+          RequestOutput(
+            request_id=req.req_id,
+            delta_text=delta_text,
+            full_text=full_text,
+            token_id=token_id,
+            output_token_ids=req.output_ids,
+            finished=is_finished,
+            finish_reason=finish_reason,
+          )
         )
-      )
+        if is_finished:
+          # Drop detokenizer state to reduce per-step CPU/memory overhead.
+          self.detokenizer.cleanup(req.req_id)
 
     # 处理完成的请求
     self.scheduler._handle_finished_requests(batch, finished_req_ids)
 
     return outputs
+
+  def is_finished(self) -> bool:
+    """检查是否所有请求都已完成"""
+    return not self.scheduler.has_unfinished()
+
+  # =========== start and stop ========
+  def start(self):
+    """启动引擎"""
+    if self._started:
+      return
+
+    self._started = True
+    logger.info("Engine started")
+
+  def stop(self):
+    """停止引擎"""
+    if not self._started:
+      return
+
+    logger.info("Stopping engine...")
+    # 单进程模式
+    if hasattr(self, "model_runner"):
+      # ModelRunner currently has no IPC; just drop the reference
+      del self.model_runner
+
+    for p in self.ps:
+      p.join()
+
+    self._started = False
+    logger.info("Engine stopped")
+
+  def __enter__(self):
+    self.start()
+    return self
+
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    self.stop()
+
+  # ================= for test =================
+  def add_request(
+    self,
+    prompt: Union[str, List[int]],
+    sampling_params: Optional[SamplingParams] = None,
+  ) -> int:
+    """
+    添加请求到调度队列（非阻塞）
+
+    新请求会被添加到等待队列，不会阻塞当前正在进行的推理。
+    调用 step() 或 stream_generate() 来驱动推理。
+
+    Args:
+        prompt: 输入 prompt (文本或 token ids)
+        sampling_params: 采样参数
+
+    Returns:
+        request_id: 请求 ID，用于后续查询状态和结果
+    """
+    if sampling_params is None:
+      sampling_params = SamplingParams()
+
+    if isinstance(prompt, str):
+      with stage("stage::Tokenizer.encode_one"):
+        token_ids = self.prompt_tokenizer.encode_one(prompt)
+    else:
+      token_ids = prompt
+
+    req = Req(token_ids, sampling_params)
+    self.scheduler.add(req)
+    self._req_by_id[req.req_id] = req
+    return req.req_id
 
   def stream_generate(
     self,
@@ -771,175 +949,19 @@ class LLMEngine:
     if not isinstance(sampling_params, list):
       sampling_params = [sampling_params] * len(prompts)
 
-    # 添加所有初始请求
-    for prompt, param in zip(prompts, sampling_params):
-      self.add_request(prompt, param)
+    # 添加所有初始请求（batch tokenize）
+    self.add_requests(prompts, sampling_params)
 
     # 持续推理直到所有请求完成
     while self.scheduler.has_unfinished():
-      step_output = self.step()
+      step_output = self.step_overlap()
 
       for output in step_output.outputs:
         yield output
 
-  def generate(
-    self,
-    prompts: Union[List[str], List[List[int]]],
-    sampling_params: Union[SamplingParams, List[SamplingParams]] = None,
-    use_tqdm: bool = True,
-  ) -> List[Dict[str, Any]]:
-    """
-    批量生成文本（阻塞式）
-
-    等待所有请求完成后返回结果。
-    如需流式输出，请使用 stream_generate()。
-
-    Args:
-        prompts: 输入 prompts
-        sampling_params: 采样参数
-        use_tqdm: 是否显示进度条
-
-    Returns:
-        生成结果列表，每个元素包含 text 和 token_ids
-    """
-    if not self._started:
-      self.start()
-
-    # 归一化输入
-    if isinstance(prompts, str):
-      prompts = [prompts]
-    elif isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], int):
-      prompts = [prompts]
-
-    if sampling_params is None:
-      sampling_params = SamplingParams()
-    if not isinstance(sampling_params, list):
-      sampling_params = [sampling_params] * len(prompts)
-
-    pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True) if use_tqdm else None
-
-    # 添加所有请求
-    for prompt, param in zip(prompts, sampling_params):
-      self.add_request(prompt, param)
-
-    # 收集结果
-    results: Dict[int, Dict[str, Any]] = {}
-    request_ids = []
-    prefill_throughput = decode_throughput = 0.0
-
-    while not self.is_finished():
-      t = perf_counter()
-      step_output = self.step()
-      step_time = max(perf_counter() - t, 1e-9)
-
-      if pbar:
-        if step_output.num_prefill_tokens > 0:
-          prefill_throughput = step_output.num_prefill_tokens / step_time
-        if step_output.num_decode_tokens > 0:
-          decode_throughput = step_output.num_decode_tokens / step_time
-        pbar.set_postfix(
-          {
-            "Prefill": f"{int(prefill_throughput)}tok/s",
-            "Decode": f"{int(decode_throughput)}tok/s",
-          }
-        )
-
-      for output in step_output.outputs:
-        if output.request_id not in results:
-          results[output.request_id] = {
-            "text": "",
-            "token_ids": [],
-            "request_id": output.request_id,
-          }
-          request_ids.append(output.request_id)
-
-        results[output.request_id]["text"] += output.delta_text
-        results[output.request_id]["token_ids"] = output.output_token_ids
-
-        if output.finished and pbar:
-          pbar.update(1)
-
-    if pbar:
-      pbar.close()
-
-    # 按请求 ID 顺序返回结果
-    return [results[rid] for rid in sorted(request_ids)]
-
-  def get_request_status(self, request_id: int) -> Dict[str, Any]:
-    """
-    获取请求状态
-
-    Args:
-        request_id: 请求 ID
-
-    Returns:
-        请求状态字典，包含 status、output_tokens、finished 等
-    """
-    if request_id not in self._request_map:
-      return {"status": "not_found", "request_id": request_id}
-
-    req = self._request_map[request_id]
-
-    if req.finished:
-      status = "finished"
-    elif req in self.scheduler.running_batch.reqs:
-      status = "running"
-    elif req in self.scheduler.waiting_queue:
-      status = "waiting"
-    else:
-      status = "unknown"
-
-    return {
-      "status": status,
-      "request_id": request_id,
-      "output_token_count": len(req.output_ids),
-      "finished": req.finished,
-      "finish_reason": req.finished_reason if req.finished else None,
-    }
-
-  def get_request_output(self, request_id: int) -> Optional[str]:
-    """
-    获取请求的完整输出文本
-
-    Args:
-        request_id: 请求 ID
-
-    Returns:
-        完整输出文本，如果请求不存在则返回 None
-    """
-    return self.scheduler.get_request_output(request_id)
-
-  def get_finished_requests(self) -> List[Req]:
-    """
-    获取并清空已完成的请求列表
-
-    Returns:
-        已完成的请求列表
-    """
-    finished = self.scheduler.finished_reqs.copy()
-    self.scheduler.finished_reqs.clear()
-    return finished
-
-  def is_finished(self) -> bool:
-    """检查是否所有请求都已完成"""
-    if self.use_multiprocess:
-      return len(self.pending_requests) == 0
-    else:
-      return not self.scheduler.has_unfinished()
-
-  def get_stats(self) -> Dict[str, Any]:
-    """获取统计信息"""
-    if self.use_multiprocess:
-      return self.process_controller.get_stats()
-    else:
-      return {
-        "mode": "single-process",
-        "started": self._started,
-      }
-
-  def __enter__(self):
-    self.start()
-    return self
-
-  def __exit__(self, exc_type, exc_val, exc_tb):
-    self.stop()
+    # Flush any remaining pending batches from overlap executor
+    while self.overlap_executor.has_pending():
+      step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+      if step_output:
+        for output in step_output.outputs:
+          yield output

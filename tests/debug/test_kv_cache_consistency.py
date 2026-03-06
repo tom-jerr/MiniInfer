@@ -913,7 +913,7 @@ def main():
   if args.compare_hf or args.check_kv_weights or args.compare_hf_layers:
     hf_dtype = _resolve_dtype(args.hf_dtype, device)
     hf_load_kwargs = {
-      "torch_dtype": hf_dtype,
+      "dtype": hf_dtype,
       "trust_remote_code": True,
     }
     if args.hf_attn_impl:

@@ -10,9 +10,7 @@ device = torch.device("cuda")
 
 # 加载模型
 print("Loading models...")
-hf_model = AutoModelForCausalLM.from_pretrained(
-  model_name, torch_dtype=torch.float16, device_map=device
-)
+hf_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float16, device_map=device)
 config = Qwen2Config.from_pretrained(model_name)
 my_model = Qwen2ForCausalLM(config=config, device=device, precision=torch.float16)
 state_dict = load_hf_weight(model_name, device=device)

@@ -420,15 +420,20 @@ class KVCacheManager:
     batch.req_pool_indices = torch.tensor(all_req_pool_indices, dtype=torch.int64).to(self.device)
     batch.out_cache_loc = torch.cat([extend_out_cache_loc, decode_out_cache_loc])
 
-  def prepare_for_decode(self, batch: "ScheduledBatch"):
+  def prepare_for_decode(self, batch: "ScheduledBatch", skip_input_ids: bool = False):
     batch.forward_mode = ForwardMode.DECODE
     # Decode 阶段的 input_ids 是每个请求最后生成的 token
     # 从每个 req.output_ids[-1] 获取
     bs = len(batch.reqs)
     if bs == 0:
       return
-    last_tokens = [req.output_ids[-1] for req in batch.reqs]
-    batch.input_ids = torch.tensor(last_tokens, dtype=torch.int64).to(self.device)
+
+    if not skip_input_ids:
+      # 非 overlap 路径：常规同步构建 input_ids
+      last_tokens = [req.output_ids[-1] for req in batch.reqs]
+      batch.input_ids = torch.tensor(last_tokens, dtype=torch.int64).to(self.device)
+    else:
+      batch.input_ids = batch.output_ids
     batch.output_ids = None
     token_per_req = 1  # decode
 

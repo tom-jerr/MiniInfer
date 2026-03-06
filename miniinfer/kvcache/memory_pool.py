@@ -365,7 +365,7 @@ class PagedTokenAllocator(ITokenAllocator):
       free_page_indices = torch.unique(free_index // self.page_size)
       # Page 0 is a reserved/padded slot and must never enter free pages.
       valid_mask = (free_page_indices >= 1) & (free_page_indices <= self.num_pages)
-      if not torch.all(valid_mask):
+      if self.debug_mode and not bool(torch.all(valid_mask)):
         invalid = free_page_indices[~valid_mask]
         logger.warning("Dropping invalid free page ids: %s", invalid.detach().cpu().tolist())
       free_page_indices = free_page_indices[valid_mask]
@@ -377,9 +377,47 @@ class PagedTokenAllocator(ITokenAllocator):
     else:
       self.free_group.append(free_index)
 
-    assert len(torch.unique(self.free_pages)) == len(self.free_pages)
-    assert torch.all(self.free_pages >= 1) and torch.all(self.free_pages <= self.num_pages)
-    assert len(self.free_pages) <= self.num_pages
+    if self.debug_mode:
+      assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+      assert torch.all(self.free_pages >= 1) and torch.all(self.free_pages <= self.num_pages)
+      assert len(self.free_pages) <= self.num_pages
+
+  def begin_free_group(self):
+    """Batch `free()` calls to amortize dedup/concat overhead."""
+    self.is_not_in_free_group = False
+
+  def end_free_group(self):
+    """Flush any batched frees and return allocator to normal mode."""
+    self.flush_free_group()
+    self.is_not_in_free_group = True
+
+  def flush_free_group(self):
+    """Materialize `free_group` into `free_pages` once."""
+    if not self.free_group:
+      return
+
+    free_index = torch.cat(self.free_group)
+    self.free_group = []
+    if free_index.numel() == 0:
+      return
+
+    free_page_indices = torch.unique(free_index // self.page_size)
+    # Page 0 is a reserved/padded slot and must never enter free pages.
+    valid_mask = (free_page_indices >= 1) & (free_page_indices <= self.num_pages)
+    if self.debug_mode and not bool(torch.all(valid_mask)):
+      invalid = free_page_indices[~valid_mask]
+      logger.warning("Dropping invalid free page ids: %s", invalid.detach().cpu().tolist())
+    free_page_indices = free_page_indices[valid_mask]
+    if free_page_indices.numel() == 0:
+      return
+
+    # Merge into allocator free list with one dedup pass.
+    self.free_pages = torch.unique(torch.cat((free_page_indices, self.free_pages)))
+
+    if self.debug_mode:
+      assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+      assert torch.all(self.free_pages >= 1) and torch.all(self.free_pages <= self.num_pages)
+      assert len(self.free_pages) <= self.num_pages
 
   def clear(self):
     # The padded slot 0 is used for writing dummy outputs from padded tokens.

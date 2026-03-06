@@ -705,7 +705,7 @@ class TestRealWorldVsTransformers:
         trust_remote_code=True,
       )
       if hf_device == "cuda":
-        model_kwargs["torch_dtype"] = torch.float16
+        model_kwargs["dtype"] = torch.float16
       hf_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **model_kwargs)
     except Exception as exc:
       pytest.skip(

@@ -47,29 +47,43 @@ class FlashAttention3Backend(AttentionBackend):
     batch_size = forward_batch.batch_size
     device = seqlens_in_batch.device
 
+    # Use precomputed int32 version if available
+    seqlens_int32 = (
+      forward_batch.seq_lens_int32
+      if forward_batch.seq_lens_int32 is not None
+      else seqlens_in_batch.to(torch.int32)
+    )
+
     if forward_batch.forward_mode.is_decode():
-      cache_seqlens = seqlens_in_batch.to(torch.int32)
+      cache_seqlens = seqlens_int32
       if getattr(forward_batch, "debug_use_past_len_cache", False):
         cache_seqlens = torch.clamp(cache_seqlens - 1, min=0)
       metadata.cache_seqlens_int32 = cache_seqlens
-      metadata.max_seq_len_k = int(cache_seqlens.max().item())
+      # Use precomputed max_seq_len from CPU to avoid GPU sync
+      metadata.max_seq_len_k = (
+        forward_batch.max_seq_len if forward_batch.max_seq_len else int(cache_seqlens.max().item())
+      )
       metadata.cu_seqlen_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
       metadata.cu_seqlen_k = torch.nn.functional.pad(
         torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
       )
       metadata.page_table = self.kv_cache_mgr.get_page_table(forward_batch, metadata.max_seq_len_k)
     else:
-      metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-      metadata.max_seq_len_q = forward_batch.seq_lens.max().item()
-      metadata.max_seq_len_k = forward_batch.seq_lens.max().item()
+      metadata.cache_seqlens_int32 = seqlens_int32
+      # Use precomputed max_seq_len from CPU to avoid GPU sync
+      metadata.max_seq_len_q = (
+        forward_batch.max_seq_len
+        if forward_batch.max_seq_len
+        else int(forward_batch.seq_lens.max().item())
+      )
+      metadata.max_seq_len_k = metadata.max_seq_len_q
       metadata.cu_seqlens_q = torch.nn.functional.pad(
-        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        torch.cumsum(seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
       )
       metadata.cu_seqlens_k = torch.nn.functional.pad(
-        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        torch.cumsum(seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
       )
       metadata.page_table = self.kv_cache_mgr.get_page_table(forward_batch, metadata.max_seq_len_k)
-      print("metadata.page_table:", metadata.page_table)
       if any(forward_batch.extend_prefix_lens_cpu):
         extend_seq_lens = forward_batch.extend_seq_lens
         metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -230,6 +244,13 @@ class FlashAttention2Backend(AttentionBackend):
     batch_size = forward_batch.batch_size
     device = seqlens_in_batch.device
 
+    # Use precomputed int32 version if available
+    seqlens_int32 = (
+      forward_batch.seq_lens_int32
+      if forward_batch.seq_lens_int32 is not None
+      else seqlens_in_batch.to(torch.int32)
+    )
+
     def _build_block_table(max_seq_len_k: int) -> torch.Tensor:
       # RequestPool stores per-token KV indices (kv_loc). FlashAttention expects per-block indices.
       # Each sequence is laid out in pages of `page_size`, so the block id is kv_loc // page_size.
@@ -250,11 +271,14 @@ class FlashAttention2Backend(AttentionBackend):
       return block_table
 
     if forward_batch.forward_mode.is_decode():
-      cache_seqlens = seqlens_in_batch.to(torch.int32)
+      cache_seqlens = seqlens_int32
       if getattr(forward_batch, "debug_use_past_len_cache", False):
         cache_seqlens = torch.clamp(cache_seqlens - 1, min=0)
       metadata.cache_seqlens_int32 = cache_seqlens
-      metadata.max_seq_len_k = int(cache_seqlens.max().item())
+      # Use precomputed max_seq_len from CPU to avoid GPU sync
+      metadata.max_seq_len_k = (
+        forward_batch.max_seq_len if forward_batch.max_seq_len else int(cache_seqlens.max().item())
+      )
       # Note: For decode, each sequence has seqlen_q=1
       metadata.max_seq_len_q = 1
       metadata.cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
@@ -263,14 +287,19 @@ class FlashAttention2Backend(AttentionBackend):
       )
       metadata.block_table = _build_block_table(metadata.max_seq_len_k)
     else:
-      metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-      metadata.max_seq_len_q = forward_batch.seq_lens.max().item()
-      metadata.max_seq_len_k = forward_batch.seq_lens.max().item()
+      metadata.cache_seqlens_int32 = seqlens_int32
+      # Use precomputed max_seq_len from CPU to avoid GPU sync
+      metadata.max_seq_len_q = (
+        forward_batch.max_seq_len
+        if forward_batch.max_seq_len
+        else int(forward_batch.seq_lens.max().item())
+      )
+      metadata.max_seq_len_k = metadata.max_seq_len_q
       metadata.cu_seqlens_q = torch.nn.functional.pad(
-        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        torch.cumsum(seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
       )
       metadata.cu_seqlens_k = torch.nn.functional.pad(
-        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        torch.cumsum(seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
       )
       metadata.block_table = _build_block_table(metadata.max_seq_len_k)
       if forward_batch.extend_prefix_lens_cpu and any(forward_batch.extend_prefix_lens_cpu):

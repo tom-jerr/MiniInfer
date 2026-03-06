@@ -17,8 +17,10 @@ from config.engine.config import EngineConfig
 from miniinfer.scheduler.scheduler_batch import ForwardBatch, ForwardMode
 from loader.weight import load_hf_weight
 from config.model.qwen2 import Qwen2Config
+from config.model.qwen3 import Qwen3Config
 from config.model.base import PretrainedConfig
 from models.fused_qwen2 import Qwen2ForCausalLM
+from models.fused_qwen3 import Qwen3ForCausalLM
 from miniinfer.layers.sample import Sampler, SamplingBatchInfo
 from miniinfer.layers.attention_backend.flashattention_backend import (
   FlashAttention2Backend,
@@ -54,10 +56,15 @@ class ModelRunner:
     self.attn_backend = None
     self._attn_backend_type = attn_backend
 
-    if "Qwen2" in config.model:
+    model_type = getattr(config.hf_config, "model_type", "").lower()
+    if model_type == "qwen2" or ("Qwen2" in config.model and model_type not in ("qwen3",)):
       self.model_config: PretrainedConfig = Qwen2Config.from_pretrained(config.model)
       self.model = Qwen2ForCausalLM(self.model_config, device=self.device)
       logger.info("Initialized Qwen2Model")
+    elif model_type == "qwen3":
+      self.model_config: PretrainedConfig = Qwen3Config.from_pretrained(config.model)
+      self.model = Qwen3ForCausalLM(self.model_config, device=self.device)
+      logger.info("Initialized Qwen3Model")
     else:
       self.model = None
     self.sampler = Sampler()
@@ -211,8 +218,8 @@ class ModelRunner:
     采样生成 token
 
     Args:
-        logits: 在 decode 模式下为 [batch_size, vocab_size]，
-                在 extend 模式下为 [total_tokens, vocab_size]（所有序列 token 拼接）
+        logits: 通常为 [batch_size, vocab_size]（decode 以及优化后的 extend/mixed）。
+                旧路径下 extend 可能为 [total_tokens, vocab_size]（所有序列 token 拼接）。
         batch: 当前 batch
 
     Returns:
@@ -221,38 +228,67 @@ class ModelRunner:
     if logits is None:
       return []
 
-    # 在 extend（prefill）模式下，需要从 logits 中提取每个序列最后一个 token 的 logits
-    # logits 的形状是 [total_tokens, vocab_size]，其中 total_tokens = sum(extend_lens)
-    # 我们只需要每个序列最后一个位置的 logits 用于采样
+    # 在 extend（prefill/mixed）模式下，如果 logits 仍是 [total_tokens, vocab_size]，
+    # 需要提取每个序列最后一个 token 的 logits；否则 logits 已经是 [batch_size, vocab_size]。
     if batch.forward_mode.is_extend():
-      # 计算每个序列最后一个 token 在 logits 中的索引
-      extend_lens = batch.extend_seq_lens_cpu
-      last_token_indices = []
-      cumsum = 0
-      for length in extend_lens:
-        last_token_indices.append(cumsum + length - 1)
-        cumsum += length
-      last_token_indices = torch.tensor(last_token_indices, device=logits.device)
-      logits_for_sampling = logits[last_token_indices]
+      if logits.size(0) == batch.batch_size:
+        logits_for_sampling = logits
+      else:
+        extend_lens = batch.extend_seq_lens_cpu or []
+        last_token_indices = []
+        cumsum = 0
+        for length in extend_lens:
+          last_token_indices.append(cumsum + int(length) - 1)
+          cumsum += int(length)
+        last_token_indices = torch.tensor(
+          last_token_indices, device=logits.device, dtype=torch.int64
+        )
+        logits_for_sampling = logits[last_token_indices]
     else:
       # decode 模式下，每个序列只有一个 token，logits 已经是 [batch_size, vocab_size]
       logits_for_sampling = logits
 
-    sampling_batch_info = SamplingBatchInfo(
-      temperature=torch.tensor(
-        [seq.sampling_params.temperature for seq in batch.all_seqs],
-        device=logits.device,
-      ),
-      top_ps=torch.tensor(
-        [seq.sampling_params.top_p for seq in batch.all_seqs],
-        device=logits.device,
-      ),
-      top_ks=torch.tensor(
-        [seq.sampling_params.top_k for seq in batch.all_seqs],
-        device=logits.device,
-      ),
-      vocab_size=logits.size(-1),
-    )
+    # Use pre-built sampling params from ForwardBatch to avoid per-step H2D
+    temps = getattr(batch, "sampling_temperatures", None)
+    top_ps = getattr(batch, "sampling_top_ps", None)
+    top_ks = getattr(batch, "sampling_top_ks", None)
+    if temps is not None and top_ps is not None and top_ks is not None:
+      sampling_batch_info = SamplingBatchInfo(
+        temperature=temps,
+        top_ps=top_ps,
+        top_ks=top_ks,
+        max_top_k=getattr(batch, "sampling_max_top_k", None),
+        vocab_size=logits.size(-1),
+      )
+    else:
+      # Fallback: create from Python lists (legacy path)
+      if batch.all_seqs is None:
+        raise ValueError(
+          "ForwardBatch is missing sampling tensors and `all_seqs`; "
+          "cannot construct per-sequence SamplingBatchInfo."
+        )
+      sampling_batch_info = SamplingBatchInfo(
+        temperature=torch.tensor(
+          [seq.sampling_params.temperature for seq in batch.all_seqs],
+          device=logits.device,
+        ),
+        top_ps=torch.tensor(
+          [seq.sampling_params.top_p for seq in batch.all_seqs],
+          device=logits.device,
+        ),
+        top_ks=torch.tensor(
+          [seq.sampling_params.top_k for seq in batch.all_seqs],
+          device=logits.device,
+        ),
+        max_top_k=max(
+          1,
+          max(
+            (int(seq.sampling_params.top_k) for seq in batch.all_seqs),
+            default=0,
+          ),
+        ),
+        vocab_size=logits.size(-1),
+      )
 
     next_token_ids = self.sampler(logits_for_sampling, sampling_batch_info)  # [num_seqs,]
     return next_token_ids

@@ -50,6 +50,11 @@ class EngineConfig:
   # cuda_graph_max_bs: 0 表示使用 max_num_seqs
   cuda_graph_max_bs: int = 0
 
+  # ============ Overlap 配置 ============
+  # 是否启用双 Batch 交替执行 (overlap scheduling)
+  # 启用后 GPU 执行当前 batch 时 CPU 并行处理上一 batch
+  enable_overlap: bool = True
+
   # 别名支持（兼容旧配置）
   @property
   def model(self) -> str:
