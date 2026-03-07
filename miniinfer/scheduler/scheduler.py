@@ -21,11 +21,8 @@ Scheduler - 单机版调度器
     - 全部预算以 page_size 粒度对齐
 """
 
-from typing import List, Optional, Tuple, Dict, Any, Callable
-from dataclasses import dataclass, field
-from enum import Enum, auto
+from typing import List, Optional, Any
 import logging
-import time
 import torch
 
 from miniinfer.config.engine.config import EngineConfig
@@ -53,10 +50,6 @@ _NTR_GROW_STEP = 0.08
 _NTR_DECAY_STEP = 0.02
 # decode 连续 OOM 收缩次数达到此值后开始调高 new_token_ratio
 _RETRACT_THRESHOLD = 2
-# 强制给 decode 留的最低 page 数
-_MIN_DECODE_PAGES = 2
-# decode 请求如果连续 N 轮未被调度，强制插入
-_DECODE_STARVATION_TICKS = 3
 
 
 @profile_methods("Scheduler")
@@ -74,9 +67,6 @@ class Scheduler:
   3. Decode 内存检查 (check_decode_mem):
      - 估算下一步所有 decode 请求需要的 page 数
      - 不足时从 batch 尾部收缩请求 (retract)，被收缩的请求回到 waiting 队列
-  4. Decode 饿死保护:
-     - 如果 running_batch 已等待超过 _DECODE_STARVATION_TICKS 轮未被调度，
-       强制跳过 prefill，立即执行 decode
   """
 
   def __init__(
@@ -179,7 +169,7 @@ class Scheduler:
     running_bs = len(self.running_batch.reqs)
 
     # Step 2: 尝试拼 prefill/mixed 批次
-    prefill_batch = self._get_new_batch_prefill(device)
+    prefill_batch = self._get_new_batch_prefill(device, skip_decode_input_ids=skip_decode_input_ids)
 
     if prefill_batch is not None:
       if logger.isEnabledFor(logging.DEBUG):
@@ -199,7 +189,9 @@ class Scheduler:
 
   # ======================== Prefill 批次构建 ========================
 
-  def _get_new_batch_prefill(self, device: torch.device) -> Optional[ScheduledBatch]:
+  def _get_new_batch_prefill(
+    self, device: torch.device, *, skip_decode_input_ids: bool = False
+  ) -> Optional[ScheduledBatch]:
     """
     尝试构建一个 prefill 批次
 
@@ -344,7 +336,19 @@ class Scheduler:
       batch.forward_mode = ForwardMode.EXTEND
 
     # self._prepare_chunked_input_ids(batch, all_chunked_reqs)
-    self.kv_cache_mgr.prepare_for_mixed(batch, all_extend_reqs, decode_reqs)
+    # --- overlap 路径：将 running_batch 的 placeholder metadata 透传给 prepare_for_mixed ---
+    mixed_kwargs = {}
+    if decode_reqs:
+      # Always pass seq_lens metadata so KVCacheManager can update running_batch
+      # lengths in-place (like prepare_for_decode) without any CUDA `.item()` fallbacks.
+      if self.running_batch.seq_lens is None or self.running_batch.seq_lens_cpu is None:
+        self._rebuild_running_batch_metadata()
+      mixed_kwargs["decode_seq_lens"] = self.running_batch.seq_lens
+      mixed_kwargs["decode_seq_lens_cpu"] = self.running_batch.seq_lens_cpu
+      if skip_decode_input_ids and self.running_batch.output_ids is not None:
+        mixed_kwargs["decode_input_ids"] = self.running_batch.output_ids
+    self.kv_cache_mgr.prepare_for_mixed(batch, all_extend_reqs, decode_reqs, **mixed_kwargs)
+    batch.uses_placeholder = bool("decode_input_ids" in mixed_kwargs)
 
     # 非 chunked 请求完成 prefill 后加入 running_batch
     for req in all_extend_reqs:
@@ -396,7 +400,7 @@ class Scheduler:
         self.new_token_ratio = max(self.new_token_ratio - _NTR_DECAY_STEP, _MIN_NEW_TOKEN_RATIO)
         self.num_continuous_decode_ok = 0
         if self.new_token_ratio != old_ratio:
-          logger.debug(f"new_token_ratio lowered: {old_ratio:.3f} → " f"{self.new_token_ratio:.3f}")
+          logger.debug(f"new_token_ratio lowered: {old_ratio:.3f} → {self.new_token_ratio:.3f}")
 
     if len(self.running_batch.reqs) == 0:
       return None
@@ -407,6 +411,7 @@ class Scheduler:
     self.kv_cache_mgr.prepare_for_decode(
       self.running_batch, skip_input_ids=bool(skip_decode_input_ids)
     )
+    self.running_batch.uses_placeholder = bool(skip_decode_input_ids)
     self.running_batch.forward_mode = ForwardMode.DECODE
     return self.running_batch
 
@@ -439,10 +444,7 @@ class Scheduler:
       # 回退到保守估算：最坏情况每个请求都需要新 page
       needed = bs * self.page_size
 
-    logger.debug(f"Check decode mem: available={available}, needed={needed}, " f"running_bs={bs}")
-
-    # 增加安全裕量：即使本步不需要新 page，也需要为后续几步预留
-    needed = max(needed, bs)
+    logger.debug(f"Check decode mem: available={available}, needed={needed}, running_bs={bs}")
 
     if available >= needed:
       return False
@@ -455,9 +457,9 @@ class Scheduler:
       if self.running_batch.seq_lens_cpu is not None and remaining_bs > 0:
         remaining_seq_lens = self.running_batch.seq_lens_cpu[:remaining_bs]
         remaining_pages = (remaining_seq_lens.remainder(self.page_size) == 0).sum().item()
-        remaining_needed = max(int(remaining_pages) * self.page_size, remaining_bs)
+        remaining_needed = int(remaining_pages) * self.page_size
       else:
-        remaining_needed = remaining_bs
+        remaining_needed = remaining_bs * self.page_size
 
       if available >= remaining_needed:
         break
@@ -465,7 +467,7 @@ class Scheduler:
       req = self.running_batch.reqs.pop()
       retract_count += 1
 
-      # 如果该请求在 pending_release_reqs 中（overlap 场景下 schedule 先于 process 执行），
+      # BUG Fix：如果该请求在 pending_release_reqs 中（overlap 场景下 schedule 先于 process 执行），
       # 需要先移除，避免后续 drain 时出现 req_pool_idx=-1 的异常
       if req in self.pending_release_reqs:
         self.pending_release_reqs.remove(req)
@@ -486,6 +488,9 @@ class Scheduler:
       req.last_node = None
       req.extend_input_len = 0
       req.req_pool_idx = -1  # 重置 req_pool_idx，避免读取已释放的数据
+      # 重置缓存的元数据
+      req._cached_seq_len = len(req.origin_input_ids)
+      req._cached_last_token = None
       self.waiting_queue.insert(0, req)
 
       # 更新可用量
@@ -510,26 +515,33 @@ class Scheduler:
       batch.req_pool_indices = None
       batch.seq_lens = None
       batch.seq_lens_cpu = None
+      batch.output_ids = None
       return
 
     # 从 req 上的 req_pool_idx 重建
-    pool_indices = []
-    for req in batch.reqs:
-      pool_indices.append(req.req_pool_idx)
+    # 优化：使用预分配的 tensor 和批量赋值
+    bs = len(batch.reqs)
+    device = batch.req_pool_indices.device if batch.req_pool_indices is not None else "cuda"
 
-    if pool_indices:
-      device = batch.req_pool_indices.device if batch.req_pool_indices is not None else "cuda"
-      batch.req_pool_indices = torch.tensor(pool_indices, dtype=torch.int64, device=device)
-      # seq_lens 需要从请求本身推算
-      seq_lens = [len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs]
-      batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
-      batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-    else:
-      batch.req_pool_indices = None
-      batch.seq_lens = None
-      batch.seq_lens_cpu = None
+    pool_indices = torch.empty(bs, dtype=torch.int64, device=device)
+    seq_lens = torch.empty(bs, dtype=torch.int64, device=device)
+    seq_lens_cpu = torch.empty(bs, dtype=torch.int64)
 
-  # ======================== 批次辅助方法 ========================
+    for i, req in enumerate(batch.reqs):
+      pool_indices[i] = req.req_pool_idx
+      # 使用缓存的 current_seq_len 而非重复计算
+      seq_lens[i] = req.current_seq_len
+      seq_lens_cpu[i] = req.current_seq_len
+
+    batch.req_pool_indices = pool_indices
+    batch.seq_lens = seq_lens
+    batch.seq_lens_cpu = seq_lens_cpu
+
+    # retract 从尾部 pop，output_ids 需要同步截断（存储了 future placeholder）
+    if batch.output_ids is not None:
+      batch.output_ids = batch.output_ids[: len(batch.reqs)]
+
+  # ======================== private helper function ========================
   def _update_running_batch_metadata(self, batch: ScheduledBatch, req: Req):
     """当请求从 extend batch 移到 running_batch 时同步元数据"""
     try:
@@ -580,12 +592,14 @@ class Scheduler:
       return
 
     if len(keep_indices) > 0 and batch.req_pool_indices is not None:
-      keep_indices_tensor = torch.tensor(keep_indices, device=batch.req_pool_indices.device)
+      # 优化：使用 torch.as_tensor 避免 CUDA 同步
+      keep_indices_cpu = torch.as_tensor(keep_indices, dtype=torch.int64)
+      keep_indices_tensor = keep_indices_cpu.to(batch.req_pool_indices.device, non_blocking=True)
       batch.req_pool_indices = batch.req_pool_indices[keep_indices_tensor]
       batch.seq_lens = batch.seq_lens[keep_indices_tensor]
       if batch.seq_lens_cpu is not None:
         batch.seq_lens_cpu = batch.seq_lens_cpu[keep_indices]
-      # sglang 风格：同步过滤 output_ids（存储了 future indices 占位符）
+      # BUG Fix: overlap by future map, 同步过滤 output_ids（存储了 future indices 占位符）
       if batch.output_ids is not None:
         batch.output_ids = batch.output_ids[keep_indices_tensor]
     elif len(keep_indices) == 0:
@@ -614,13 +628,19 @@ class Scheduler:
 
     next_token_ids = result.next_token_ids
     if isinstance(next_token_ids, torch.Tensor):
-      next_token_ids = next_token_ids.cpu().tolist()
+      # Avoid redundant .cpu() if already on CPU (e.g., from overlap pinned buffer)
+      if next_token_ids.device.type != "cpu":
+        logger.error(
+          "Expected next_token_ids to be on CPU, but got device: %s", next_token_ids.device
+        )
+        next_token_ids = next_token_ids.cpu()
+      next_token_ids = next_token_ids.tolist()
 
     output_texts = []
     finished_req_ids = []
     for i, req in enumerate(batch.reqs):
       token_id = next_token_ids[i]
-      req.output_ids.append(token_id)
+      req.append_output_token(token_id)
 
       delta_text, is_finished = self.incremental_decoder.decode(
         req_id=req.req_id,
@@ -691,26 +711,32 @@ class Scheduler:
         for req in to_release:
           # 防御性检查：overlap 场景下，schedule(N) 中的 retract 可能已释放并重置了
           # req_pool_idx，此时跳过，避免重复释放或无效访问
-          if int(getattr(req, "req_pool_idx", -1)) < 0:
-            logger.debug(
-              f"drain_pending_releases: skip req_id={req.req_id} with "
-              f"req_pool_idx={getattr(req, 'req_pool_idx', -1)} (already released)"
-            )
-            continue
+          # if int(getattr(req, "req_pool_idx", -1)) < 0:
+          #   logger.debug(
+          #     f"drain_pending_releases: skip req_id={req.req_id} with "
+          #     f"req_pool_idx={getattr(req, 'req_pool_idx', -1)} (already released)"
+          #   )
+          #   continue
+          assert req.req_pool_idx != -1, (
+            f"Pending release req_id={req.req_id} has invalid req_pool_idx={getattr(req, 'req_pool_idx', -1)}"
+          )
           self.kv_cache_mgr.update_finished_req_radix_cache(req)
           req.req_pool_idx = -1
       finally:
         end_group()
     else:
       for req in to_release:
-        # 防御性检查：overlap 场景下，schedule(N) 中的 retract 可能已释放并重置了
-        # req_pool_idx，此时跳过，避免重复释放或无效访问
-        if int(getattr(req, "req_pool_idx", -1)) < 0:
-          logger.debug(
-            f"drain_pending_releases: skip req_id={req.req_id} with "
-            f"req_pool_idx={getattr(req, 'req_pool_idx', -1)} (already released)"
-          )
-          continue
+        # # 防御性检查：overlap 场景下，schedule(N) 中的 retract 可能已释放并重置了
+        # # req_pool_idx，此时跳过，避免重复释放或无效访问
+        # if int(getattr(req, "req_pool_idx", -1)) < 0:
+        #   logger.debug(
+        #     f"drain_pending_releases: skip req_id={req.req_id} with "
+        #     f"req_pool_idx={getattr(req, 'req_pool_idx', -1)} (already released)"
+        #   )
+        #   continue
+        assert req.req_pool_idx != -1, (
+          f"Pending release req_id={req.req_id} has invalid req_pool_idx={getattr(req, 'req_pool_idx', -1)}"
+        )
         self.kv_cache_mgr.update_finished_req_radix_cache(req)
         req.req_pool_idx = -1
 
@@ -729,7 +755,7 @@ class Scheduler:
       f"\n{'=' * 80}\n"
       f"[Scheduler Round] KV Cache Status:\n"
       f"  Free Pages: {free_pages}/{total_pages} "
-      f"(Used: {used_pages}, {used_pages/total_pages*100:.1f}%)\n"
+      f"(Used: {used_pages}, {used_pages / total_pages * 100:.1f}%)\n"
       f"  Available Tokens: {available_tokens}\n"
       f"  Page Size: {self.page_size}\n"
       f"  Waiting Queue: {len(self.waiting_queue)} reqs\n"
@@ -752,7 +778,7 @@ class Scheduler:
       logger.debug(f"  Input IDs shape: {batch.input_ids.shape}")
 
     # 打印每个请求的详细信息
-    logger.debug(f"  Requests Details:")
+    logger.debug("  Requests Details:")
     for i, req in enumerate(batch.reqs):
       input_len = len(req.origin_input_ids)
       output_len = len(req.output_ids)

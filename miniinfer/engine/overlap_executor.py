@@ -16,9 +16,8 @@ Timeline:
 """
 
 from collections import deque
-from copy import copy
 from dataclasses import dataclass
-from typing import Optional, Callable, Any, Deque, Tuple
+from typing import Optional, Callable, Any, Deque
 import torch
 import logging
 
@@ -26,7 +25,6 @@ from miniinfer.scheduler.scheduler_batch import (
   ScheduledBatch,
   ForwardBatch,
   BatchResult,
-  ForwardMode,
 )
 from .future_map import FutureMap, FutureIndices
 
@@ -39,8 +37,11 @@ class OverlapBatchRecord:
 
   batch: ScheduledBatch
   forward_batch: ForwardBatch
-  batch_result: BatchResult
+  # Filled after sampling is launched.
+  batch_result: Optional[BatchResult] = None
   future_indices: Optional[FutureIndices] = None
+  compute_done_event: Optional[torch.cuda.Event] = None
+  sample_done_event: Optional[torch.cuda.Event] = None
   copy_done_event: Optional[torch.cuda.Event] = None
 
 
@@ -64,12 +65,17 @@ class OverlapExecutor:
                                    ↑_____ 与 forward(N-1) 真正并行 _____↑
 
       限制条件:
-          - 仅适用于连续 decode batch（batch size 相同）
-          - prefill 阶段和 prefill→decode 切换仍需走保守路径
+          - 仅首次 batch（无 running_batch）或 near-max-tokens 边界走保守路径
+          - 连续 prefill / decode / mixed 均可 overlap
 
-  保守路径（prefill 等场景）:
+  保守路径（仅首次 batch 或 near-max-tokens 边界场景）:
       process(N-1) → schedule(N) → run_batch_async(N)
       GPU 在 schedule 期间空闲。
+
+  Prefill Overlap:
+      纯 EXTEND batch 的 input_ids 全为正数（不含 placeholder），
+      但 _propagate_future_to_running_batch 会保留旧 running 请求的 future indices，
+      使下一轮 can_use_placeholder=True，实现 prefill 阶段的 overlap。
 
   使用方式:
       executor = OverlapExecutor(max_running_requests=256)
@@ -110,10 +116,12 @@ class OverlapExecutor:
       # CUDA Streams
       # - forward_stream: GPU 计算流（forward + sample）
       # - copy_stream: 异步 copy 流（D2H copy）
-      # - schedule_stream: 默认流，用于调度协调
+      # - schedule_stream: 独立调度流（用于调度侧的轻量 CUDA ops/H2D copy）
       self.forward_stream = torch.cuda.Stream(device=device)
       self.copy_stream = torch.cuda.Stream(device=device)
-      self.schedule_stream = torch.cuda.current_stream(device=device)
+      # Use a dedicated stream here (SGLang-style). Using the current/default
+      # stream can accidentally serialize with compute on some setups.
+      self.schedule_stream = torch.cuda.Stream(device=device)
 
       # Pinned CPU buffer for async D2H copy of next_token_ids
       # 使用 pinned memory 实现真正的异步 copy
@@ -236,18 +244,40 @@ class OverlapExecutor:
     Returns:
         OverlapBatchRecord 包含 batch 信息和 future
     """
-    if not self.enable_overlap:
-      # 非 overlap 模式：同步执行
-      output = model_runner.forward(forward_batch)
-      next_tokens = model_runner.sample(output.logits, forward_batch)
-      batch_result = BatchResult(logits=output.logits, next_token_ids=next_tokens)
-      return OverlapBatchRecord(
-        batch=batch,
-        forward_batch=forward_batch,
-        batch_result=batch_result,
-      )
+    # Backward-compatible wrapper: keep the old behavior (forward + sample in one call).
+    # The new overlap pipeline can split compute and sampling to allow CPU-side work
+    # (e.g., grammar vocab-mask generation) between them.
+    record = self.run_forward_async(
+      batch=batch,
+      forward_batch=forward_batch,
+      model_runner=model_runner,
+      use_placeholder=use_placeholder,
+    )
+    return self.run_sample_async(record=record, model_runner=model_runner)
 
-    # Overlap 模式：异步执行
+  def run_forward_async(
+    self,
+    batch: ScheduledBatch,
+    forward_batch: ForwardBatch,
+    model_runner: Any,
+    use_placeholder: bool = False,
+  ) -> OverlapBatchRecord:
+    """
+    Launch forward/compute on the forward stream.
+
+    This allocates FutureMap slots for the batch and writes placeholder indices to
+    `batch.output_ids` (SGLang-style), but does NOT run sampling or D2H copy.
+    """
+    if not self.enable_overlap:
+      output = model_runner.forward(forward_batch)
+      record = OverlapBatchRecord(
+        batch=self._copy_batch(batch),
+        forward_batch=forward_batch,
+        future_indices=None,
+        compute_done_event=None,
+      )
+      record.batch_result = BatchResult(logits=output.logits, next_token_ids=None)
+      return record
 
     # 分配 future 槽位用于本步的输出
     bs = len(batch.reqs)
@@ -262,7 +292,30 @@ class OverlapExecutor:
     self._last_future_indices = future_indices
     self._last_batch_size = bs
 
-    # 在 forward_stream 上执行 forward + sample
+    # ===================================================================
+    # Stream 管理（SGLang 风格）
+    #
+    # schedule_stream (默认流):
+    #   - schedule() 调度逻辑
+    #   - prepare_*() 元数据准备
+    #   - forward_batch_init() 构建 ForwardBatch
+    #   - 所有 CPU→GPU 异步传输（.to(device, non_blocking=True)）
+    #
+    # forward_stream:
+    #   - model.forward() GPU 计算
+    #   - model.sample() GPU 采样
+    #   - resolve_future_input_ids() 替换占位符
+    #
+    # copy_stream:
+    #   - D2H copy（next_tokens → CPU pinned buffer）
+    #
+    # Timeline:
+    #   schedule_stream: |-- prepare(N) --|-- prepare(N+1) --|
+    #   forward_stream:       |-- forward(N) --|-- forward(N+1) --|
+    #   copy_stream:                   |-- copy(N) --|-- copy(N+1) --|
+    # ===================================================================
+
+    # 在 forward_stream 上执行 forward（compute）
     with torch.cuda.stream(self.forward_stream):
       # 等待 schedule_stream 完成数据准备
       self.forward_stream.wait_stream(self.schedule_stream)
@@ -274,36 +327,76 @@ class OverlapExecutor:
 
       # GPU forward pass
       output = model_runner.forward(forward_batch)
+      compute_done_event = torch.cuda.Event()
+      compute_done_event.record(self.forward_stream)
 
-      # GPU sampling
-      next_tokens = model_runner.sample(output.logits, forward_batch)
-
-      # 存储结果到 FutureMap（用于下一个 batch 的 resolve_future）
-      self.future_map.store_to_map(future_indices, next_tokens)
-
-    # 使用 copy_stream 异步复制 next_token_ids 到 CPU pinned memory
-    # 这允许 forward(N+1) 与 copy(N) 并行
-    with torch.cuda.stream(self.copy_stream):
-      # copy_stream 等待 forward_stream 完成 sample
-      self.copy_stream.wait_stream(self.forward_stream)
-
-      # 异步 D2H copy 到 pinned buffer
-      cpu_next_tokens = self.cpu_next_token_ids_buf[:bs].copy_(next_tokens, non_blocking=True)
-
-      # 记录 copy 完成事件（不是 forward 完成！）
-      copy_done_event = torch.cuda.Event()
-      copy_done_event.record(self.copy_stream)
-
-    # 创建 batch 记录，存储 CPU tensor 引用
-    # 注意：cpu_next_tokens 是 pinned buffer 的 view，需要 clone 后才能多次使用
-    batch_result = BatchResult(logits=output.logits, next_token_ids=cpu_next_tokens)
     record = OverlapBatchRecord(
       batch=self._copy_batch(batch),  # 复制 batch 防止引用问题
       forward_batch=forward_batch,
-      batch_result=batch_result,
+      batch_result=BatchResult(logits=output.logits, next_token_ids=None),
       future_indices=future_indices,
-      copy_done_event=copy_done_event,
+      compute_done_event=compute_done_event,
     )
+    return record
+
+  def run_sample_async(
+    self,
+    record: OverlapBatchRecord,
+    model_runner: Any,
+    *,
+    vocab_mask: Optional[torch.Tensor] = None,
+  ) -> OverlapBatchRecord:
+    """
+    Launch sampling on the forward stream after forward/compute.
+
+    This writes sampled next_token_ids into FutureMap, then performs an async D2H copy
+    into a pinned CPU buffer on the copy stream, finally enqueuing the record for CPU
+    post-processing.
+    """
+    if record.batch is None or record.forward_batch is None:
+      raise ValueError("run_sample_async requires a valid OverlapBatchRecord")
+
+    # Non-overlap mode: run sampling synchronously and return a ready record.
+    if not self.enable_overlap:
+      logits = None if record.batch_result is None else record.batch_result.logits
+      if logits is None:
+        raise RuntimeError("Non-overlap run_sample_async requires logits in record.batch_result")
+      next_tokens = model_runner.sample(logits, record.forward_batch, vocab_mask=vocab_mask)
+      record.batch_result = BatchResult(logits=logits, next_token_ids=next_tokens)
+      return record
+
+    if record.future_indices is None:
+      raise RuntimeError("Overlap run_sample_async requires record.future_indices")
+
+    bs = len(record.batch.reqs)
+
+    # Launch sampling (and store to FutureMap) on forward_stream.
+    with torch.cuda.stream(self.forward_stream):
+      # Ensure any sampling metadata transfers (e.g., vocab_mask) on schedule_stream complete.
+      self.forward_stream.wait_stream(self.schedule_stream)
+      if record.compute_done_event is not None:
+        self.forward_stream.wait_event(record.compute_done_event)
+
+      logits = None if record.batch_result is None else record.batch_result.logits
+      if logits is None:
+        raise RuntimeError("run_sample_async called without logits (did run_forward_async run?)")
+
+      next_tokens = model_runner.sample(logits, record.forward_batch, vocab_mask=vocab_mask)
+      self.future_map.store_to_map(record.future_indices, next_tokens)
+      sample_done_event = torch.cuda.Event()
+      sample_done_event.record(self.forward_stream)
+
+    # Async copy next_token_ids to CPU pinned memory on copy_stream.
+    with torch.cuda.stream(self.copy_stream):
+      self.copy_stream.wait_event(sample_done_event)
+      cpu_next_tokens = self.cpu_next_token_ids_buf[:bs].copy_(next_tokens, non_blocking=True)
+      copy_done_event = torch.cuda.Event()
+      copy_done_event.record(self.copy_stream)
+
+    # Update record and enqueue for CPU post-processing.
+    record.sample_done_event = sample_done_event
+    record.copy_done_event = copy_done_event
+    record.batch_result = BatchResult(logits=logits, next_token_ids=cpu_next_tokens)
 
     # 保持引用存活
     self.batch_record_buf[self.batch_record_idx] = record
@@ -311,6 +404,38 @@ class OverlapExecutor:
 
     # 加入待处理队列
     self.result_queue.append(record)
+
+    return record
+
+  def pop_and_sync_pending(self) -> Optional[OverlapBatchRecord]:
+    """
+    从队列取出一个 batch 并同步 copy 事件（不调用回调）
+
+    仅做最小 GPU 同步：等待 D2H copy 完成并 clone pinned buffer。
+    返回 record 供调用方分阶段处理。
+
+    Returns:
+        OverlapBatchRecord 或 None（队列为空）
+    """
+    if not self.result_queue:
+      return None
+
+    record = self.result_queue.popleft()
+    if record.batch_result is None:
+      raise RuntimeError(
+        "OverlapExecutor internal error: pending record has no batch_result. "
+        "Did you enqueue it before sampling completed?"
+      )
+
+    # 等待 copy 完成（不是等待 forward 完成！）
+    # copy 操作很快，这个等待通常几乎不阻塞
+    if record.copy_done_event is not None:
+      record.copy_done_event.synchronize()
+
+    # 将 pinned buffer 中的数据 clone 成独立 tensor
+    # 因为下一个 batch 可能覆盖 pinned buffer
+    if record.batch_result.next_token_ids is not None:
+      record.batch_result.next_token_ids = record.batch_result.next_token_ids.clone()
 
     return record
 
@@ -330,20 +455,9 @@ class OverlapExecutor:
     Returns:
         process_func 的返回值，或 None 如果队列为空
     """
-    if not self.result_queue:
+    record = self.pop_and_sync_pending()
+    if record is None:
       return None
-
-    record = self.result_queue.popleft()
-
-    # 等待 copy 完成（不是等待 forward 完成！）
-    # copy 操作很快，这个等待通常几乎不阻塞
-    if record.copy_done_event is not None:
-      record.copy_done_event.synchronize()
-
-    # 将 pinned buffer 中的数据 clone 成独立 tensor
-    # 因为下一个 batch 可能覆盖 pinned buffer
-    if record.batch_result.next_token_ids is not None:
-      record.batch_result.next_token_ids = record.batch_result.next_token_ids.clone()
 
     # 调用处理函数
     return process_func(record.batch, record.batch_result)
@@ -375,6 +489,7 @@ class OverlapExecutor:
       device=batch.device,
       input_ids=batch.input_ids,
       output_ids=batch.output_ids,
+      uses_placeholder=getattr(batch, "uses_placeholder", False),
       req_pool_indices=batch.req_pool_indices,
       out_cache_loc=batch.out_cache_loc,
       seq_lens=batch.seq_lens,

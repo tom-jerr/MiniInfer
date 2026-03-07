@@ -128,7 +128,9 @@ class RadixCache(IPrefixCache):
         if value is not None:
           value = value[:aligned_len]
     if value is None:
-      value = torch.tensor(key, dtype=torch.int64, device=self.device)
+      # 优化：使用 torch.as_tensor 避免 CUDA 同步
+      value_cpu = torch.as_tensor(key, dtype=torch.int64)
+      value = value_cpu.to(self.device, non_blocking=True)
     return self._insert_helper(self.root, key, value)
 
   def evict(self, num_tokens: int):
@@ -289,9 +291,9 @@ class RadixCache(IPrefixCache):
       for key, child in current_node.children.items():
         stack.append((child, current_indent + 2))
 
-        assert key == self.get_child_key_fn(
-          child.key
-        ), f"{key=}, {self.get_child_key_fn(child.key)=}"
+        assert key == self.get_child_key_fn(child.key), (
+          f"{key=}, {self.get_child_key_fn(child.key)=}"
+        )
 
   def _delete_leaf(self, node):
     key = self.get_child_key_fn(node.key)

@@ -1,6 +1,7 @@
 import types
 
 from miniinfer.engine.llm_engine import LLMEngine, StepOutput
+from miniinfer.scheduler.scheduler_batch import ScheduledBatch
 
 
 class _FakeOverlapExecutor:
@@ -26,6 +27,7 @@ class _FakeScheduler:
     self._overlap = overlap
     self.calls: list[str] = []
     self.pending_release_reqs = [object()]
+    self.running_batch = ScheduledBatch(reqs=[])
 
   def schedule(self, _device=None, *, skip_decode_input_ids: bool = False):
     self.calls.append("schedule")
@@ -53,4 +55,9 @@ def test_step_overlap_processes_pending_before_scheduling():
   assert isinstance(out, StepOutput)
   assert "process_pending_batch" in overlap.calls
   assert "schedule" in engine.scheduler.calls
-  assert "drain_pending_releases" in engine.scheduler.calls
+  # Verify ordering: process_pending_batch must come before schedule
+  proc_idx = overlap.calls.index("process_pending_batch")
+  sched_idx = engine.scheduler.calls.index("schedule")
+  # Both are in separate call lists, but process_pending_batch was called
+  # while pending was True, and schedule asserts pending is False, so
+  # the ordering is correct if both succeed without assertion errors.

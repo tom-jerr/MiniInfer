@@ -14,7 +14,6 @@ Future Placeholder 机制：
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
 import torch
 import logging
 
@@ -147,22 +146,32 @@ class FutureMap:
         input_ids: 可能包含占位符的 input_ids [batch_size]
 
     Returns:
-        resolved_ids: 替换后的 input_ids [batch_size]
+        resolved_ids: 替换后的 input_ids（in-place；返回同一个 tensor 引用）
     """
-    # 找出负数位置（占位符）
-    is_placeholder = input_ids < 0
+    if input_ids is None:
+      return input_ids
+    if input_ids.numel() == 0:
+      return input_ids
+    if input_ids.device != self.token_ids_buf.device:
+      raise RuntimeError(
+        "FutureMap.resolve_future_input_ids: device mismatch: "
+        f"input_ids.device={input_ids.device}, token_ids_buf.device={self.token_ids_buf.device}"
+      )
 
-    if not is_placeholder.any():
-      # 没有占位符，直接返回
+    # Find placeholder positions (negative ids) and replace only those.
+    # NOTE: Do NOT call `.any().item()` here (it would introduce a device sync).
+    is_placeholder = input_ids < 0
+    placeholder_ids = input_ids[is_placeholder]
+    if placeholder_ids.numel() == 0:
       return input_ids
 
-    # 从 buffer 读取真实 token
-    # placeholder = -future_index，所以 future_index = -placeholder
-    future_indices = torch.clamp(-input_ids, min=0)
-    resolved_tokens = self.token_ids_buf[future_indices]
+    # placeholder = -future_index (1-based). Convert to indices and clamp to buffer range defensively.
+    future_indices = (-placeholder_ids).to(torch.int64)
+    future_indices.clamp_(0, self.token_ids_buf.numel() - 1)
 
-    # 替换占位符
-    return torch.where(is_placeholder, resolved_tokens, input_ids)
+    # In-place writeback: avoids allocating a full-size output tensor (vs torch.where).
+    input_ids[is_placeholder] = self.token_ids_buf[future_indices]
+    return input_ids
 
   def resolve_future(
     self,

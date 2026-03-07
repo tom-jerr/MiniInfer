@@ -7,6 +7,9 @@ import torch
 from dataclasses import dataclass
 from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -60,9 +63,17 @@ class FlashAttention3Backend(AttentionBackend):
         cache_seqlens = torch.clamp(cache_seqlens - 1, min=0)
       metadata.cache_seqlens_int32 = cache_seqlens
       # Use precomputed max_seq_len from CPU to avoid GPU sync
-      metadata.max_seq_len_k = (
-        forward_batch.max_seq_len if forward_batch.max_seq_len else int(cache_seqlens.max().item())
-      )
+      metadata.max_seq_len_k = forward_batch.max_seq_len
+      if metadata.max_seq_len_k is None:
+        # Fallback: compute from CPU tensor if available, else GPU tensor
+        if forward_batch.seq_lens_cpu is not None:
+          metadata.max_seq_len_k = int(forward_batch.seq_lens_cpu.max())
+        else:
+          raise RuntimeError(
+            "FlashAttention3Backend.init_forward_metadata: missing CPU-side seq_lens metadata "
+            "(forward_batch.max_seq_len / forward_batch.seq_lens_cpu). "
+            "Refusing to fall back to CUDA `.item()` which would sync and break overlap."
+          )
       metadata.cu_seqlen_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
       metadata.cu_seqlen_k = torch.nn.functional.pad(
         torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
@@ -71,11 +82,18 @@ class FlashAttention3Backend(AttentionBackend):
     else:
       metadata.cache_seqlens_int32 = seqlens_int32
       # Use precomputed max_seq_len from CPU to avoid GPU sync
-      metadata.max_seq_len_q = (
-        forward_batch.max_seq_len
-        if forward_batch.max_seq_len
-        else int(forward_batch.seq_lens.max().item())
-      )
+      metadata.max_seq_len_q = forward_batch.max_seq_len
+      if metadata.max_seq_len_q is None:
+        # Fallback: compute from CPU tensor if available, else GPU tensor
+        if forward_batch.seq_lens_cpu is not None:
+          metadata.max_seq_len_q = int(forward_batch.seq_lens_cpu.max())
+        else:
+          raise RuntimeError(
+            "FlashAttention3Backend.init_forward_metadata: missing CPU-side seq_lens metadata "
+            "(forward_batch.max_seq_len / forward_batch.seq_lens_cpu). "
+            "Refusing to fall back to CUDA `.item()` which would sync and break overlap."
+          )
+
       metadata.max_seq_len_k = metadata.max_seq_len_q
       metadata.cu_seqlens_q = torch.nn.functional.pad(
         torch.cumsum(seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
@@ -276,9 +294,16 @@ class FlashAttention2Backend(AttentionBackend):
         cache_seqlens = torch.clamp(cache_seqlens - 1, min=0)
       metadata.cache_seqlens_int32 = cache_seqlens
       # Use precomputed max_seq_len from CPU to avoid GPU sync
-      metadata.max_seq_len_k = (
-        forward_batch.max_seq_len if forward_batch.max_seq_len else int(cache_seqlens.max().item())
-      )
+      metadata.max_seq_len_k = forward_batch.max_seq_len
+      if metadata.max_seq_len_k is None:
+        if forward_batch.seq_lens_cpu is not None:
+          metadata.max_seq_len_k = int(forward_batch.seq_lens_cpu.max())
+        else:
+          raise RuntimeError(
+            "FlashAttention2Backend.init_forward_metadata: missing CPU-side seq_lens metadata "
+            "(forward_batch.max_seq_len / forward_batch.seq_lens_cpu). "
+            "Refusing to fall back to CUDA `.item()` which would sync and break overlap."
+          )
       # Note: For decode, each sequence has seqlen_q=1
       metadata.max_seq_len_q = 1
       metadata.cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
@@ -289,11 +314,16 @@ class FlashAttention2Backend(AttentionBackend):
     else:
       metadata.cache_seqlens_int32 = seqlens_int32
       # Use precomputed max_seq_len from CPU to avoid GPU sync
-      metadata.max_seq_len_q = (
-        forward_batch.max_seq_len
-        if forward_batch.max_seq_len
-        else int(forward_batch.seq_lens.max().item())
-      )
+      metadata.max_seq_len_q = forward_batch.max_seq_len
+      if metadata.max_seq_len_q is None:
+        if forward_batch.seq_lens_cpu is not None:
+          metadata.max_seq_len_q = int(forward_batch.seq_lens_cpu.max())
+        else:
+          raise RuntimeError(
+            "FlashAttention2Backend.init_forward_metadata: missing CPU-side seq_lens metadata "
+            "(forward_batch.max_seq_len / forward_batch.seq_lens_cpu). "
+            "Refusing to fall back to CUDA `.item()` which would sync and break overlap."
+          )
       metadata.max_seq_len_k = metadata.max_seq_len_q
       metadata.cu_seqlens_q = torch.nn.functional.pad(
         torch.cumsum(seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
@@ -305,9 +335,11 @@ class FlashAttention2Backend(AttentionBackend):
       if forward_batch.extend_prefix_lens_cpu and any(forward_batch.extend_prefix_lens_cpu):
         extend_seq_lens = forward_batch.extend_seq_lens
         if not isinstance(extend_seq_lens, torch.Tensor):
-          extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32, device=device)
+          # 优化：使用 torch.as_tensor 避免 CUDA 同步
+          extend_seq_lens_cpu = torch.as_tensor(extend_seq_lens, dtype=torch.int32)
+          extend_seq_lens = extend_seq_lens_cpu.to(device, non_blocking=True)
         else:
-          extend_seq_lens = extend_seq_lens.to(device=device, dtype=torch.int32)
+          extend_seq_lens = extend_seq_lens.to(device=device, dtype=torch.int32, non_blocking=True)
         metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
         metadata.cu_seqlens_q = torch.nn.functional.pad(
           torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
@@ -394,7 +426,7 @@ class FlashAttention2Backend(AttentionBackend):
     # Debug: print shapes for first layer
     debug_decode = getattr(forward_batch, "debug_decode", False) and layer.layer_id == 0
     if debug_decode:
-      print(f"\n[FA2 forward_decode layer 0]")
+      print("\n[FA2 forward_decode layer 0]")
       print(f"  q shape: {q.shape}")
       print(f"  k shape: {k.shape}")
       print(f"  batch_size: {forward_batch.batch_size}")

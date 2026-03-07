@@ -55,7 +55,12 @@ def get_kv_cache_bytes_per_token(
   KV cache size = 2 (K + V) × num_layers × num_kv_heads × head_dim × dtype_size
   """
   dtype_size = torch.tensor([], dtype=config.dtype).element_size()
-  head_dim = config.hf_config.hidden_size // config.hf_config.num_attention_heads
+  # Qwen3 等模型有独立的 head_dim 配置，优先使用
+  head_dim = getattr(
+    config.hf_config,
+    "head_dim",
+    config.hf_config.hidden_size // config.hf_config.num_attention_heads,
+  )
   bytes_per_token = (
     2
     * config.hf_config.num_hidden_layers

@@ -10,10 +10,8 @@ Incremental Streaming Decoder - 增量流式解码器
 3. UTF-8 边界处理：通过 valid char 检测处理 byte-fallback token 的不完整序列
 """
 
-from typing import Dict, List, Optional, Tuple, Any, Callable, Union
+from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field
-from functools import lru_cache
-import hashlib
 
 
 # Replacement character for invalid UTF-8 sequences

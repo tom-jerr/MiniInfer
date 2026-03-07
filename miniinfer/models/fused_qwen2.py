@@ -105,7 +105,7 @@ class Qwen2MLP(nn.Module, WeightLoaderMixin):
     self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
     # TODO(lzy): only support silu for now
     if hidden_act != "silu":
-      raise ValueError(f"Unsupported activation: {hidden_act}. " "Only silu is supported for now.")
+      raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
     # SiluAndMul is a function, not a class
     self.act_fn = SiluAndMul
 
@@ -347,17 +347,19 @@ class Qwen2ForCausalLM(nn.Module, WeightLoaderMixin):
           for length in extend_lens:
             last_token_indices.append(cumsum + int(length) - 1)
             cumsum += int(length)
-          hidden_states_for_logits = hidden_states[
-            torch.tensor(last_token_indices, device=hidden_states.device, dtype=torch.int64)
-          ]
+          # 优化：使用 torch.as_tensor 避免 CUDA 同步
+          idx_cpu = torch.as_tensor(last_token_indices, dtype=torch.int64)
+          idx = idx_cpu.to(hidden_states.device, non_blocking=True)
+          hidden_states_for_logits = hidden_states[idx]
         elif hidden_states.dim() == 3:
           # hidden_states: [batch, seq, hidden]
           bsz = hidden_states.size(0)
-          idx = torch.tensor(
+          # 优化：使用 torch.as_tensor 避免 CUDA 同步
+          idx_cpu = torch.as_tensor(
             [int(l) - 1 for l in extend_lens[:bsz]],
-            device=hidden_states.device,
             dtype=torch.int64,
-          ).clamp_min_(0)
+          )
+          idx = idx_cpu.to(hidden_states.device, non_blocking=True).clamp_min_(0)
           hidden_states_for_logits = hidden_states[torch.arange(bsz, device=idx.device), idx]
 
     logits = self.lm_head(hidden_states_for_logits)

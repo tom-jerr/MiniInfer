@@ -7,7 +7,7 @@ Qwen3 模型实现（融合 QKV/Gate-Up 投影）
 3. QK-Norm: 在 RoPE 之前对 Q/K 进行 per-head RMSNorm
 """
 
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from miniinfer.scheduler.scheduler_batch import ForwardBatch
 
@@ -15,17 +15,12 @@ from .base import BaseModelOutput
 import torch
 import torch.nn as nn
 from kernels.triton.silu_mul import SiluAndMul
-from miniinfer.layers.attention import AttentionImpl
-
 from miniinfer.layers import (
   AttentionImpl,
   LMHead,
   RMSNorm,
   RotaryEmbedding,
   VocabEmbedding,
-  get_activation,
-  get_attention,
-  linear,
 )
 from miniinfer.config.model.qwen3 import Qwen3Config
 from miniinfer.loader.weight import WeightLoaderMixin
@@ -340,7 +335,7 @@ class Qwen3ForCausalLM(nn.Module, WeightLoaderMixin):
         elif hidden_states.dim() == 3:
           bsz = hidden_states.size(0)
           idx = torch.tensor(
-            [int(l) - 1 for l in extend_lens[:bsz]],
+            [int(length) - 1 for length in extend_lens[:bsz]],
             device=hidden_states.device,
             dtype=torch.int64,
           ).clamp_min_(0)

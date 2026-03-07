@@ -13,6 +13,13 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 sys.path.insert(0, "/MiniInfer-ws/MiniInfer")
+import logging
+
+logging.basicConfig(
+  level=logging.WARNING,
+  format="%(asctime)s %(levelname)s %(name)s:%(lineno)d - %(message)s",
+  force=True,  # Python 3.8+：确保生效（避免被别的库提前配置）
+)
 
 
 # 定义测试用的 RequestOutput 类（避免循环导入）
@@ -174,7 +181,7 @@ class StreamOutputFormatter:
 
     print("\n" + "-" * 60)
     print(
-      f"Total: {self.total_tokens} tokens in {elapsed:.2f}s ({self.total_tokens/elapsed:.1f} tok/s)"
+      f"Total: {self.total_tokens} tokens in {elapsed:.2f}s ({self.total_tokens / elapsed:.1f} tok/s)"
     )
     print("=" * 60)
 
@@ -345,7 +352,7 @@ def test_generate_with_engine(model_path: str):
     total_tokens += len(result["token_ids"])
 
   print("\n" + "-" * 60)
-  print(f"Total: {total_tokens} tokens in {elapsed:.2f}s ({total_tokens/elapsed:.1f} tok/s)")
+  print(f"Total: {total_tokens} tokens in {elapsed:.2f}s ({total_tokens / elapsed:.1f} tok/s)")
   print("=" * 60)
 
   engine.stop()

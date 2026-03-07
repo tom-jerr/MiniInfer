@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import Optional, List
+from typing import Optional, List, ClassVar
 from layers.attention_backend.base_backend import AttentionBackend
 import torch
 from itertools import count
@@ -79,6 +79,12 @@ class Req:
     self.chunked_prefill_len = 0  # 当前 chunk 已经处理的长度
     self.total_input_len = len(token_ids)  # 总输入长度
 
+    # ============ cached metadata for performance ============
+    # 缓存当前序列长度，避免重复计算 len(origin_input_ids) + len(output_ids)
+    self._cached_seq_len = len(token_ids)
+    # 缓存最后的 output token，避免重复访问 output_ids[-1]
+    self._cached_last_token = None
+
   @property
   def remaining_prefill_len(self) -> int:
     """剩余需要 prefill 的长度"""
@@ -87,6 +93,26 @@ class Req:
   def is_prefill_complete(self) -> bool:
     """检查 prefill 是否完成"""
     return self.chunked_prefill_len + self.cache_protected_len >= self.total_input_len
+
+  @property
+  def current_seq_len(self) -> int:
+    """获取当前序列长度（缓存）"""
+    return self._cached_seq_len
+
+  def append_output_token(self, token_id: int):
+    """追加输出 token 并更新缓存"""
+    self.output_ids.append(token_id)
+    self._cached_seq_len += 1
+    self._cached_last_token = token_id
+
+  def get_last_token(self) -> Optional[int]:
+    """获取最后一个 token（优先使用缓存）"""
+    if self._cached_last_token is not None:
+      return self._cached_last_token
+    if len(self.output_ids) > 0:
+      self._cached_last_token = self.output_ids[-1]
+      return self._cached_last_token
+    return None
 
 
 class ChunkedReq:
@@ -161,6 +187,9 @@ class ScheduledBatch:
   # ============ model forward related ============
   input_ids: torch.Tensor = None
   output_ids: torch.Tensor = None
+  # True when this batch's input_ids contains FutureMap placeholders (negative ids)
+  # and must be resolved on the forward stream before model forward.
+  uses_placeholder: bool = False
 
   # =========== kv cache related ============
   req_pool_indices: torch.Tensor = None
@@ -229,6 +258,21 @@ class ForwardBatch:
   sampling_top_ks: Optional[torch.Tensor] = None
   # CPU-side metadata to avoid GPU->CPU sync in sampling.
   sampling_max_top_k: Optional[int] = None
+  # Optional device-side indices of the last token per sequence in an EXTEND/MIXED
+  # logits tensor of shape [total_tokens, vocab_size]. Built on CPU and transferred
+  # via pinned buffer to avoid per-step GPU allocations/copies.
+  last_token_indices: Optional[torch.Tensor] = None
+
+  # ============ Pinned Memory Buffer Pool (类级别，所有实例共享) ============
+  # 用于高效的 sampling params 异步传输（SGLang 风格优化）
+  _pinned_temperatures: ClassVar[Optional[torch.Tensor]] = None
+  _pinned_top_ps: ClassVar[Optional[torch.Tensor]] = None
+  _pinned_top_ks: ClassVar[Optional[torch.Tensor]] = None
+  _pinned_extend_lens: ClassVar[Optional[torch.Tensor]] = None
+  _pinned_extend_prefix_lens: ClassVar[Optional[torch.Tensor]] = None
+  _pinned_last_token_indices: ClassVar[Optional[torch.Tensor]] = None
+  _max_buffer_size: ClassVar[int] = 256  # 默认最大 batch size
+
   # ============ some metadata for k ============
   seq_lens: torch.Tensor = None
   # Pre-converted int32 version to avoid GPU dtype conversion overhead
@@ -249,14 +293,38 @@ class ForwardBatch:
   extend_seq_lens_cpu: Optional[List[int]] = None
 
   @classmethod
+  def _ensure_pinned_buffers(cls, max_bs: int):
+    """确保 pinned memory buffers 已初始化（SGLang 风格优化）"""
+    if cls._pinned_temperatures is None or max_bs > cls._max_buffer_size:
+      cls._max_buffer_size = max(max_bs, cls._max_buffer_size)
+      cls._pinned_temperatures = torch.empty(
+        cls._max_buffer_size, dtype=torch.float32, pin_memory=True
+      )
+      cls._pinned_top_ps = torch.empty(cls._max_buffer_size, dtype=torch.float32, pin_memory=True)
+      cls._pinned_top_ks = torch.empty(cls._max_buffer_size, dtype=torch.int64, pin_memory=True)
+      cls._pinned_extend_lens = torch.empty(
+        cls._max_buffer_size, dtype=torch.int64, pin_memory=True
+      )
+      cls._pinned_extend_prefix_lens = torch.empty(
+        cls._max_buffer_size, dtype=torch.int64, pin_memory=True
+      )
+      cls._pinned_last_token_indices = torch.empty(
+        cls._max_buffer_size, dtype=torch.int64, pin_memory=True
+      )
+
+  @classmethod
   def init_new(cls, batch: ScheduledBatch, attn_backend: Optional[AttentionBackend] = None):
     # Compute max_seq_len from CPU tensor to avoid GPU sync
+    # 优化：直接从 CPU tensor 取值，避免 .item() 的潜在同步
     max_seq_len = None
     if batch.seq_lens_cpu is not None:
-      max_seq_len = int(batch.seq_lens_cpu.max().item())
+      max_seq_len = int(batch.seq_lens_cpu.max())
 
     # Pre-convert seq_lens to int32 to avoid repeated conversions in FA backends
-    seq_lens_int32 = batch.seq_lens.to(torch.int32) if batch.seq_lens is not None else None
+    # 优化：使用 non_blocking=True 避免同步
+    seq_lens_int32 = (
+      batch.seq_lens.to(torch.int32, non_blocking=True) if batch.seq_lens is not None else None
+    )
 
     forward_batch = cls(
       forward_mode=batch.forward_mode,
@@ -274,40 +342,59 @@ class ForwardBatch:
 
     # Pre-build per-sequence sampling params on the target device.
     # This avoids repeatedly converting Python lists to tensors inside ModelRunner.sample().
+    # 优化：使用预分配的 pinned memory buffer 进行零拷贝异步传输（SGLang 风格）
     if batch.reqs:
       dev = batch.device if batch.device is not None else batch.input_ids.device
+      bs = len(batch.reqs)
+
+      # 确保 pinned buffer 已初始化
+      cls._ensure_pinned_buffers(bs)
+
       # Compute max_top_k on CPU to avoid `.item()` sync in batched top-k.
       # Ensure it's always >= 1 so top-k path can safely run even when empty.
       forward_batch.sampling_max_top_k = max(
         1, max((int(r.sampling_params.top_k) for r in batch.reqs), default=0)
       )
-      forward_batch.sampling_temperatures = torch.tensor(
-        [r.sampling_params.temperature for r in batch.reqs],
-        device=dev,
-        dtype=torch.float32,
-      )
-      forward_batch.sampling_top_ps = torch.tensor(
-        [r.sampling_params.top_p for r in batch.reqs],
-        device=dev,
-        dtype=torch.float32,
-      )
-      forward_batch.sampling_top_ks = torch.tensor(
-        [r.sampling_params.top_k for r in batch.reqs],
-        device=dev,
-        dtype=torch.int64,
-      )
+
+      # 提取 sampling params 到 pinned buffer（在 CPU 上操作，无 GPU sync）
+      temps = [r.sampling_params.temperature for r in batch.reqs]
+      top_ps = [r.sampling_params.top_p for r in batch.reqs]
+      top_ks = [r.sampling_params.top_k for r in batch.reqs]
+
+      cls._pinned_temperatures[:bs] = torch.as_tensor(temps, dtype=torch.float32)
+      cls._pinned_top_ps[:bs] = torch.as_tensor(top_ps, dtype=torch.float32)
+      cls._pinned_top_ks[:bs] = torch.as_tensor(top_ks, dtype=torch.int64)
+
+      # 异步传输到 GPU（真正的零拷贝，无临时 buffer）
+      forward_batch.sampling_temperatures = cls._pinned_temperatures[:bs].to(dev, non_blocking=True)
+      forward_batch.sampling_top_ps = cls._pinned_top_ps[:bs].to(dev, non_blocking=True)
+      forward_batch.sampling_top_ks = cls._pinned_top_ks[:bs].to(dev, non_blocking=True)
 
     if batch.forward_mode.is_extend():
       # forward_batch.extend_num_tokens = batch.input_ids.shape[0]
       extend_lens_cpu = batch.extend_lens or []
       total_extend_tokens = int(sum(extend_lens_cpu)) if extend_lens_cpu else 0
 
-      forward_batch.extend_seq_lens = torch.tensor(
-        extend_lens_cpu, dtype=torch.int64, device=batch.device
+      dev = batch.device if batch.device is not None else batch.input_ids.device
+      bs = len(batch.reqs)
+      cls._ensure_pinned_buffers(bs)
+
+      # H2D extend lens/prefix lens via pinned buffers on the current CUDA stream
+      cls._pinned_extend_lens[:bs] = torch.as_tensor(extend_lens_cpu, dtype=torch.int64)
+      cls._pinned_extend_prefix_lens[:bs] = torch.as_tensor(batch.prefix_lens or [], dtype=torch.int64)
+      forward_batch.extend_seq_lens = cls._pinned_extend_lens[:bs].to(dev, non_blocking=True)
+      forward_batch.extend_prefix_lens = cls._pinned_extend_prefix_lens[:bs].to(
+        dev, non_blocking=True
       )
-      forward_batch.extend_prefix_lens = torch.tensor(
-        batch.prefix_lens or [], dtype=torch.int64, device=batch.device
-      )
+
+      # Precompute last token indices for sampling from [total_tokens, vocab] logits
+      # without per-step GPU tensor allocations.
+      if total_extend_tokens > 0:
+        cumsum = torch.cumsum(cls._pinned_extend_lens[:bs], dim=0, dtype=torch.int64)
+        cls._pinned_last_token_indices[:bs] = torch.clamp(cumsum - 1, min=0)
+        forward_batch.last_token_indices = cls._pinned_last_token_indices[:bs].to(
+          dev, non_blocking=True
+        )
       forward_batch.extend_prefix_lens_cpu = batch.prefix_lens
       forward_batch.extend_seq_lens_cpu = extend_lens_cpu
       # positions and start loc for extend
@@ -338,19 +425,6 @@ class ForwardBatch:
 class BatchResult:
   logits: torch.Tensor
   next_token_ids: torch.Tensor
-
-
-def compute_position_torch(extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor):
-  positions = torch.cat(
-    [
-      torch.arange(prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device)
-      for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
-    ],
-    axis=0,
-  )
-  # extend_start_loc = torch.zeros_like(extend_seq_lens)
-  # extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-  return positions.to(torch.int64)
 
 
 def compute_positions_extend(

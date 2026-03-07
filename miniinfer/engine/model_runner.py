@@ -7,14 +7,12 @@ ModelRunner - 模型推理执行器
 3. 采样生成 token
 """
 
-from typing import List, Optional, Tuple, Any
+from typing import Any
 from models.base import BaseModelOutput
 import torch
-import torch.nn as nn
-from transformers import AutoModelForCausalLM
 
 from config.engine.config import EngineConfig
-from miniinfer.scheduler.scheduler_batch import ForwardBatch, ForwardMode
+from miniinfer.scheduler.scheduler_batch import ForwardBatch
 from loader.weight import load_hf_weight
 from config.model.qwen2 import Qwen2Config
 from config.model.qwen3 import Qwen3Config
@@ -178,14 +176,12 @@ class ModelRunner:
 
     if self.attn_backend is None:
       raise RuntimeError(
-        "Attention backend not initialized. "
-        "Call set_kv_cache_mgr() first before init_cuda_graph()."
+        "Attention backend not initialized. Call set_kv_cache_mgr() first before init_cuda_graph()."
       )
 
     if self.kv_cache_mgr is None:
       raise RuntimeError(
-        "KV cache manager not initialized. "
-        "Call set_kv_cache_mgr() first before init_cuda_graph()."
+        "KV cache manager not initialized. Call set_kv_cache_mgr() first before init_cuda_graph()."
       )
 
     logger.info(
@@ -213,6 +209,8 @@ class ModelRunner:
     self,
     logits: torch.Tensor,
     batch: ForwardBatch,
+    *,
+    vocab_mask: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """
     采样生成 token
@@ -234,19 +232,37 @@ class ModelRunner:
       if logits.size(0) == batch.batch_size:
         logits_for_sampling = logits
       else:
-        extend_lens = batch.extend_seq_lens_cpu or []
-        last_token_indices = []
-        cumsum = 0
-        for length in extend_lens:
-          last_token_indices.append(cumsum + int(length) - 1)
-          cumsum += int(length)
-        last_token_indices = torch.tensor(
-          last_token_indices, device=logits.device, dtype=torch.int64
-        )
-        logits_for_sampling = logits[last_token_indices]
+        # Prefer precomputed device-side indices built during ForwardBatch.init_new()
+        # (on schedule_stream via pinned buffers) to avoid per-step GPU allocations/H2D copies.
+        last_idx = getattr(batch, "last_token_indices", None)
+        if last_idx is None:
+          extend_lens = batch.extend_seq_lens_cpu or []
+          last_token_indices = []
+          cumsum = 0
+          for length in extend_lens:
+            last_token_indices.append(cumsum + int(length) - 1)
+            cumsum += int(length)
+          last_idx = torch.as_tensor(last_token_indices, dtype=torch.int64).to(
+            logits.device, non_blocking=True
+          )
+        logits_for_sampling = logits[last_idx]
     else:
       # decode 模式下，每个序列只有一个 token，logits 已经是 [batch_size, vocab_size]
       logits_for_sampling = logits
+
+    if vocab_mask is not None:
+      if not isinstance(vocab_mask, torch.Tensor):
+        vocab_mask = torch.as_tensor(vocab_mask)
+      if vocab_mask.dtype != torch.bool:
+        vocab_mask = vocab_mask.to(torch.bool)
+      if vocab_mask.device != logits_for_sampling.device:
+        vocab_mask = vocab_mask.to(logits_for_sampling.device, non_blocking=True)
+      if vocab_mask.shape != logits_for_sampling.shape:
+        raise ValueError(
+          "vocab_mask shape mismatch: "
+          f"mask={tuple(vocab_mask.shape)} logits={tuple(logits_for_sampling.shape)}"
+        )
+      logits_for_sampling = logits_for_sampling.masked_fill(~vocab_mask, float("-inf"))
 
     # Use pre-built sampling params from ForwardBatch to avoid per-step H2D
     temps = getattr(batch, "sampling_temperatures", None)

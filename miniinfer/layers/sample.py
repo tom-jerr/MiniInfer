@@ -219,13 +219,18 @@ def batched_sample(
   scaled_logits = topk_logits / topk_temps
 
   # Batched top-k: use a CPU-known max_k to avoid GPU->CPU sync.
-  # If not provided, fall back to a synced computation.
+  # max_top_k should be passed from ForwardBatch.sampling_max_top_k (pre-computed on CPU).
   if topk_logits.numel() != 0:
-    if max_top_k is None:
-      # Note: this `.item()` can introduce a stream sync; prefer passing max_top_k from CPU.
-      max_k = int(topk_ks.max().item())
-    else:
+    if max_top_k is not None:
       max_k = int(max_top_k)
+    else:
+      # Avoid any GPU->CPU sync here (e.g., `topk_ks.max().item()`), which would
+      # serialize overlap. Callers should pass a CPU-known `max_top_k` computed
+      # during batch construction (see ForwardBatch.sampling_max_top_k).
+      raise ValueError(
+        "batched_sample: `max_top_k` is required for batched top-k sampling to avoid CUDA sync. "
+        "Pass `ForwardBatch.sampling_max_top_k` into `SamplingBatchInfo.max_top_k`."
+      )
     max_k = max(1, min(max_k, logits.size(-1)))
 
     topk_vals, topk_idx = torch.topk(scaled_logits, k=max_k, dim=-1)

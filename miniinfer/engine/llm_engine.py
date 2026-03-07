@@ -16,6 +16,7 @@ Usage:
 
 import atexit
 import logging
+import queue
 from dataclasses import dataclass, field, fields
 from time import perf_counter
 from typing import List, Optional, Union, Dict, Any, Generator, Sequence
@@ -109,13 +110,16 @@ class LLMEngine:
     self.system_prompt = kwargs.get("system_prompt", "You are a helpful assistant.")
     self.debug = bool(kwargs.get("debug", True))
     self.debug_logit_topk = int(kwargs.get("debug_logit_topk", 5))
+    # Optional callback to generate per-batch vocab masks for grammar-constrained sampling.
+    # Signature: fn(forward_batch: ForwardBatch) -> Optional[torch.Tensor]
+    self.vocab_mask_fn = kwargs.get("vocab_mask_fn", None)
 
     self.use_multiprocess = use_multiprocess
     self._started = False
 
     if use_multiprocess:
       raise NotImplementedError(
-        "Multiprocess mode is not implemented yet. " "Please use use_multiprocess=False."
+        "Multiprocess mode is not implemented yet. Please use use_multiprocess=False."
       )
 
     self._init_single_process_mode()
@@ -146,7 +150,9 @@ class LLMEngine:
             cumsum += int(length)
           if not last_token_indices:
             return
-          idx = torch.tensor(last_token_indices, device=logits.device, dtype=torch.int64)
+          # 优化：使用 torch.as_tensor 避免 CUDA 同步
+          idx_cpu = torch.as_tensor(last_token_indices, dtype=torch.int64)
+          idx = idx_cpu.to(logits.device, non_blocking=True)
           logits_for_sampling = logits[idx]
       else:
         logits_for_sampling = logits
@@ -279,6 +285,10 @@ class LLMEngine:
     # 追踪上一个 batch 用于 overlap 判断
     self._last_batch: Optional[ScheduledBatch] = None
 
+    # 异步请求队列：支持在推理过程中动态添加请求
+    # 线程安全，可从任意线程调用 submit_request()
+    self._pending_requests: queue.Queue = queue.Queue()
+
     self._started = True
 
   # ======== add request and step function ========
@@ -291,7 +301,7 @@ class LLMEngine:
       return []
     if len(prompts) != len(sampling_params):
       raise ValueError(
-        "prompts and sampling_params length mismatch: " f"{len(prompts)} vs {len(sampling_params)}"
+        f"prompts and sampling_params length mismatch: {len(prompts)} vs {len(sampling_params)}"
       )
 
     token_ids_list: List[List[int]] = [[] for _ in range(len(prompts))]
@@ -318,6 +328,109 @@ class LLMEngine:
       self._req_by_id[req.req_id] = req
       request_ids.append(req.req_id)
     return request_ids
+
+  def submit_request(
+    self,
+    prompt: Union[str, List[int]],
+    sampling_params: Optional[SamplingParams] = None,
+  ) -> int:
+    """
+    异步提交请求（线程安全）
+
+    请求会被加入待处理队列，在下一次 step_overlap() 调用时处理。
+    可以从任意线程调用此方法，适用于 online serving 场景。
+
+    Args:
+        prompt: 输入 prompt（文本或 token ids）
+        sampling_params: 采样参数
+
+    Returns:
+        request_id: 请求 ID
+    """
+    if sampling_params is None:
+      sampling_params = SamplingParams()
+
+    # 预先 tokenize（如果需要）
+    if isinstance(prompt, str):
+      token_ids = self.prompt_tokenizer.encode_one(prompt)
+    else:
+      token_ids = list(prompt)
+
+    req = Req(token_ids, sampling_params)
+    self._req_by_id[req.req_id] = req
+    self._pending_requests.put(req)
+    return req.req_id
+
+  def _recv_requests(self) -> int:
+    """
+    处理异步提交的请求（SGLang 风格 recv_requests）
+
+    从 _pending_requests 队列中取出所有待处理请求，加入 scheduler。
+    此方法在 step_overlap() 开头调用。
+
+    Returns:
+        处理的请求数量
+    """
+    count = 0
+    while not self._pending_requests.empty():
+      try:
+        req = self._pending_requests.get_nowait()
+        self.scheduler.add(req)
+        count += 1
+      except Exception:
+        break
+    return count
+
+  def _is_disable_overlap_for_batch(self, batch: Optional[ScheduledBatch]) -> bool:
+    """
+    判断是否应该禁用当前 batch 的 overlap（SGLang 风格）
+
+    禁用条件：
+    1. overlap 未启用
+    2. 连续两个 prefill/extend batch（优化 TTFT）
+    3. 当前 batch 为空
+
+    对于连续 prefill 禁用 overlap 的理由：
+    - 假设 batch A 是 prefill，batch B 也是 prefill
+    - 如果启用 overlap，process(A) 会在 forward(B) 期间执行
+    - 但 batch A 的用户想尽快看到首个 token（TTFT）
+    - 禁用 overlap 后，process(A) 在 forward(B) 之前完成
+    - 这样 batch A 的首个 token 更早返回
+
+    Args:
+        batch: 当前要执行的 batch
+
+    Returns:
+        True 如果应该禁用 overlap
+    """
+    if not self.config.enable_overlap:
+      return True
+
+    if batch is None:
+      return True
+
+    # 连续两个 prefill/extend batch 禁用 overlap 以优化 TTFT
+    if (
+      self._last_batch is not None
+      and self._last_batch.forward_mode.is_extend()
+      and batch.forward_mode.is_extend()
+    ):
+      return True
+
+    return False
+
+  def _build_vocab_mask(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+    fn = getattr(self, "vocab_mask_fn", None)
+    if fn is None:
+      return None
+    mask = fn(forward_batch)
+    if mask is None:
+      return None
+    if not isinstance(mask, torch.Tensor):
+      mask = torch.as_tensor(mask)
+    if mask.dtype != torch.bool:
+      mask = mask.to(torch.bool)
+    return mask
 
   def step(self) -> StepOutput:
     """
@@ -397,56 +510,65 @@ class LLMEngine:
 
   def step_overlap(self) -> StepOutput:
     """
-    双 Batch 交替执行的推理步骤（使用 Future Placeholder）
+    双 Batch 交替执行的推理步骤（SGLang 风格）
 
-    与 step() 的区别：
-    - GPU 执行当前 batch forward 时，CPU 并行处理上一 batch 的结果
-    - 使用 OverlapExecutor 管理异步执行和结果队列
-    - 对于连续 decode batch，使用 placeholder 实现真正的 GPU/CPU overlap
+    核心设计（参考 SGLang event_loop_overlap）:
+      - Placeholder 路径: schedule(N) → run_async(N) → process(N-1)
+                                            ↑               ↑
+                                      GPU 先启动    与 forward(N) 并行
 
-    Timeline (连续 decode):
-        GPU forward_stream: |-- forward(N-1) --|-- forward(N) --|-- forward(N+1) --|
-        CPU schedule_stream: [schedule(N)] ──► [run(N)] ──► [process(N-1)] ──► [schedule(N+1)]
-                                  ↑_____ 与 forward(N-1) 真正并行 _____↑
+      - Conservative 路径: process(N-1) → schedule(N) → run_async(N)
+                              ↑
+                     schedule 需要正确的 output_ids
+
+    SGLang 的关键优化：
+      1. 先启动 GPU，然后在 GPU 执行时处理上一批结果
+      2. 连续两个 prefill batch 禁用 overlap，优化 TTFT（首 token 延迟）
+      3. recv_requests 在循环开头处理异步提交的新请求
+
+    Conservative 路径用于：首批请求、near-max-tokens 边界、连续 prefill。
+
+    Phases:
+      0. recv_requests: 处理 submit_request() 异步提交的请求
+      1. 判断是否可以使用 placeholder (can_use_placeholder)
+      2. Conservative: 先处理 N-1 (如果需要)
+      3. Schedule: 获取下一个 batch
+      3.5. 检测连续 prefill，禁用 overlap 优化 TTFT
+      4. run_async: 启动 GPU forward
+      5. Placeholder: GPU 运行时处理 N-1
 
     Returns:
         StepOutput: 包含本步所有请求的增量输出
     """
-    outputs = []
+    outputs: List[RequestOutput] = []
     num_prefill = 0
     num_decode = 0
     prefill_prefix_lens: Dict[int, int] = {}
     prefill_extend_lens: Dict[int, int] = {}
 
-    # =======================================================================
-    # 策略: 对于连续 decode batch，使用 placeholder 实现真正的 overlap
+    # ===================================================================
+    # Phase 0: recv_requests — 处理异步提交的请求 (SGLang 风格)
     #
-    # 原本的问题：
-    #   schedule(N) 依赖 process(N-1) 后的状态（req.output_ids 更新）
-    #   这导致必须先 process 再 schedule，GPU 在 schedule 期间空闲
-    #
-    # 解决方案：
-    #   decode batch 的 input_ids 使用 placeholder (-future_index)
-    #   在 forward_stream 上 resolve_future 替换为真实 token
-    #   这允许 schedule(N) 与 forward(N-1) 并行
-    #
-    # 限制条件：
-    #   - 仅适用于连续 decode batch（batch size 相同）
-    #   - prefill 阶段仍需走保守路径
-    # =======================================================================
+    # 从 _pending_requests 队列中取出所有待处理请求，加入 scheduler。
+    # 这允许用户在推理过程中动态添加请求（通过 submit_request()）。
+    # ===================================================================
+    if getattr(self, "_pending_requests", None) is not None:
+      with stage("stage::LLMEngine.step_overlap.recv_requests"):
+        self._recv_requests()
 
-    # 1. 首先检查是否可以使用 placeholder 路径
-    # 条件：当前有 running decode batch，且 batch size 与上一步相同。
+    # ===================================================================
+    # Phase 1: 判断路径
     #
-    # 额外约束（max_tokens 边界）：
-    # placeholder 路径的 schedule(N) 发生在 process(N-1) 之前，因此当某个请求在 N-1
-    # 处理后将因 max_tokens 结束时，schedule(N) 仍会把它纳入 decode batch，导致多跑 1 token。
-    # 这类情况可以在 schedule 时通过 (len(output_ids) + 1 >= max_tokens) 预测出来，
-    # 因此直接回退到保守路径，避免超发 token。
+    # can_use_placeholder 决定是否走 SGLang 风格 overlap：
+    # - True: schedule 使用 placeholder input_ids，无需等待 N-1 处理完成
+    # - False: schedule 需要正确的 output_ids，必须先处理 N-1
+    # ===================================================================
     running_batch = self.scheduler.running_batch
     has_near_max_tokens_req = False
     if running_batch is not None and running_batch.reqs:
       for req in running_batch.reqs:
+        if req.finished:
+          continue
         max_tokens = int(getattr(req, "max_tokens", 0) or 0)
         if max_tokens > 0 and (len(getattr(req, "output_ids", [])) + 1) >= max_tokens:
           has_near_max_tokens_req = True
@@ -456,73 +578,172 @@ class LLMEngine:
       self.config.enable_overlap
       and not has_near_max_tokens_req
       and len(running_batch.reqs) > 0
-      and running_batch.forward_mode.is_decode()
-      # sglang 风格：output_ids 存储了 -future_indices，
-      # _filter_batch 已同步过滤，shape 一定正确
       and running_batch.output_ids is not None
+      # and len(running_batch.output_ids) == len(running_batch.reqs)
     )
 
-    if can_use_placeholder:
-      # ===== Placeholder 路径：真正的 overlap =====
-      # 顺序: schedule(N) → run(N) → process(N-1)
-      # GPU 在 schedule 和 run 期间继续执行 forward(N-1)
+    # ===================================================================
+    # Phase 2: Conservative 路径 — 先处理 N-1
+    #
+    # 仅当无法使用 placeholder 时（首批/near-max-tokens），先同步处理上一批。
+    # 这确保 schedule(N) 看到正确的 output_ids。
+    # ===================================================================
+    pending_step_out: Optional[StepOutput] = None
 
-      # 1a. 调度 decode batch（使用 placeholder input_ids）
-      # sglang 风格：prepare_for_decode(skip=True) 内部直接
-      # 执行 input_ids = output_ids（已由 _filter_batch 过滤到正确 shape）
-      with stage("stage::LLMEngine.step_overlap.schedule_placeholder"):
-        batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=True)
+    if not can_use_placeholder and self.overlap_executor.has_pending():
+      with stage("stage::LLMEngine.step_overlap.process_conservative"):
+        pending_step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
 
-      use_placeholder = (
-        batch is not None
-        and len(batch.reqs) > 0
-        and batch.forward_mode.is_decode()
-        # input_ids 包含负数占位符 → resolve_future_input_ids 会替换
-        and batch.input_ids is not None
-        and (batch.input_ids < 0).any()
-      )
-
-      # 1b. 异步执行当前 batch
-      if batch is not None and len(batch.reqs) > 0:
-        with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
-          forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
-
-        with stage("stage::LLMEngine.step_overlap.run_async"):
-          record = self.overlap_executor.run_batch_async(
-            batch,
-            forward_batch,
-            self.model_runner,
-            use_placeholder=use_placeholder,
-          )
-          # When overlap is disabled at executor level (e.g., no CUDA),
-          # run_batch_async executes synchronously and does not enqueue results.
-          if not getattr(self.overlap_executor, "enable_overlap", True):
-            step_out = self._process_overlap_result(batch, record.batch_result)
-            if step_out:
-              outputs.extend(step_out.outputs)
-              num_prefill += step_out.num_prefill_tokens
-              num_decode += step_out.num_decode_tokens
-              prefill_prefix_lens.update(step_out.prefill_prefix_lens)
-              prefill_extend_lens.update(step_out.prefill_extend_lens)
-
-      # 1c. 处理上一步的结果（与 GPU forward(N) 并行）
-      if self.overlap_executor.has_pending():
-        with stage("stage::LLMEngine.step_overlap.process_overlap"):
-          step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
-          if step_out:
-            outputs.extend(step_out.outputs)
-            num_prefill += step_out.num_prefill_tokens
-            num_decode += step_out.num_decode_tokens
-            prefill_prefix_lens.update(step_out.prefill_prefix_lens)
-            prefill_extend_lens.update(step_out.prefill_extend_lens)
-
+    # ===================================================================
+    # Phase 3: Schedule（在 schedule_stream 上执行 CPU→GPU 数据准备）
+    #
+    # 所有 schedule 和 prepare 操作在 schedule_stream 上执行，
+    # forward_stream 会等待 schedule_stream 完成后再启动 GPU 计算。
+    # ===================================================================
+    schedule_stream = getattr(self.overlap_executor, "schedule_stream", None)
+    if schedule_stream is not None:
+      with torch.cuda.stream(schedule_stream):
+        if can_use_placeholder:
+          with stage("stage::LLMEngine.step_overlap.schedule_placeholder"):
+            batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=True)
+        else:
+          with stage("stage::LLMEngine.step_overlap.schedule"):
+            batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
     else:
-      # ===== 保守路径：先 process 再 schedule =====
-      # 用于 prefill、首次 decode 等场景
+      if can_use_placeholder:
+        with stage("stage::LLMEngine.step_overlap.schedule_placeholder"):
+          batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=True)
+      else:
+        with stage("stage::LLMEngine.step_overlap.schedule"):
+          batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
 
-      # 2a. 先处理 pending batch
-      if self.overlap_executor.has_pending():
-        with stage("stage::LLMEngine.step_overlap.process_pending_first"):
+    # ===================================================================
+    # Phase 3.5: 检测连续 prefill，决定是否禁用 overlap (SGLang 风格)
+    #
+    # 连续两个 prefill/extend batch 会禁用 overlap 以优化 TTFT：
+    # - 第一个 prefill batch 的用户希望尽快看到首个 token
+    # - 禁用 overlap 后，process(N-1) 在 forward(N) 之前完成
+    # - 这样 batch N-1 的首个 token 更早返回给用户
+    # ===================================================================
+    disable_overlap_for_batch = self._is_disable_overlap_for_batch(batch)
+
+    if disable_overlap_for_batch and self.overlap_executor.has_pending():
+      # 连续 prefill 或其他禁用场景：立即处理上一批结果
+      with stage("stage::LLMEngine.step_overlap.process_consecutive_prefill"):
+        step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        if step_out:
+          if pending_step_out is None:
+            pending_step_out = step_out
+          else:
+            # 合并结果（不应该发生，但防御性处理）
+            pending_step_out.outputs.extend(step_out.outputs)
+
+    # ===================================================================
+    # Phase 4: run_async — 尽快把 forward(N) 交给 GPU
+    # ===================================================================
+    # IMPORTANT: avoid GPU sync here (e.g. `(batch.input_ids < 0).any()`),
+    # otherwise we will block the CPU scheduler on a CUDA reduction and
+    # destroy overlap. Let the scheduler mark placeholder usage explicitly.
+    use_placeholder = bool(can_use_placeholder and batch is not None and batch.uses_placeholder)
+
+    current_record = None
+    current_forward_batch = None
+
+    if batch is not None and len(batch.reqs) > 0:
+      # forward_batch_init 也在 schedule_stream 上执行（构建元数据）
+      schedule_stream = getattr(self.overlap_executor, "schedule_stream", None)
+      if schedule_stream is not None:
+        with torch.cuda.stream(schedule_stream):
+          with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
+            current_forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+      else:
+        with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
+          current_forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+
+      with stage("stage::LLMEngine.step_overlap.run_forward_async"):
+        current_record = self.overlap_executor.run_forward_async(
+          batch,
+          current_forward_batch,
+          self.model_runner,
+          use_placeholder=use_placeholder,
+        )
+
+      if not batch.forward_mode.is_decode():
+        # Propagate placeholder metadata for the next schedule() call.
+        # This is "scheduler-side" CUDA work; keep it on schedule_stream to avoid
+        # accidental default-stream serialization with compute.
+        schedule_stream = getattr(self.overlap_executor, "schedule_stream", None)
+        if schedule_stream is not None:
+          with torch.cuda.stream(schedule_stream):
+            self._propagate_future_to_running_batch(batch)
+        else:
+          self._propagate_future_to_running_batch(batch)
+
+    # ===================================================================
+    # Phase 5: Placeholder 路径 — GPU 启动后处理 N-1
+    #
+    # 此时 GPU 正在执行 forward(N)+sample(N)（如果无 vocab_mask）
+    # 或 forward(N)（如果有 vocab_mask）。
+    # CPU 并行处理 N-1 的结果，实现真正的 overlap。
+    #
+    # 注意：如果 disable_overlap_for_batch=True，Phase 3.5 已经处理过，这里跳过
+    # ===================================================================
+    if (
+      can_use_placeholder and not disable_overlap_for_batch and self.overlap_executor.has_pending()
+    ):
+      with stage("stage::LLMEngine.step_overlap.process_overlap"):
+        pending_step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+
+    # 收集 pending 处理结果
+    if pending_step_out is not None:
+      outputs.extend(pending_step_out.outputs)
+      num_prefill += pending_step_out.num_prefill_tokens
+      num_decode += pending_step_out.num_decode_tokens
+      prefill_prefix_lens.update(pending_step_out.prefill_prefix_lens)
+      prefill_extend_lens.update(pending_step_out.prefill_extend_lens)
+
+    # ===================================================================
+    # Phase 4.5: vocab mask generate (CPU-heavy) + launch sample (GPU-heavy)
+    #
+    # Only executed when vocab_mask_fn is configured (grammar-constrained sampling).
+    # This stage is intentionally after processing (N-1) so any per-request
+    # grammar state updates can be reflected in the sampling mask for batch N.
+    # ===================================================================
+    if batch is not None and len(batch.reqs) > 0 and current_record is not None:
+      vocab_mask = None
+      with stage("stage::LLMEngine.step_overlap.vocab_mask_generate"):
+        if current_forward_batch is not None:
+          vocab_mask = self._build_vocab_mask(current_forward_batch)
+          if vocab_mask is not None:
+            # Transfer the mask on schedule_stream so forward_stream can wait on it.
+            if getattr(self.overlap_executor, "schedule_stream", None) is not None:
+              with torch.cuda.stream(self.overlap_executor.schedule_stream):
+                vocab_mask = vocab_mask.to(self.model_runner.device, non_blocking=True)
+            else:
+              vocab_mask = vocab_mask.to(self.model_runner.device, non_blocking=True)
+
+      with stage("stage::LLMEngine.step_overlap.launch_sample"):
+        current_record = self.overlap_executor.run_sample_async(
+          record=current_record,
+          model_runner=self.model_runner,
+          vocab_mask=vocab_mask,
+        )
+
+    # Non-overlap mode: process immediately
+    if batch is not None and current_record is not None:
+      if not getattr(self.overlap_executor, "enable_overlap", True):
+        step_out = self._process_overlap_result(current_record.batch, current_record.batch_result)
+        if step_out:
+          outputs.extend(step_out.outputs)
+          num_prefill += step_out.num_prefill_tokens
+          num_decode += step_out.num_decode_tokens
+          prefill_prefix_lens.update(step_out.prefill_prefix_lens)
+          prefill_extend_lens.update(step_out.prefill_extend_lens)
+
+    # 确保 overlap 被禁用或无 batch 时不堆积 pending
+    if (not self.config.enable_overlap or batch is None) and self.overlap_executor.has_pending():
+      with stage("stage::LLMEngine.step_overlap.sync_pending"):
+        while self.overlap_executor.has_pending():
           step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
           if step_out:
             outputs.extend(step_out.outputs)
@@ -531,44 +752,6 @@ class LLMEngine:
             prefill_prefix_lens.update(step_out.prefill_prefix_lens)
             prefill_extend_lens.update(step_out.prefill_extend_lens)
 
-      # 2b. 调度获取当前 batch
-      with stage("stage::LLMEngine.step_overlap.schedule"):
-        batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
-
-      # 2c. 如果 overlap 被禁用，确保没有 pending batch 堆积
-      disable_overlap = not self.config.enable_overlap or batch is None
-      if disable_overlap and self.overlap_executor.has_pending():
-        with stage("stage::LLMEngine.step_overlap.sync_pending"):
-          while self.overlap_executor.has_pending():
-            step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
-            if step_out:
-              outputs.extend(step_out.outputs)
-              num_prefill += step_out.num_prefill_tokens
-              num_decode += step_out.num_decode_tokens
-              prefill_prefix_lens.update(step_out.prefill_prefix_lens)
-              prefill_extend_lens.update(step_out.prefill_extend_lens)
-
-      # 2d. 异步执行当前 batch
-      if batch is not None and len(batch.reqs) > 0:
-        with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
-          forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
-
-        with stage("stage::LLMEngine.step_overlap.run_async"):
-          record = self.overlap_executor.run_batch_async(
-            batch, forward_batch, self.model_runner, use_placeholder=False
-          )
-          # When overlap is disabled at executor level (e.g., enable_overlap=False or no CUDA),
-          # run_batch_async executes synchronously and does not enqueue results.
-          if not getattr(self.overlap_executor, "enable_overlap", True):
-            step_out = self._process_overlap_result(batch, record.batch_result)
-            if step_out:
-              outputs.extend(step_out.outputs)
-              num_prefill += step_out.num_prefill_tokens
-              num_decode += step_out.num_decode_tokens
-              prefill_prefix_lens.update(step_out.prefill_prefix_lens)
-              prefill_extend_lens.update(step_out.prefill_extend_lens)
-
-    # 更新 last_batch
     self._last_batch = batch
 
     return StepOutput(
@@ -723,6 +906,72 @@ class LLMEngine:
       prefill_extend_lens=prefill_extend_lens,
     )
 
+  def _propagate_future_to_running_batch(self, batch: ScheduledBatch) -> None:
+    """
+    将非 DECODE batch 上的 output_ids (future placeholder) 传播回 running_batch。
+
+    DECODE batch 就是 running_batch 本身，run_batch_async 直接写入 output_ids。
+    但 EXTEND / MIXED batch 是新建对象，需要把 batch.output_ids 中 decode 请求对应的 future indices
+    以及新加入 running_batch 的 extend 请求的 future indices 传播回 running_batch.output_ids。
+    这样下一轮 schedule(N+1) 可以从 running_batch.output_ids 获取 placeholder。
+
+    对于纯 EXTEND batch（chunked_prefill=False），batch 仅包含新 prefill 请求。
+    此时 running_batch 中的旧 decode 请求不在 batch 中，但它们在 running_batch.output_ids
+    中的旧 future indices 仍然有效（FutureMap 循环 buffer 空间足够），需要保留。
+    """
+    running_batch = self.scheduler.running_batch
+    if batch.output_ids is None or len(running_batch.reqs) == 0:
+      running_batch.output_ids = None
+      return
+
+    # Save old output_ids before overwriting.
+    # _get_new_batch_prefill appends new reqs to running_batch, so:
+    #   running_batch.reqs = [old_surviving_reqs..., new_prefill_reqs...]
+    #   old_output_ids corresponds to old_surviving_reqs (same order, post-_filter_batch)
+    old_output_ids = running_batch.output_ids
+
+    # Build a CPU-side map from running_batch order -> batch indices.
+    # Avoid Python for-loop driving per-element GPU writes; do one masked gather on GPU.
+    batch_req_map = {id(r): i for i, r in enumerate(batch.reqs)}
+    idx_in_batch = [batch_req_map.get(id(req), -1) for req in running_batch.reqs]
+
+    # Validate any "not-in-batch" entries can be sourced from old_output_ids.
+    if old_output_ids is None:
+      if any(i < 0 for i in idx_in_batch):
+        running_batch.output_ids = None
+        return
+    else:
+      old_len = int(old_output_ids.numel())
+      for i, idx in enumerate(idx_in_batch):
+        if idx < 0 and i >= old_len:
+          running_batch.output_ids = None
+          return
+
+    device = batch.output_ids.device
+    idx_cpu = torch.as_tensor(idx_in_batch, dtype=torch.int64)
+    idx_dev = idx_cpu.to(device, non_blocking=True)
+    in_batch = idx_dev >= 0
+
+    new_output_ids = torch.empty(
+      (len(running_batch.reqs),),
+      dtype=batch.output_ids.dtype,
+      device=device,
+    )
+
+    pos_in_batch = in_batch.nonzero(as_tuple=True)[0]
+    if pos_in_batch.numel() > 0:
+      src = idx_dev[pos_in_batch]
+      new_output_ids[pos_in_batch] = batch.output_ids[src]
+
+    pos_old = (~in_batch).nonzero(as_tuple=True)[0]
+    if pos_old.numel() > 0:
+      if old_output_ids is None:
+        running_batch.output_ids = None
+        return
+      new_output_ids[pos_old] = old_output_ids[pos_old]
+
+    running_batch.output_ids = new_output_ids
+
   def _process_step_result(self, batch: ScheduledBatch, result: BatchResult) -> List[RequestOutput]:
     """
     处理单步推理结果，返回每个请求的增量输出
@@ -737,7 +986,14 @@ class LLMEngine:
 
     next_token_ids = result.next_token_ids
     if isinstance(next_token_ids, torch.Tensor):
-      next_token_ids = next_token_ids.cpu().tolist()
+      # In overlap mode, next_token_ids is already on CPU (cloned from pinned buffer).
+      # Check device to avoid unnecessary .cpu() call which could disguise issues.
+      if next_token_ids.device.type != "cpu":
+        logger.error(
+          "Expected next_token_ids to be on CPU, but got device: %s", next_token_ids.device
+        )
+        next_token_ids = next_token_ids.cpu()
+      next_token_ids = next_token_ids.tolist()
 
     outputs = []
     finished_req_ids = []
@@ -779,14 +1035,16 @@ class LLMEngine:
       if req.finished:
         continue
 
-      # retract 后请求会被重新 prefill。若不清理 detokenizer 状态，
-      # 旧 token 文本会和重跑后的新 token 文本串接，导致输出错位/乱码。
+      # BUG Fix: retract 后请求的 KV cache 已被释放，output_ids 已重置。
+      # schedule(N) 的 retract 先于 process(N-1)，此时不应追加 token
+      # 到已重置的 output_ids，否则下次 prefill 会包含孤立 token 导致乱码。
       if req.is_retracted:
         self.detokenizer.cleanup(req.req_id)
         req.is_retracted = False
+        continue
 
       token_id = next_token_ids[i]
-      req.output_ids.append(token_id)
+      req.append_output_token(token_id)
 
       active_reqs.append(req)
       active_req_ids.append(req.req_id)

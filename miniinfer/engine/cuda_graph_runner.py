@@ -308,8 +308,7 @@ class CudaGraphRunner:
 
     if padded_bs not in self.graphs:
       raise RuntimeError(
-        f"No CUDA graph captured for batch_size={padded_bs}. "
-        f"Available: {list(self.graphs.keys())}"
+        f"No CUDA graph captured for batch_size={padded_bs}. Available: {list(self.graphs.keys())}"
       )
 
     captured = self.graphs[padded_bs]
@@ -318,11 +317,21 @@ class CudaGraphRunner:
     # Use precomputed max_seq_len from CPU to avoid GPU sync
     max_seq_len_k = forward_batch.max_seq_len
     if max_seq_len_k is None:
-      # Fallback: compute from CPU tensor if available, else GPU tensor
+      # Fallback: compute from CPU tensor if available. Do NOT fall back to CUDA `.item()`
+      # here because it would introduce a stream sync and break overlap.
       if forward_batch.seq_lens_cpu is not None:
-        max_seq_len_k = int(forward_batch.seq_lens_cpu.max().item())
+        max_seq_len_k = int(forward_batch.seq_lens_cpu.max())
       else:
-        max_seq_len_k = int(forward_batch.seq_lens.max().item())
+        all_seqs = getattr(forward_batch, "all_seqs", None) or []
+        if all_seqs:
+          # Decode: CPU-known seq len is available from Req.current_seq_len.
+          max_seq_len_k = max(int(getattr(r, "current_seq_len", 0)) for r in all_seqs)
+        else:
+          raise RuntimeError(
+            "CudaGraphRunner.replay: missing CPU-side seq_lens metadata "
+            "(forward_batch.max_seq_len / forward_batch.seq_lens_cpu / forward_batch.all_seqs). "
+            "Refusing to fall back to CUDA `.item()` which would sync and break overlap."
+          )
     actual_block_table = self.kv_cache_mgr.get_page_table(forward_batch, max_seq_len_k)
     # Convert to block indices
     actual_blocks = (actual_block_table[:, :: self.page_size].contiguous() // self.page_size).to(
