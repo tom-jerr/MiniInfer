@@ -19,7 +19,7 @@ from config.model.qwen3 import Qwen3Config
 from config.model.base import PretrainedConfig
 from models.fused_qwen2 import Qwen2ForCausalLM
 from models.fused_qwen3 import Qwen3ForCausalLM
-from miniinfer.layers.sample import Sampler, SamplingBatchInfo
+from miniinfer.layers.sample import BatchSamplingArgs, Sampler
 from miniinfer.layers.attention_backend.flashattention_backend import (
   FlashAttention2Backend,
 )
@@ -65,7 +65,8 @@ class ModelRunner:
       logger.info("Initialized Qwen3Model")
     else:
       self.model = None
-    self.sampler = Sampler()
+
+    self.sampler = Sampler(device=self.device, vocab_size=self.model_config.vocab_size)
     self.init_load_model()
 
     # CUDA Graph support
@@ -264,47 +265,40 @@ class ModelRunner:
         )
       logits_for_sampling = logits_for_sampling.masked_fill(~vocab_mask, float("-inf"))
 
-    # Use pre-built sampling params from ForwardBatch to avoid per-step H2D
-    temps = getattr(batch, "sampling_temperatures", None)
-    top_ps = getattr(batch, "sampling_top_ps", None)
-    top_ks = getattr(batch, "sampling_top_ks", None)
-    if temps is not None and top_ps is not None and top_ks is not None:
-      sampling_batch_info = SamplingBatchInfo(
-        temperature=temps,
-        top_ps=top_ps,
-        top_ks=top_ks,
-        max_top_k=getattr(batch, "sampling_max_top_k", None),
-        vocab_size=logits.size(-1),
-      )
-    else:
-      # Fallback: create from Python lists (legacy path)
+    # mini-sglang style sampling metadata propagation:
+    # - ForwardBatch.init_new builds/ships sampling tensors via pinned buffers
+    # - sampling_top_k/top_p can be omitted if disabled for the whole batch
+    if batch.sampling_is_all_greedy:
+      return self.sampler.sample(logits_for_sampling, BatchSamplingArgs(temperatures=None))
+
+    temps = batch.sampling_temperatures
+    top_ps = batch.sampling_top_ps
+    top_ks = batch.sampling_top_ks
+    max_top_k = batch.sampling_max_top_k
+
+    if temps is None:
+      logger.error("Batch sampling temperatures is None but sampling_is_all_greedy is False")
+      # Legacy fallback: build from Python lists (may incur H2D each step).
       if batch.all_seqs is None:
         raise ValueError(
           "ForwardBatch is missing sampling tensors and `all_seqs`; "
-          "cannot construct per-sequence SamplingBatchInfo."
+          "cannot construct per-sequence sampling metadata."
         )
-      sampling_batch_info = SamplingBatchInfo(
-        temperature=torch.tensor(
-          [seq.sampling_params.temperature for seq in batch.all_seqs],
-          device=logits.device,
-        ),
-        top_ps=torch.tensor(
-          [seq.sampling_params.top_p for seq in batch.all_seqs],
-          device=logits.device,
-        ),
-        top_ks=torch.tensor(
-          [seq.sampling_params.top_k for seq in batch.all_seqs],
-          device=logits.device,
-        ),
-        max_top_k=max(
-          1,
-          max(
-            (int(seq.sampling_params.top_k) for seq in batch.all_seqs),
-            default=0,
-          ),
-        ),
-        vocab_size=logits.size(-1),
-      )
+      params = [seq.sampling_params for seq in batch.all_seqs]
+      if all(float(p.temperature) == 0.0 for p in params):
+        return self.sampler.sample(logits_for_sampling, BatchSamplingArgs(temperatures=None))
 
-    next_token_ids = self.sampler(logits_for_sampling, sampling_batch_info)  # [num_seqs,]
-    return next_token_ids
+      temps = torch.tensor([float(p.temperature) for p in params], device=logits.device)
+      if any(int(p.top_k) >= 1 for p in params):
+        top_ks = torch.tensor([int(p.top_k) for p in params], device=logits.device, dtype=torch.int32)
+        max_top_k = max(1, max((int(p.top_k) for p in params), default=0))
+      if any(float(p.top_p) < 1.0 for p in params):
+        top_ps = torch.tensor([float(p.top_p) for p in params], device=logits.device)
+
+    args = self.sampler.prepare(
+      temperatures=temps,
+      top_k=top_ks,
+      top_p=top_ps,
+      max_top_k=max_top_k,
+    )
+    return self.sampler.sample(logits_for_sampling, args)

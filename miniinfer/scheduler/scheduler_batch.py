@@ -294,6 +294,9 @@ class ForwardBatch:
   sampling_temperatures: Optional[torch.Tensor] = None
   sampling_top_ps: Optional[torch.Tensor] = None
   sampling_top_ks: Optional[torch.Tensor] = None
+  # True when every sequence in this forward step is greedy (temperature == 0).
+  # In that case we can skip building sampling tensors entirely and use argmax.
+  sampling_is_all_greedy: bool = False
   # CPU-side metadata to avoid GPU->CPU sync in sampling.
   sampling_max_top_k: Optional[int] = None
   # Optional device-side indices of the last token per sequence in an EXTEND/MIXED
@@ -335,19 +338,20 @@ class ForwardBatch:
     """确保 pinned memory buffers 已初始化（SGLang 风格优化）"""
     if cls._pinned_temperatures is None or max_bs > cls._max_buffer_size:
       cls._max_buffer_size = max(max_bs, cls._max_buffer_size)
+      pin = bool(torch.cuda.is_available())
       cls._pinned_temperatures = torch.empty(
-        cls._max_buffer_size, dtype=torch.float32, pin_memory=True
+        cls._max_buffer_size, dtype=torch.float32, pin_memory=pin
       )
-      cls._pinned_top_ps = torch.empty(cls._max_buffer_size, dtype=torch.float32, pin_memory=True)
-      cls._pinned_top_ks = torch.empty(cls._max_buffer_size, dtype=torch.int64, pin_memory=True)
+      cls._pinned_top_ps = torch.empty(cls._max_buffer_size, dtype=torch.float32, pin_memory=pin)
+      cls._pinned_top_ks = torch.empty(cls._max_buffer_size, dtype=torch.int32, pin_memory=pin)
       cls._pinned_extend_lens = torch.empty(
-        cls._max_buffer_size, dtype=torch.int64, pin_memory=True
+        cls._max_buffer_size, dtype=torch.int64, pin_memory=pin
       )
       cls._pinned_extend_prefix_lens = torch.empty(
-        cls._max_buffer_size, dtype=torch.int64, pin_memory=True
+        cls._max_buffer_size, dtype=torch.int64, pin_memory=pin
       )
       cls._pinned_last_token_indices = torch.empty(
-        cls._max_buffer_size, dtype=torch.int64, pin_memory=True
+        cls._max_buffer_size, dtype=torch.int64, pin_memory=pin
       )
 
   @classmethod
@@ -388,25 +392,32 @@ class ForwardBatch:
       # 确保 pinned buffer 已初始化
       cls._ensure_pinned_buffers(bs)
 
-      # Compute max_top_k on CPU to avoid `.item()` sync in batched top-k.
-      # Ensure it's always >= 1 so top-k path can safely run even when empty.
-      forward_batch.sampling_max_top_k = max(
-        1, max((int(r.sampling_params.top_k) for r in batch.reqs), default=0)
-      )
+      # mini-sglang style: only build/transfer sampling metadata that is needed for this batch.
+      params = [r.sampling_params for r in batch.reqs]
+      forward_batch.sampling_is_all_greedy = all(float(p.temperature) == 0.0 for p in params)
 
-      # 提取 sampling params 到 pinned buffer（在 CPU 上操作，无 GPU sync）
-      temps = [r.sampling_params.temperature for r in batch.reqs]
-      top_ps = [r.sampling_params.top_p for r in batch.reqs]
-      top_ks = [r.sampling_params.top_k for r in batch.reqs]
+      if not forward_batch.sampling_is_all_greedy:
+        need_top_k = any(int(p.top_k) >= 1 for p in params)
+        need_top_p = any(float(p.top_p) < 1.0 for p in params)
 
-      cls._pinned_temperatures[:bs] = torch.as_tensor(temps, dtype=torch.float32)
-      cls._pinned_top_ps[:bs] = torch.as_tensor(top_ps, dtype=torch.float32)
-      cls._pinned_top_ks[:bs] = torch.as_tensor(top_ks, dtype=torch.int64)
+        # temperatures are always needed for non-all-greedy batches
+        temps = [float(p.temperature) for p in params]
+        cls._pinned_temperatures[:bs] = torch.as_tensor(temps, dtype=torch.float32)
+        forward_batch.sampling_temperatures = cls._pinned_temperatures[:bs].to(
+          dev, non_blocking=True
+        )
 
-      # 异步传输到 GPU（真正的零拷贝，无临时 buffer）
-      forward_batch.sampling_temperatures = cls._pinned_temperatures[:bs].to(dev, non_blocking=True)
-      forward_batch.sampling_top_ps = cls._pinned_top_ps[:bs].to(dev, non_blocking=True)
-      forward_batch.sampling_top_ks = cls._pinned_top_ks[:bs].to(dev, non_blocking=True)
+        if need_top_p:
+          top_ps = [float(p.top_p) for p in params]
+          cls._pinned_top_ps[:bs] = torch.as_tensor(top_ps, dtype=torch.float32)
+          forward_batch.sampling_top_ps = cls._pinned_top_ps[:bs].to(dev, non_blocking=True)
+
+        if need_top_k:
+          top_ks = [int(p.top_k) for p in params]
+          cls._pinned_top_ks[:bs] = torch.as_tensor(top_ks, dtype=torch.int32)
+          forward_batch.sampling_top_ks = cls._pinned_top_ks[:bs].to(dev, non_blocking=True)
+          # CPU-side max_k for the torch fallback (no GPU sync)
+          forward_batch.sampling_max_top_k = max(1, max(top_ks, default=0))
 
     if batch.forward_mode.is_extend():
       # forward_batch.extend_num_tokens = batch.input_ids.shape[0]

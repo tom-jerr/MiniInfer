@@ -16,12 +16,13 @@ dependencies = [
     "xxhash",
     "numpy>=2.2.4",
     "accelerate>=1.11.0",
-    #"flash-attn>=2.8.3",
+    "flash-attn>=2.8.3",
     "ruff>=0.11.6",
     "pre-commit>=4.0.0",
     "pandas",
     "matplotlib",
     "pytest",
+    "flashinfer-python",
 ]
 
 [tool.pytest.ini_options]
@@ -30,5 +31,5 @@ pythonpath = "."
 
 [tool.setuptools.packages.find]
 where = ["miniinfer"]
-#[tool.uv.extra-build-dependencies]
-#flash-attn = ["torch"]
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
