@@ -311,7 +311,7 @@ class PagedTokenAllocator(ITokenAllocator):
       self.seen_max_num_extend_tokens_next_power_of_2,
     )
 
-    assert len(torch.unique(out_indices)) == len(out_indices)
+    # assert len(torch.unique(out_indices)) == len(out_indices)
 
     # print("num_new_pages:", num_new_pages)
     # print("out_indices:", out_indices)

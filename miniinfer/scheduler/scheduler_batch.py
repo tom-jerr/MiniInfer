@@ -79,6 +79,16 @@ class Req:
     self.chunked_prefill_len = 0  # 当前 chunk 已经处理的长度
     self.total_input_len = len(token_ids)  # 总输入长度
 
+    # ============ TokenPool related (mini-sglang style) ============
+    # table_idx: 在 TokenPool 中的行索引，由 TokenPool.allocate() 分配
+    self.table_idx: int = -1
+    # device_len: TokenPool 中该请求已写入的 token 数量
+    # 初始值为 input 长度，每次 decode 后 +1
+    self.device_len: int = len(token_ids)
+    # cached_len: 已经 forward 过的长度（KV cache 已计算）
+    # Prefill 后 cached_len = device_len，每次 decode 后更新
+    self.cached_len: int = 0
+
     # ============ cached metadata for performance ============
     # 缓存当前序列长度，避免重复计算 len(origin_input_ids) + len(output_ids)
     self._cached_seq_len = len(token_ids)
@@ -113,6 +123,34 @@ class Req:
       self._cached_last_token = self.output_ids[-1]
       return self._cached_last_token
     return None
+
+  # ============ TokenPool related methods (mini-sglang style) ============
+
+  @property
+  def extend_len(self) -> int:
+    """本次 forward 需要处理的 token 数量 = device_len - cached_len"""
+    return self.device_len - self.cached_len
+
+  @property
+  def remain_len(self) -> int:
+    """剩余可生成的 token 数量"""
+    max_device_len = self.total_input_len + self.max_tokens
+    return max_device_len - self.device_len
+
+  @property
+  def can_decode(self) -> bool:
+    """是否还可以继续 decode"""
+    return self.remain_len > 0 and not self.finished
+
+  def complete_one(self) -> None:
+    """
+    完成一次 forward 后更新状态（mini-sglang 风格）
+
+    - cached_len 更新为 device_len（本次已计算的 KV cache）
+    - device_len += 1（下一个 token 位置）
+    """
+    self.cached_len = self.device_len
+    self.device_len += 1
 
 
 class ChunkedReq:
@@ -381,7 +419,9 @@ class ForwardBatch:
 
       # H2D extend lens/prefix lens via pinned buffers on the current CUDA stream
       cls._pinned_extend_lens[:bs] = torch.as_tensor(extend_lens_cpu, dtype=torch.int64)
-      cls._pinned_extend_prefix_lens[:bs] = torch.as_tensor(batch.prefix_lens or [], dtype=torch.int64)
+      cls._pinned_extend_prefix_lens[:bs] = torch.as_tensor(
+        batch.prefix_lens or [], dtype=torch.int64
+      )
       forward_batch.extend_seq_lens = cls._pinned_extend_lens[:bs].to(dev, non_blocking=True)
       forward_batch.extend_prefix_lens = cls._pinned_extend_prefix_lens[:bs].to(
         dev, non_blocking=True
