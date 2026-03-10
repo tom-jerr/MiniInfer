@@ -17,3 +17,5 @@ output/
 *.nsys-rep
 .vscode
 *.json
+core
+*.tmp

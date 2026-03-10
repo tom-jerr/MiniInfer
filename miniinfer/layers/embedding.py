@@ -1,7 +1,8 @@
-from typing import Dict
-from loader.weight import WeightLoaderMixin
 import torch
 from torch import nn
+from typing import Dict
+
+from miniinfer.loader.weight import WeightLoaderMixin
 
 from .linear import linear
 

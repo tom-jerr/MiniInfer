@@ -279,7 +279,8 @@ def test_stream_generate_with_engine(model_path: str):
   ]
 
   sampling_params = SamplingParams(
-    temperature=0.7,
+    temperature=1.0,
+    top_k=1,
     max_tokens=50,
   )
 
@@ -329,7 +330,8 @@ def test_generate_with_engine(model_path: str):
   ]
 
   sampling_params = SamplingParams(
-    temperature=0.7,
+    temperature=1,
+    top_k=1,
     max_tokens=32,
   )
 

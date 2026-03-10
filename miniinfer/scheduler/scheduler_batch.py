@@ -2,10 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import Optional, List, ClassVar
-from layers.attention_backend.base_backend import AttentionBackend
+
 import torch
 from itertools import count
 from copy import copy
+from miniinfer.layers.attention_backend.base_backend import AttentionBackend
 from miniinfer.utils.sampling_params import SamplingParams
 
 
@@ -257,7 +258,7 @@ class ForwardBatch:
   sampling_top_ps: Optional[torch.Tensor] = None
   sampling_top_ks: Optional[torch.Tensor] = None
   # CPU-side metadata to avoid GPU->CPU sync in sampling.
-  sampling_max_top_k: Optional[int] = None
+  # sampling_max_top_k: Optional[int] = None
   # Optional device-side indices of the last token per sequence in an EXTEND/MIXED
   # logits tensor of shape [total_tokens, vocab_size]. Built on CPU and transferred
   # via pinned buffer to avoid per-step GPU allocations/copies.
@@ -314,17 +315,18 @@ class ForwardBatch:
 
   @classmethod
   def init_new(cls, batch: ScheduledBatch, attn_backend: Optional[AttentionBackend] = None):
-    # Compute max_seq_len from CPU tensor to avoid GPU sync
-    # 优化：直接从 CPU tensor 取值，避免 .item() 的潜在同步
-    max_seq_len = None
-    if batch.seq_lens_cpu is not None:
-      max_seq_len = int(batch.seq_lens_cpu.max())
+    # Snapshot seq_lens because overlap scheduling mutates running batch lengths in-place
+    # for the next step while the current step may still be executing on the GPU.
+    seq_lens = batch.seq_lens.clone() if batch.seq_lens is not None else None
+    seq_lens_cpu = batch.seq_lens_cpu.clone() if batch.seq_lens_cpu is not None else None
 
-    # Pre-convert seq_lens to int32 to avoid repeated conversions in FA backends
-    # 优化：使用 non_blocking=True 避免同步
-    seq_lens_int32 = (
-      batch.seq_lens.to(torch.int32, non_blocking=True) if batch.seq_lens is not None else None
-    )
+    # Compute max_seq_len from CPU tensor to avoid GPU sync.
+    max_seq_len = None
+    if seq_lens_cpu is not None:
+      max_seq_len = int(seq_lens_cpu.max())
+
+    # Pre-convert seq_lens to int32 to avoid repeated conversions in FA backends.
+    seq_lens_int32 = seq_lens.to(torch.int32, non_blocking=True) if seq_lens is not None else None
 
     forward_batch = cls(
       forward_mode=batch.forward_mode,
@@ -332,9 +334,9 @@ class ForwardBatch:
       input_ids=batch.input_ids,
       req_pool_indices=batch.req_pool_indices,
       out_cache_loc=batch.out_cache_loc,
-      seq_lens=batch.seq_lens,
+      seq_lens=seq_lens,
       seq_lens_int32=seq_lens_int32,
-      seq_lens_cpu=batch.seq_lens_cpu,
+      seq_lens_cpu=seq_lens_cpu,
       max_seq_len=max_seq_len,
       attn_backend=attn_backend,
       all_seqs=batch.reqs,
@@ -352,9 +354,9 @@ class ForwardBatch:
 
       # Compute max_top_k on CPU to avoid `.item()` sync in batched top-k.
       # Ensure it's always >= 1 so top-k path can safely run even when empty.
-      forward_batch.sampling_max_top_k = max(
-        1, max((int(r.sampling_params.top_k) for r in batch.reqs), default=0)
-      )
+      # forward_batch.sampling_max_top_k = max(
+      #   1, max((int(r.sampling_params.top_k) for r in batch.reqs), default=0)
+      # )
 
       # 提取 sampling params 到 pinned buffer（在 CPU 上操作，无 GPU sync）
       temps = [r.sampling_params.temperature for r in batch.reqs]
@@ -381,7 +383,9 @@ class ForwardBatch:
 
       # H2D extend lens/prefix lens via pinned buffers on the current CUDA stream
       cls._pinned_extend_lens[:bs] = torch.as_tensor(extend_lens_cpu, dtype=torch.int64)
-      cls._pinned_extend_prefix_lens[:bs] = torch.as_tensor(batch.prefix_lens or [], dtype=torch.int64)
+      cls._pinned_extend_prefix_lens[:bs] = torch.as_tensor(
+        batch.prefix_lens or [], dtype=torch.int64
+      )
       forward_batch.extend_seq_lens = cls._pinned_extend_lens[:bs].to(dev, non_blocking=True)
       forward_batch.extend_prefix_lens = cls._pinned_extend_prefix_lens[:bs].to(
         dev, non_blocking=True

@@ -21,12 +21,11 @@ Scheduler - 单机版调度器
     - 全部预算以 page_size 粒度对齐
 """
 
-from typing import List, Optional, Any
+from typing import List, Optional, Any, TYPE_CHECKING
 import logging
 import torch
 
 from miniinfer.config.engine.config import EngineConfig
-from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 from miniinfer.utils.profiler_utils import profile_methods
 from miniinfer.scheduler.prefill_adder import PrefillAdder, AddReqResult
 from miniinfer.scheduler.scheduler_batch import (
@@ -37,6 +36,9 @@ from miniinfer.scheduler.scheduler_batch import (
   ForwardMode,
   BatchResult,
 )
+
+if TYPE_CHECKING:
+  from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +75,7 @@ class Scheduler:
     self,
     config: EngineConfig,
     tokenizer: Any,
-    kv_cache_mgr: KVCacheManager,
+    kv_cache_mgr: "KVCacheManager",
   ):
     self.engine_config = config
     self.tokenizer = tokenizer
@@ -130,6 +132,101 @@ class Scheduler:
   def add(self, req: Req):
     """添加新请求到等待队列"""
     self.waiting_queue.append(req)
+
+  def warmup_schedule_path(self, device: Optional[torch.device] = None) -> None:
+    """
+    Warm up prefill/decode/mixed scheduling paths so the first live batch
+    does not pay lazy CUDA/Triton module loading costs.
+
+    The warmup uses synthetic requests and restores scheduler state before
+    returning.
+    """
+    if not torch.cuda.is_available() or str(self.kv_cache_mgr.device) == "cpu":
+      return
+
+    if device is None:
+      device = torch.device(str(self.kv_cache_mgr.device))
+
+    warmup_len = max(
+      1,
+      min(
+        int(self.page_size),
+        int(self.max_extend_len),
+        int(getattr(self.kv_cache_mgr, "max_context_len", self.page_size)),
+      ),
+    )
+
+    saved_state = {
+      "waiting_queue": self.waiting_queue,
+      "running_batch": self.running_batch,
+      "chunking_reqs": self.chunking_reqs,
+      "cur_batch": self.cur_batch,
+      "last_batch": self.last_batch,
+      "finished_reqs": self.finished_reqs,
+      "pending_release_reqs": self.pending_release_reqs,
+      "new_token_ratio": self.new_token_ratio,
+      "num_continuous_retract": self.num_continuous_retract,
+      "num_continuous_decode_ok": self.num_continuous_decode_ok,
+      "num_retracted_reqs": self.num_retracted_reqs,
+    }
+
+    cleanup_reqs: List[Req] = []
+    try:
+      self.waiting_queue = []
+      self.running_batch = ScheduledBatch(reqs=[], device=device)
+      self.chunking_reqs = []
+      self.cur_batch = None
+      self.last_batch = None
+      self.finished_reqs = []
+      self.pending_release_reqs = []
+      self.new_token_ratio = _INIT_NEW_TOKEN_RATIO
+      self.num_continuous_retract = 0
+      self.num_continuous_decode_ok = 0
+      self.num_retracted_reqs = 0
+
+      prefill_req = Req([1] * warmup_len)
+      self.waiting_queue = [prefill_req]
+      prefill_batch = self._get_new_batch_prefill(device)
+      if prefill_batch is None or not self.running_batch.reqs:
+        return
+      cleanup_reqs.append(prefill_req)
+
+      self.running_batch.output_ids = torch.zeros(
+        (len(self.running_batch.reqs),), dtype=torch.int64, device=device
+      )
+      decode_batch = self._get_decode_batch(device, skip_decode_input_ids=True)
+      if decode_batch is None:
+        return
+      prefill_req.append_output_token(1)
+
+      if self.enable_chunked_prefill:
+        mixed_req = Req([2] * warmup_len)
+        self.waiting_queue = [mixed_req]
+        mixed_batch = self._get_new_batch_prefill(device)
+        if mixed_batch is not None:
+          cleanup_reqs.append(mixed_req)
+          prefill_req.append_output_token(2)
+
+      torch.cuda.synchronize(device)
+    finally:
+      for req in reversed(cleanup_reqs):
+        req_pool_idx = int(getattr(req, "req_pool_idx", -1))
+        if req_pool_idx >= 0:
+          self.kv_cache_mgr.release_request(req, is_insert=False)
+
+      torch.cuda.synchronize(device)
+
+      self.waiting_queue = saved_state["waiting_queue"]
+      self.running_batch = saved_state["running_batch"]
+      self.chunking_reqs = saved_state["chunking_reqs"]
+      self.cur_batch = saved_state["cur_batch"]
+      self.last_batch = saved_state["last_batch"]
+      self.finished_reqs = saved_state["finished_reqs"]
+      self.pending_release_reqs = saved_state["pending_release_reqs"]
+      self.new_token_ratio = saved_state["new_token_ratio"]
+      self.num_continuous_retract = saved_state["num_continuous_retract"]
+      self.num_continuous_decode_ok = saved_state["num_continuous_decode_ok"]
+      self.num_retracted_reqs = saved_state["num_retracted_reqs"]
 
   def has_unfinished(self) -> bool:
     return (
@@ -267,7 +364,7 @@ class Scheduler:
     new_chunked_reqs = []
     remaining_waiting = []
 
-    for req in self.waiting_queue:
+    for waiting_idx, req in enumerate(self.waiting_queue):
       if adder.no_remaining_budget():
         remaining_waiting.append(req)
         continue
@@ -280,7 +377,7 @@ class Scheduler:
       if result == AddReqResult.NO_TOKEN:
         # KV cache 不足，后续请求也无法添加
         remaining_waiting.append(req)
-        remaining_waiting.extend(self.waiting_queue[self.waiting_queue.index(req) + 1 :])
+        remaining_waiting.extend(self.waiting_queue[waiting_idx + 1 :])
         break
       elif result == AddReqResult.OTHER:
         # 软限制（chunk 预算用尽等），跳过但继续尝试
@@ -351,10 +448,13 @@ class Scheduler:
     batch.uses_placeholder = bool("decode_input_ids" in mixed_kwargs)
 
     # 非 chunked 请求完成 prefill 后加入 running_batch
-    for req in all_extend_reqs:
+    ready_running_indices = []
+    for req_idx, req in enumerate(all_extend_reqs):
       if not req.is_chunked:
         self.running_batch.reqs.append(req)
-        self._update_running_batch_metadata(batch, req)
+        ready_running_indices.append(req_idx)
+
+    self._append_running_batch_metadata(batch, ready_running_indices)
 
     return batch
 
@@ -542,23 +642,20 @@ class Scheduler:
       batch.output_ids = batch.output_ids[: len(batch.reqs)]
 
   # ======================== private helper function ========================
-  def _update_running_batch_metadata(self, batch: ScheduledBatch, req: Req):
-    """当请求从 extend batch 移到 running_batch 时同步元数据"""
-    try:
-      req_idx_in_batch = batch.reqs.index(req)
-    except ValueError:
+  def _append_running_batch_metadata(self, batch: ScheduledBatch, req_indices: List[int]):
+    """批量将新完成 prefill 的请求元数据追加到 running_batch。"""
+    if not req_indices:
       return
 
     if batch.req_pool_indices is None or batch.seq_lens is None:
       return
 
-    req_pool_idx = batch.req_pool_indices[req_idx_in_batch : req_idx_in_batch + 1]
-    seq_len = batch.seq_lens[req_idx_in_batch : req_idx_in_batch + 1]
-    seq_len_cpu = (
-      batch.seq_lens_cpu[req_idx_in_batch : req_idx_in_batch + 1]
-      if batch.seq_lens_cpu is not None
-      else None
-    )
+    idx_cpu = torch.as_tensor(req_indices, dtype=torch.int64)
+    idx_device = idx_cpu.to(batch.req_pool_indices.device, non_blocking=True)
+
+    req_pool_idx = batch.req_pool_indices[idx_device]
+    seq_len = batch.seq_lens[idx_device]
+    seq_len_cpu = batch.seq_lens_cpu[idx_cpu] if batch.seq_lens_cpu is not None else None
 
     if self.running_batch.req_pool_indices is None:
       self.running_batch.req_pool_indices = req_pool_idx

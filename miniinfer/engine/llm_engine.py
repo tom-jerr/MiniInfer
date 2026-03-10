@@ -282,6 +282,17 @@ class LLMEngine:
         device="cuda",
         enable_overlap=enable_overlap,
       )
+
+    # 步骤 7: 预热 release path，避免第一次 drain_pending_releases() 触发
+    # Runtime Triggered Module Loading。
+    with stage("stage::LLMEngine.init.release_path_warmup"):
+      self.kv_cache_mgr.warmup_release_path()
+
+    # 步骤 8: 预热 schedule path，覆盖 prefill / decode / mixed 中首次触发的
+    # CUDA/Triton 模块加载。
+    with stage("stage::LLMEngine.init.schedule_path_warmup"):
+      self.scheduler.warmup_schedule_path(device=torch.device("cuda"))
+
     # 追踪上一个 batch 用于 overlap 判断
     self._last_batch: Optional[ScheduledBatch] = None
 
@@ -752,6 +763,13 @@ class LLMEngine:
             prefill_prefix_lens.update(step_out.prefill_prefix_lens)
             prefill_extend_lens.update(step_out.prefill_extend_lens)
 
+    # Drain deferred releases only after the current batch has already launched
+    # its sample/copy work. Cache state must be fresh before the next schedule(),
+    # but it does not need to block this step's launch path.
+    if getattr(self.scheduler, "pending_release_reqs", None):
+      with stage("stage::LLMEngine.step_overlap.drain_pending_releases"):
+        self.scheduler.drain_pending_releases()
+
     self._last_batch = batch
 
     return StepOutput(
@@ -891,12 +909,6 @@ class LLMEngine:
         num_prefill = sum(batch.extend_lens) if batch.extend_lens else 0
     elif batch.forward_mode.is_decode():
       num_decode = len(batch.reqs)
-
-    # Immediately update radix cache after processing this batch result.
-    # This ensures radix cache state is fresh before the next schedule() call,
-    # eliminating the need for a separate drain step in step_overlap().
-    if getattr(self.scheduler, "pending_release_reqs", None):
-      self.scheduler.drain_pending_releases()
 
     return StepOutput(
       outputs=outputs,

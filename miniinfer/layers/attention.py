@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from .linear import linear, softmax
 
 if TYPE_CHECKING:
-  from engine.scheduler_batch import ForwardBatch
+  from miniinfer.scheduler.scheduler_batch import ForwardBatch
 
 
 def scaled_dot_product_attention_simple(

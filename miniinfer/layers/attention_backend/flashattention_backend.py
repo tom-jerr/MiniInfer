@@ -1,13 +1,15 @@
 from __future__ import annotations
 from .base_backend import AttentionBackend
-from miniinfer.layers.attention import AttentionImpl
-from miniinfer.scheduler.scheduler_batch import ForwardBatch
-from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 import torch
 from dataclasses import dataclass
 from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 import logging
+
+if TYPE_CHECKING:
+  from miniinfer.layers.attention import AttentionImpl
+  from miniinfer.scheduler.scheduler_batch import ForwardBatch
+  from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 
 logger = logging.getLogger(__name__)
 

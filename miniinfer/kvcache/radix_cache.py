@@ -4,10 +4,11 @@ import heapq
 import logging
 
 import torch
-from kvcache.interface import IPrefixCache, ITokenAllocator
 from typing import List, Tuple, Any, Optional
 import time
 import hashlib
+
+from .interface import IPrefixCache, ITokenAllocator
 
 logger = logging.getLogger(__name__)
 

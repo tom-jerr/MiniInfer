@@ -3,10 +3,10 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from miniinfer.layers.attention import AttentionImpl
 
 if TYPE_CHECKING:
-  from miniinfer.engine.scheduler_batch import ForwardBatch
+  from miniinfer.layers.attention import AttentionImpl
+  from miniinfer.scheduler.scheduler_batch import ForwardBatch
 
 
 class AttentionBackend(ABC):

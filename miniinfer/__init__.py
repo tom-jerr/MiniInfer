@@ -1,81 +1,200 @@
-import torch
-import pytest
-from flash_attn import flash_attn_varlen_func, flash_attn_func
-from utils import *
+"""MiniInfer package entrypoint with eager subpackage imports."""
+
+from __future__ import annotations
+
+import importlib
+import os
+from typing import Iterable
+
+from .config import EngineConfig, PretrainedConfig, Qwen2Config, Qwen3Config
+from .engine import (
+  CapturedGraph,
+  ChatTemplateHandler,
+  CudaGraphRunner,
+  DecodeState,
+  FutureIndices,
+  FutureMap,
+  IncrementalBatchTokenizer,
+  IncrementalDecoder,
+  LLMEngine,
+  ModelRunner,
+  OverlapBatchRecord,
+  OverlapExecutor,
+  RequestOutput,
+  StepOutput,
+)
+from .kvcache import (
+  IKVCacheStorage,
+  IPrefixCache,
+  IRequestPool,
+  ITokenAllocator,
+  KVCacheManager,
+  MHAKVCacheStorage,
+  PagedTokenAllocator,
+  RadixCache,
+  RequestPool,
+  TokenAllocator,
+)
+from .layers import (
+  AttentionBackend,
+  AttentionImpl,
+  FlashAttention2Backend,
+  FlashAttention2Metadata,
+  FlashAttention3Backend,
+  FlashAttention3Metadata,
+  LMHead,
+  RMSNorm,
+  RotaryEmbedding,
+  Sampler,
+  VocabEmbedding,
+  apply_activation,
+  causal_mask,
+  get_activation,
+  get_attention,
+  linear,
+  softmax,
+)
+from .loader import DisabledTqdm, WeightLoaderMixin, load_hf_weight
+from .models import (
+  BaseModelOutput,
+  Qwen2Attention,
+  Qwen2ForCausalLM,
+  Qwen2MLP,
+  Qwen2Model,
+  Qwen2TransformerBlock,
+  Qwen3Attention,
+  Qwen3ForCausalLM,
+  Qwen3MLP,
+  Qwen3Model,
+  Qwen3TransformerBlock,
+)
+from .scheduler import (
+  AddReqResult,
+  BatchResult,
+  BatchType,
+  ChunkedReq,
+  ForwardBatch,
+  ForwardMode,
+  PrefillAdder,
+  Req,
+  ScheduledBatch,
+  Scheduler,
+  clamp_position,
+  compute_positions_extend,
+)
+from .utils import (
+  SamplingParams,
+  calc_max_total_tokens,
+  dequantize_linear,
+  make_model,
+  profile_methods,
+  shortcut_name_to_full_name,
+  stage,
+)
+
+_EAGER_IMPORT_PACKAGES = (
+  "config",
+  "config.engine",
+  "config.model",
+  "loader",
+  "layers",
+  "layers.attention_backend",
+  "kvcache",
+  "scheduler",
+  "models",
+  "engine",
+  "utils",
+)
 
 
-@pytest.fixture(scope="module")
-def init():
-  dtype = torch.float32
-  HEAD = 2
-  HEAD_DIM = 2
-  seqlens = [1, 2, 3, 4]
-
-  query = torch.empty(0, HEAD, HEAD_DIM, dtype=dtype, device="cuda")
-  key = torch.empty(0, HEAD, HEAD_DIM, dtype=dtype, device="cuda")
-  value = torch.empty(0, HEAD, HEAD_DIM, dtype=dtype, device="cuda")
-
-  querys, keys, values = [], [], []
-
-  for l in seqlens:
-    q = torch.rand(l, HEAD, HEAD_DIM, dtype=dtype, device="cuda")
-    k = torch.rand(l, HEAD, HEAD_DIM, dtype=dtype, device="cuda")
-    v = torch.rand(l, HEAD, HEAD_DIM, dtype=dtype, device="cuda")
-
-    querys.append(q)
-    keys.append(k)
-    values.append(v)
-
-    query = torch.cat([query, q], dim=0)
-    key = torch.cat([key, k], dim=0)
-    value = torch.cat([value, v], dim=0)
-
-  return {
-    "querys": querys,
-    "keys": keys,
-    "values": values,
-    "query": query,
-    "key": key,
-    "value": value,
-    "seqlens": seqlens,
-  }
+def eager_import_packages(packages: Iterable[str] = _EAGER_IMPORT_PACKAGES) -> None:
+  """Import package entrypoints eagerly to front-load module initialization."""
+  for package in packages:
+    importlib.import_module(f"{__name__}.{package}")
 
 
-def test_fla_attn_func(init):
-  for q, k, v in zip(init["querys"], init["keys"], init["values"]):
-    q = q.unsqueeze(0)
-    k = k.unsqueeze(0)
-    v = v.unsqueeze(0)
-
-    out = flash_attn_func(q, k, v)
-    ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
-    assert_close(out, ref_out, precision=torch.float32)
+if os.getenv("MINIINFER_EAGER_IMPORT", "1").strip().lower() not in {"0", "false", "off", "no"}:
+  eager_import_packages()
 
 
-def test_fla_varlen_func(init):
-  seqlens = init["seqlens"]
-  query = init["query"]
-  key = init["key"]
-  value = init["value"]
-
-  seq_len = torch.tensor(seqlens, dtype=torch.int32, device="cuda")
-
-  cu_seqlens = torch.zeros(len(seqlens) + 1, dtype=torch.int32, device="cuda")
-  cu_seqlens[1:] = torch.cumsum(seq_len, dim=0)
-
-  max_seqlen = max(seqlens)
-
-  out = flash_attn_varlen_func(
-    query,
-    key,
-    value,
-    cu_seqlens,
-    cu_seqlens,
-    max_seqlen,
-    max_seqlen,
-  )
-
-  acc = 0
-  for l in seqlens:
-    print(out[acc : acc + l])
-    acc += l
+__all__ = [
+  "AddReqResult",
+  "AttentionBackend",
+  "AttentionImpl",
+  "BaseModelOutput",
+  "BatchResult",
+  "BatchType",
+  "CapturedGraph",
+  "ChatTemplateHandler",
+  "ChunkedReq",
+  "CudaGraphRunner",
+  "DecodeState",
+  "DisabledTqdm",
+  "EngineConfig",
+  "FlashAttention2Backend",
+  "FlashAttention2Metadata",
+  "FlashAttention3Backend",
+  "FlashAttention3Metadata",
+  "ForwardBatch",
+  "ForwardMode",
+  "FutureIndices",
+  "FutureMap",
+  "IKVCacheStorage",
+  "IPrefixCache",
+  "IRequestPool",
+  "ITokenAllocator",
+  "IncrementalBatchTokenizer",
+  "IncrementalDecoder",
+  "KVCacheManager",
+  "LLMEngine",
+  "LMHead",
+  "MHAKVCacheStorage",
+  "ModelRunner",
+  "OverlapBatchRecord",
+  "OverlapExecutor",
+  "PagedTokenAllocator",
+  "PrefillAdder",
+  "PretrainedConfig",
+  "Qwen2Attention",
+  "Qwen2Config",
+  "Qwen2ForCausalLM",
+  "Qwen2MLP",
+  "Qwen2Model",
+  "Qwen2TransformerBlock",
+  "Qwen3Attention",
+  "Qwen3Config",
+  "Qwen3ForCausalLM",
+  "Qwen3MLP",
+  "Qwen3Model",
+  "Qwen3TransformerBlock",
+  "RMSNorm",
+  "RadixCache",
+  "Req",
+  "RequestOutput",
+  "RequestPool",
+  "RotaryEmbedding",
+  "Sampler",
+  "SamplingParams",
+  "ScheduledBatch",
+  "Scheduler",
+  "StepOutput",
+  "TokenAllocator",
+  "VocabEmbedding",
+  "WeightLoaderMixin",
+  "apply_activation",
+  "calc_max_total_tokens",
+  "causal_mask",
+  "clamp_position",
+  "compute_positions_extend",
+  "dequantize_linear",
+  "eager_import_packages",
+  "get_activation",
+  "get_attention",
+  "linear",
+  "load_hf_weight",
+  "make_model",
+  "profile_methods",
+  "shortcut_name_to_full_name",
+  "softmax",
+  "stage",
+]

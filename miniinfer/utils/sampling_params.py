@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class SamplingParams:
-  temperature: float = 0
+  temperature: float = 1.0
   max_tokens: int = 1
   ignore_eos: bool = False
   # Sampling controls. Set `temperature=0` for greedy decoding.

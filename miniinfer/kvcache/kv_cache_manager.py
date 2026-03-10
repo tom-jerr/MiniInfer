@@ -6,15 +6,15 @@ from typing import Optional, Tuple
 import torch
 import logging
 
-from kvcache.interface import (
+from .interface import (
   IKVCacheStorage,
   ITokenAllocator,
   IRequestPool,
   IPrefixCache,
 )
-from kvcache.memory_pool import MHAKVCacheStorage, PagedTokenAllocator, RequestPool
-from kvcache.radix_cache import RadixCache
-from scheduler.scheduler_batch import ScheduledBatch, Req, ForwardMode, ForwardBatch
+from .memory_pool import MHAKVCacheStorage, PagedTokenAllocator, RequestPool
+from .radix_cache import RadixCache
+from miniinfer.scheduler.scheduler_batch import ScheduledBatch, Req, ForwardMode, ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,45 @@ class KVCacheManager:
     )
 
   # ============== public methods for scheduler ==============
+
+  def warmup_release_path(self) -> None:
+    """
+    Warm up CUDA ops used by the deferred release path.
+
+    The first real `drain_pending_releases()` can otherwise pay for lazy module
+    loading (e.g. request-pool read cast and grouped free/unique kernels). Use
+    a no-op warmup that leaves allocator/request-pool state unchanged.
+    """
+    if not torch.cuda.is_available() or str(self.device) == "cpu":
+      return
+
+    # Warm request-pool read/cast used to fetch kv_indices during release.
+    warmup_tokens = max(1, min(int(self.page_size), int(self.max_context_len)))
+    _ = self.request_pool.read(0, slice(0, warmup_tokens))
+
+    free_pages = getattr(self.token_allocator, "free_pages", None)
+    if free_pages is None or free_pages.numel() == 0:
+      torch.cuda.synchronize()
+      return
+
+    # Warm grouped free/flush kernels using an already-free page so allocator
+    # contents stay logically unchanged after dedup.
+    dummy_page = free_pages[:1].clone()
+    page_offsets = torch.arange(self.page_size, dtype=torch.int64, device=self.device)
+    dummy_free = dummy_page * self.page_size + page_offsets
+
+    begin_group = getattr(self.token_allocator, "begin_free_group", None)
+    end_group = getattr(self.token_allocator, "end_free_group", None)
+    if begin_group is not None and end_group is not None:
+      begin_group()
+      try:
+        self.token_allocator.free(dummy_free)
+      finally:
+        end_group()
+    else:
+      self.token_allocator.free(dummy_free)
+
+    torch.cuda.synchronize()
 
   def prefix_for_waiting_req(self, req: "Req"):
     """Req is mutable"""

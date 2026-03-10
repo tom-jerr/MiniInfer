@@ -1,8 +1,9 @@
-from typing import Dict, Optional
-from loader.weight import WeightLoaderMixin
 import torch
 from torch import nn
+from typing import Dict, Optional
+
 from kernels.triton.rms_norm import add_rms_norm_forward
+from miniinfer.loader.weight import WeightLoaderMixin
 
 
 class RMSNorm(nn.Module, WeightLoaderMixin):

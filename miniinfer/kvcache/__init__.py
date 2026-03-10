@@ -10,18 +10,19 @@ KV Cache 模块
 """
 
 from .kv_cache_manager import KVCacheManager
-from .memory_pool import (
-  MHAKVCacheStorage,
-  PagedTokenAllocator,
-  TokenAllocator,
-  RequestPool,
-)
 from .interface import (
   IKVCacheStorage,
   ITokenAllocator,
   IRequestPool,
   IPrefixCache,
 )
+from .memory_pool import (
+  MHAKVCacheStorage,
+  PagedTokenAllocator,
+  RequestPool,
+  TokenAllocator,
+)
+from .radix_cache import RadixCache
 
 __all__ = [
   # Manager
@@ -36,4 +37,5 @@ __all__ = [
   "ITokenAllocator",
   "IRequestPool",
   "IPrefixCache",
+  "RadixCache",
 ]

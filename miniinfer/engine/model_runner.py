@@ -7,25 +7,26 @@ ModelRunner - 模型推理执行器
 3. 采样生成 token
 """
 
+import logging
 from typing import Any
-from models.base import BaseModelOutput
+
 import torch
 
-from config.engine.config import EngineConfig
+from miniinfer.config.engine.config import EngineConfig
+from miniinfer.config.model.base import PretrainedConfig
+from miniinfer.config.model.qwen2 import Qwen2Config
+from miniinfer.config.model.qwen3 import Qwen3Config
+from miniinfer.loader.weight import load_hf_weight
+from miniinfer.models.base import BaseModelOutput
+from miniinfer.models.fused_qwen2 import Qwen2ForCausalLM
+from miniinfer.models.fused_qwen3 import Qwen3ForCausalLM
 from miniinfer.scheduler.scheduler_batch import ForwardBatch
-from loader.weight import load_hf_weight
-from config.model.qwen2 import Qwen2Config
-from config.model.qwen3 import Qwen3Config
-from config.model.base import PretrainedConfig
-from models.fused_qwen2 import Qwen2ForCausalLM
-from models.fused_qwen3 import Qwen3ForCausalLM
 from miniinfer.layers.sample import Sampler, SamplingBatchInfo
 from miniinfer.layers.attention_backend.flashattention_backend import (
   FlashAttention2Backend,
 )
 from miniinfer.engine.cuda_graph_runner import CudaGraphRunner
 from miniinfer.utils.profiler_utils import profile_methods
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +274,7 @@ class ModelRunner:
         temperature=temps,
         top_ps=top_ps,
         top_ks=top_ks,
-        max_top_k=getattr(batch, "sampling_max_top_k", None),
+        # max_top_k=getattr(batch, "sampling_max_top_k", None),
         vocab_size=logits.size(-1),
       )
     else:
@@ -296,13 +297,13 @@ class ModelRunner:
           [seq.sampling_params.top_k for seq in batch.all_seqs],
           device=logits.device,
         ),
-        max_top_k=max(
-          1,
-          max(
-            (int(seq.sampling_params.top_k) for seq in batch.all_seqs),
-            default=0,
-          ),
-        ),
+        # max_top_k=max(
+        #   1,
+        #   max(
+        #     (int(seq.sampling_params.top_k) for seq in batch.all_seqs),
+        #     default=0,
+        #   ),
+        # ),
         vocab_size=logits.size(-1),
       )
 
