@@ -9,6 +9,7 @@
 ### 1. llm_engine.py - 显式指定 schedule_stream
 
 **Before**:
+
 ```python
 # schedule 和 prepare 操作没有指定 stream
 batch = self.scheduler.schedule(...)
@@ -16,6 +17,7 @@ forward_batch = ForwardBatch.init_new(batch, ...)
 ```
 
 **After**:
+
 ```python
 # 显式在 schedule_stream 上执行
 with torch.cuda.stream(self.overlap_executor.schedule_stream):
@@ -26,6 +28,7 @@ with torch.cuda.stream(self.overlap_executor.schedule_stream):
 ```
 
 **效果**：
+
 - 所有 CPU 侧的元数据准备在 schedule_stream 上执行
 - 所有 `.to(device, non_blocking=True)` 自动使用当前 stream（schedule_stream）
 - forward_stream 正确等待 schedule_stream 完成
@@ -37,7 +40,7 @@ with torch.cuda.stream(self.overlap_executor.schedule_stream):
 ```python
 # ===================================================================
 # Stream 管理（SGLang 风格）
-# 
+#
 # schedule_stream (默认流):
 #   - schedule() 调度逻辑
 #   - prepare_*() 元数据准备
@@ -70,15 +73,15 @@ schedule_stream:
       |-- schedule(N) + prepare(N) + init(N) --|
                         ↓
                         (H2D async transfers in this stream)
-                        
+
 forward_stream:
                         |--------- forward(N) ---------|
                         ↑ wait(schedule_stream)
-                        
+
 copy_stream:
                                           |-- copy(N) to CPU --|
                                           ↑ wait(forward_stream)
-                                          
+
 CPU main thread:
       |-- process(N-1) --|
                         ↑ sync(copy_done_event from N-1)
@@ -111,20 +114,21 @@ with torch.cuda.stream(schedule_stream):
     # 2. KVCacheManager.prepare_for_extend()
     # 直接在 pinned buffer 上填充数据（CPU 操作，无锁页开销）
     self.pinned_seq_lens[:bs] = torch.as_tensor(seq_lens, dtype=torch.int64)
-    
+
     # 3. 触发异步 DMA 传输（在 schedule_stream 上）
     seq_lens_tensor = self.pinned_seq_lens[:bs].to(device, non_blocking=True)
     # ↑ 立即返回，不等待传输完成
-    
+
 # 4. forward_stream 等待 schedule_stream
 with torch.cuda.stream(forward_stream):
     forward_stream.wait_stream(schedule_stream)  # GPU 侧等待
-    
+
     # 5. 现在可以安全使用 seq_lens_tensor
     output = model.forward(forward_batch)
 ```
 
 **性能优势**：
+
 - 无 PyTorch 内部的临时 buffer 复制（零拷贝）
 - DMA 传输与 CPU 工作并行
 - GPU 侧自动等待传输完成（不阻塞 CPU）
@@ -163,20 +167,24 @@ CPU main:        |-- process(N-2) --|-- process(N-1) --|-- process(N) --|
 ## 优化层次总结
 
 ### Level 0: 基线（无优化）
+
 - 同步执行，GPU 等待 CPU
 - GPU 利用率: ~60-70%
 
 ### Level 1: 消除 CUDA Sync（已完成）
+
 - 使用 `non_blocking=True`
 - 避免 `.item()` 调用
 - GPU 利用率: ~94%
 
 ### Level 2: Pinned Memory Pool（已完成）
+
 - 预分配 pinned buffers
 - 真正的零拷贝异步传输
 - GPU 利用率: ~95%
 
 ### Level 3: Stream 管理（本次优化）
+
 - 三 stream pipeline 并行
 - 正确的操作顺序和同步
 - **GPU 利用率: ~95-96%**
@@ -195,12 +203,12 @@ CPU main:        |-- process(N-2) --|-- process(N-1) --|-- process(N) --|
 
 ### 新增的文档
 
-1. **docs/CUDA_Stream_优化实现.md**
+1. **docs/CUDA*Stream*优化实现.md**
    - 完整的 stream 架构说明
    - Timeline 可视化
    - 实现细节和性能对比
 
-2. **docs/Stream_优化总结.md**（本文件）
+2. **docs/Stream\_优化总结.md**（本文件）
    - 优化总结和代码改动清单
 
 ## 验证方法
@@ -248,12 +256,14 @@ python benchmark/bench_simple.py --model Qwen/Qwen2-1.5B-Instruct
 ### 不建议继续优化
 
 **原因**：
+
 1. GPU 利用率已经接近理论极限（95-96%）
 2. 继续优化的边际收益极小（<1%）
 3. 架构复杂度大幅增加（多线程、C++ 等）
 4. 真正的瓶颈在 GPU kernel、内存带宽等
 
 **应该转向**：
+
 - GPU kernel 优化（fusion、quantization）
 - 内存带宽优化（KV cache 压缩）
 - 调度策略优化（prefill/decode 平衡）
@@ -261,7 +271,7 @@ python benchmark/bench_simple.py --model Qwen/Qwen2-1.5B-Instruct
 
 ## 参考文档
 
-- [CUDA_Stream_优化实现.md](CUDA_Stream_优化实现.md) - 完整的 stream 架构说明
-- [SGLang_单线程架构分析.md](SGLang_单线程架构分析.md) - SGLang 的设计哲学
-- [Pinned_Memory_优化实现总结.md](Pinned_Memory_优化实现总结.md) - Pinned Memory 优化
-- [CPU_GPU_Overlap_深度分析.md](CPU_GPU_Overlap_深度分析.md) - Overlap 原理分析
+- [CUDA*Stream*优化实现.md](CUDA_Stream_优化实现.md) - 完整的 stream 架构说明
+- [SGLang\_单线程架构分析.md](SGLang_单线程架构分析.md) - SGLang 的设计哲学
+- [Pinned*Memory*优化实现总结.md](Pinned_Memory_优化实现总结.md) - Pinned Memory 优化
+- [CPU*GPU_Overlap*深度分析.md](CPU_GPU_Overlap_深度分析.md) - Overlap 原理分析

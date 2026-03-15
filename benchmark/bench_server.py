@@ -96,11 +96,15 @@ def main():
       [randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)
     ]
     sampling_params = [
-      SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_output_len))
+      SamplingParams(
+        temperature=1, top_k=1, top_p=1, ignore_eos=True, max_tokens=randint(100, max_output_len)
+      )
       for _ in range(num_seqs)
     ]
 
-    llm.generate(["Benchmark: "], SamplingParams(temperature=0.1))  # to warm up flashinfer
+    llm.generate(
+      ["Benchmark: "], SamplingParams(temperature=1, top_k=1, top_p=1)
+    )  # to warm up flashinfer
     if torch.cuda.is_available():
       torch.cuda.synchronize()
 

@@ -9,12 +9,13 @@
 参考 SGLang 的设计，发现主要瓶颈在 CPU 侧元数据构建使用了大量 Python 循环，无法与 GPU 计算有效 overlap：
 
 1. **prepare_for_mixed/decode**: 使用 list comprehension 构建元数据
-2. **_rebuild_running_batch_metadata**: 循环计算每个请求的 seq_len
+2. **\_rebuild_running_batch_metadata**: 循环计算每个请求的 seq_len
 3. **ForwardBatch.init_new**: 多次 list → tensor 转换
 
 ## 优化方案
 
 ### 核心思想
+
 - **缓存替代计算**: 在 Req 对象中维护缓存字段，避免重复计算
 - **批量替代循环**: 使用预分配的 tensor 和向量化操作替代 Python 循环
 - **减少转换**: 直接在 GPU 上分配 tensor，减少 CPU ↔ GPU 数据转移
@@ -22,6 +23,7 @@
 ### 具体实现
 
 #### 1. Req 类增强 (scheduler_batch.py)
+
 ```python
 # 新增缓存字段
 self._cached_seq_len = len(token_ids)     # 缓存序列长度
@@ -44,7 +46,8 @@ def current_seq_len(self) -> int:
     return self._cached_seq_len
 ```
 
-#### 2. 优化 _rebuild_running_batch_metadata (scheduler.py)
+#### 2. 优化 \_rebuild_running_batch_metadata (scheduler.py)
+
 ```python
 # 优化前：Python 循环 + 重复计算
 seq_lens = [len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs]
@@ -57,6 +60,7 @@ for i, req in enumerate(batch.reqs):
 ```
 
 #### 3. 优化 prepare_for_decode (kv_cache_manager.py)
+
 ```python
 # 优化前：list comprehension + 双重转换
 last_tokens = [req.output_ids[-1] for req in batch.reqs]
@@ -70,6 +74,7 @@ batch.input_ids = last_tokens
 ```
 
 #### 4. 优化 prepare_for_mixed (kv_cache_manager.py)
+
 ```python
 # 优化前：多次遍历
 extend_num_tokens = sum(len(ids) for ids in extend_ids_list)
@@ -80,29 +85,32 @@ for r in decode_reqs:
 extend_num_tokens = 0
 for r in extend_reqs:
     extend_num_tokens += len(ids)  # 边循环边累加
-    
+
 for r in decode_reqs:
     cur_seq_len = r.current_seq_len  # 使用缓存
 ```
 
 #### 5. 删除废弃代码 (scheduler_batch.py)
+
 删除了包含 Python 循环的旧实现 `compute_position_torch`，保留向量化的 `compute_positions_extend`。
 
 ## 改动的关键文件
 
 1. ✅ `miniinfer/scheduler/scheduler_batch.py` - Req 类增强
-2. ✅ `miniinfer/scheduler/scheduler.py` - 优化 _rebuild_running_batch_metadata
+2. ✅ `miniinfer/scheduler/scheduler.py` - 优化 \_rebuild_running_batch_metadata
 3. ✅ `miniinfer/kvcache/kv_cache_manager.py` - 优化 prepare_for_mixed/decode
 4. ✅ `miniinfer/engine/llm_engine.py` - 更新 token append 调用
 
 ## 预期效果
 
 ### 定量预测
+
 - **forward_batch_init 耗时**: 减少 50-70%
 - **CPU 操作次数**: 减少 40-60%
 - **内存分配次数**: 减少 30-50%
 
 ### 定性改进
+
 - ✅ 更好的 CPU-GPU overlap
 - ✅ 减少 GPU 空闲等待时间
 - ✅ 提升整体 throughput
@@ -111,6 +119,7 @@ for r in decode_reqs:
 ## 验证方法
 
 ### 功能测试
+
 ```bash
 # 运行测试套件确保无回归
 pytest tests/test_stream_generate.py
@@ -119,12 +128,14 @@ pytest tests/test_memory_pressure.py
 ```
 
 ### 性能测试
+
 ```bash
 # 对比优化前后的性能
 python benchmark/bench_simple.py --model Qwen/Qwen2-1.5B-Instruct
 ```
 
 重点关注：
+
 - forward_batch_init 阶段耗时
 - schedule 阶段耗时
 - GPU 利用率

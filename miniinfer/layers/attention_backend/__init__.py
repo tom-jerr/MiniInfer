@@ -8,6 +8,8 @@ __all__ = [
   "FlashAttention2Metadata",
   "FlashAttention3Backend",
   "FlashAttention3Metadata",
+  "FlashInferBackend",
+  "FlashInferMetadata",
 ]
 
 
@@ -18,6 +20,24 @@ def __getattr__(name: str):
     "FlashAttention3Backend",
     "FlashAttention3Metadata",
   }:
+    from .flashattention_backend import (
+      FlashAttention2Backend,
+      FlashAttention2Metadata,
+      FlashAttention3Backend,
+      FlashAttention3Metadata,
+    )
+
+    return locals()[name]
+  elif name in {
+    "FlashInferBackend",
+    "FlashInferMetadata",
+  }:
+    from .flashinfer_backend import (
+      FlashInferBackend,
+      FlashInferMetadata,
+    )
+
+    return locals()[name]
     from .flashattention_backend import (
       FlashAttention2Backend,
       FlashAttention2Metadata,

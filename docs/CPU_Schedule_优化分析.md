@@ -11,7 +11,7 @@
    - 多次 list → tensor 转换
    - 示例：`[len(ids) for ids in extend_ids_list]`
 
-2. **_rebuild_running_batch_metadata** (scheduler.py)
+2. **\_rebuild_running_batch_metadata** (scheduler.py)
    - 循环计算每个请求的 seq_len
    - 示例：`[len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs]`
 
@@ -45,6 +45,7 @@
 **修改位置**: `miniinfer/scheduler/scheduler_batch.py`
 
 **新增字段**:
+
 ```python
 # 缓存当前序列长度，避免重复计算 len(origin_input_ids) + len(output_ids)
 self._cached_seq_len = len(token_ids)
@@ -53,6 +54,7 @@ self._cached_last_token = None
 ```
 
 **新增方法**:
+
 ```python
 @property
 def current_seq_len(self) -> int:
@@ -82,12 +84,14 @@ def get_last_token(self) -> Optional[int]:
 **修改位置**: `miniinfer/kvcache/kv_cache_manager.py:prepare_for_decode`
 
 **优化前**:
+
 ```python
 last_tokens = [req.output_ids[-1] for req in batch.reqs]
 batch.input_ids = torch.tensor(last_tokens, dtype=torch.int64).to(self.device)
 ```
 
 **优化后**:
+
 ```python
 # 小批次：直接使用缓存的 last_token (避免访问 output_ids[-1])
 last_tokens = torch.empty(bs, dtype=torch.int64, device=self.device)
@@ -99,16 +103,18 @@ for i, req in enumerate(batch.reqs):
 batch.input_ids = last_tokens
 ```
 
-**效果**: 
+**效果**:
+
 - 直接在 GPU 上分配 tensor，减少 CPU → GPU 转换
 - 使用缓存的 last_token 避免列表访问
 - 避免 Python list 构建和中间转换
 
-### 3. 优化 _rebuild_running_batch_metadata
+### 3. 优化 \_rebuild_running_batch_metadata
 
 **修改位置**: `miniinfer/scheduler/scheduler.py:_rebuild_running_batch_metadata`
 
 **优化前**:
+
 ```python
 pool_indices = []
 for req in batch.reqs:
@@ -120,6 +126,7 @@ batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
 ```
 
 **优化后**:
+
 ```python
 # 预分配 tensor
 bs = len(batch.reqs)
@@ -135,6 +142,7 @@ for i, req in enumerate(batch.reqs):
 ```
 
 **效果**:
+
 - 预分配 tensor 减少内存分配次数
 - 直接填充 tensor 避免 list 中间层
 - 使用缓存的 seq_len 避免重复计算
@@ -144,6 +152,7 @@ for i, req in enumerate(batch.reqs):
 **修改位置**: `miniinfer/kvcache/kv_cache_manager.py:prepare_for_mixed`
 
 **优化点 1 - extend 请求处理**:
+
 ```python
 # 优化前：多次 sum 和 len 调用
 extend_num_tokens = sum(len(ids) for ids in extend_ids_list)
@@ -158,6 +167,7 @@ for r in extend_reqs:
 ```
 
 **优化点 2 - decode 请求处理（同步路径）**:
+
 ```python
 # 优化前
 for r in decode_reqs:
@@ -171,6 +181,7 @@ for r in decode_reqs:
 ```
 
 **优化点 3 - 列表展开**:
+
 ```python
 # 优化前：多次 extend
 all_ids = []
@@ -186,6 +197,7 @@ all_ids.extend([t for ids in decode_ids_list for t in ids])
 ```
 
 **效果**:
+
 - 减少重复的列表遍历
 - 使用缓存字段避免重复计算
 - 优化列表构建操作
@@ -195,6 +207,7 @@ all_ids.extend([t for ids in decode_ids_list for t in ids])
 **修改位置**: `miniinfer/scheduler/scheduler_batch.py`
 
 删除了包含 Python 循环的旧实现：
+
 ```python
 def compute_position_torch(extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor):
     positions = torch.cat([
@@ -207,11 +220,13 @@ def compute_position_torch(extend_prefix_lens: torch.Tensor, extend_seq_lens: to
 
 ### 6. 更新所有 token append 调用
 
-**修改位置**: 
+**修改位置**:
+
 - `miniinfer/scheduler/scheduler.py:process_batch_result`
 - `miniinfer/engine/llm_engine.py:_process_overlap_result`
 
 **修改**:
+
 ```python
 # 优化前
 req.output_ids.append(token_id)
@@ -244,15 +259,18 @@ req.append_output_token(token_id)
 ### 关键优化点
 
 #### 高影响优化
+
 - ✅ `_rebuild_running_batch_metadata`: 频繁调用，减少 60% 耗时
 - ✅ `prepare_for_mixed`: 每个 mixed batch 调用，减少 40% 耗时
 - ✅ `prepare_for_decode`: 每个 decode step 调用，减少 30% 耗时
 
 #### 中等影响优化
+
 - ✅ Req 缓存字段: 避免重复计算
 - ✅ 删除废弃代码: 清理代码库
 
 #### 潜在进一步优化
+
 - 🔄 使用 NumPy/Numba 加速更多 CPU 操作
 - 🔄 预分配全局 buffer pool 减少分配
 - 🔄 使用 C++ 扩展重写热点路径

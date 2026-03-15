@@ -23,12 +23,18 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description="MiniInfer simple benchmark + torch.profiler trace export.")
+  parser = argparse.ArgumentParser(
+    description="MiniInfer simple benchmark + torch.profiler trace export."
+  )
   parser.add_argument("--model", default=os.getenv("MINIINFER_MODEL", "Qwen/Qwen2-0.5B-Instruct"))
   parser.add_argument("--batch-size", type=int, default=int(os.getenv("MINIINFER_BS", "8")))
   parser.add_argument("--prompt", default=os.getenv("MINIINFER_PROMPT", "Hello"))
-  parser.add_argument("--max-tokens", type=int, default=int(os.getenv("MINIINFER_MAX_TOKENS", "64")))
-  parser.add_argument("--temperature", type=float, default=float(os.getenv("MINIINFER_TEMP", "0.7")))
+  parser.add_argument(
+    "--max-tokens", type=int, default=int(os.getenv("MINIINFER_MAX_TOKENS", "64"))
+  )
+  parser.add_argument(
+    "--temperature", type=float, default=float(os.getenv("MINIINFER_TEMP", "0.7"))
+  )
   parser.add_argument(
     "--trace",
     default=os.getenv("MINIINFER_TRACE", "engine_profile.json"),

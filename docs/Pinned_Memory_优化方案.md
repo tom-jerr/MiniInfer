@@ -19,16 +19,16 @@ class KVCacheManager:
         # 预分配 pinned memory buffers for metadata
         max_bs = self.max_num_seqs
         max_tokens_per_step = self.max_total_tokens // 4  # 估计值
-        
+
         # 序列长度相关 (每个 batch 最多 max_bs 个请求)
         self.pinned_seq_lens = torch.empty(max_bs, dtype=torch.int64, pin_memory=True)
         self.pinned_prefix_lens = torch.empty(max_bs, dtype=torch.int64, pin_memory=True)
         self.pinned_extend_lens = torch.empty(max_bs, dtype=torch.int64, pin_memory=True)
         self.pinned_req_pool_indices = torch.empty(max_bs, dtype=torch.int64, pin_memory=True)
-        
+
         # token IDs (extend 阶段可能有很多 token)
         self.pinned_input_ids = torch.empty(max_tokens_per_step, dtype=torch.int64, pin_memory=True)
-        
+
         # Sampling params (per request)
         self.pinned_temperatures = torch.empty(max_bs, dtype=torch.float32, pin_memory=True)
         self.pinned_top_ps = torch.empty(max_bs, dtype=torch.float32, pin_memory=True)
@@ -45,32 +45,32 @@ def prepare_for_extend(self, batch: "ScheduledBatch"):
     prefix_lens = [len(r.prefix_indices) for r in batch.reqs]
     extend_lens = [r.extend_input_len for r in batch.reqs]
     bs = len(batch.reqs)
-    
+
     # 2. 直接在 pinned buffer 上填充数据
     # seq_lens
     torch.as_tensor(seq_lens, dtype=torch.int64, out=self.pinned_seq_lens[:bs])
     batch.seq_lens = self.pinned_seq_lens[:bs].to(self.device, non_blocking=True)
     batch.seq_lens_cpu = self.pinned_seq_lens[:bs].clone()  # CPU 副本
-    
+
     # prefix_lens
     torch.as_tensor(prefix_lens, dtype=torch.int64, out=self.pinned_prefix_lens[:bs])
     prefix_lens_device = self.pinned_prefix_lens[:bs].to(self.device, non_blocking=True)
-    
+
     # extend_lens
     torch.as_tensor(extend_lens, dtype=torch.int64, out=self.pinned_extend_lens[:bs])
     extend_lens_device = self.pinned_extend_lens[:bs].to(self.device, non_blocking=True)
-    
+
     # extend_ids (flatten)
     extend_ids_flat = [token_id for ids in extend_ids for token_id in ids]
     num_tokens = len(extend_ids_flat)
     torch.as_tensor(extend_ids_flat, dtype=torch.int64, out=self.pinned_input_ids[:num_tokens])
     extend_ids_tensor = self.pinned_input_ids[:num_tokens].to(self.device, non_blocking=True)
-    
+
     # req_pool_indices
     req_pool_indices = self.request_pool.alloc(bs)
     torch.as_tensor(req_pool_indices, dtype=torch.int64, out=self.pinned_req_pool_indices[:bs])
     req_pool_indices_tensor = self.pinned_req_pool_indices[:bs].to(self.device, non_blocking=True)
-    
+
     # ... 其余逻辑保持不变
 ```
 
@@ -83,33 +83,33 @@ class ForwardBatch:
     _pinned_temperatures: torch.Tensor = None
     _pinned_top_ps: torch.Tensor = None
     _pinned_top_ks: torch.Tensor = None
-    
+
     @classmethod
     def _ensure_pinned_buffers(cls, max_bs: int):
         if cls._pinned_temperatures is None:
             cls._pinned_temperatures = torch.empty(max_bs, dtype=torch.float32, pin_memory=True)
             cls._pinned_top_ps = torch.empty(max_bs, dtype=torch.float32, pin_memory=True)
             cls._pinned_top_ks = torch.empty(max_bs, dtype=torch.int64, pin_memory=True)
-    
+
     @classmethod
     def init_new(cls, batch: ScheduledBatch, attn_backend):
         bs = len(batch.reqs)
         cls._ensure_pinned_buffers(max_bs=256)  # 或从 config 获取
-        
+
         # 提取 sampling params 到 pinned buffer
         temps = [r.sampling_params.temperature for r in batch.reqs]
         top_ps = [r.sampling_params.top_p for r in batch.reqs]
         top_ks = [r.sampling_params.top_k for r in batch.reqs]
-        
+
         torch.as_tensor(temps, dtype=torch.float32, out=cls._pinned_temperatures[:bs])
         torch.as_tensor(top_ps, dtype=torch.float32, out=cls._pinned_top_ps[:bs])
         torch.as_tensor(top_ks, dtype=torch.int64, out=cls._pinned_top_ks[:bs])
-        
+
         dev = batch.device
         sampling_temperatures = cls._pinned_temperatures[:bs].to(dev, non_blocking=True)
         sampling_top_ps = cls._pinned_top_ps[:bs].to(dev, non_blocking=True)
         sampling_top_ks = cls._pinned_top_ks[:bs].to(dev, non_blocking=True)
-        
+
         # ... 其余逻辑
 ```
 

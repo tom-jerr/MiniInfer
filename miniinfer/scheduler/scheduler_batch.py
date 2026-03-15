@@ -295,7 +295,7 @@ class ForwardBatch:
 
   @classmethod
   def _ensure_pinned_buffers(cls, max_bs: int):
-    """确保 pinned memory buffers 已初始化（SGLang 风格优化）"""
+    """确保 pinned memory buffers 已初始化"""
     if cls._pinned_temperatures is None or max_bs > cls._max_buffer_size:
       cls._max_buffer_size = max(max_bs, cls._max_buffer_size)
       cls._pinned_temperatures = torch.empty(

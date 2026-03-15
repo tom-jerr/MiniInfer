@@ -814,9 +814,9 @@ class Scheduler:
           #     f"req_pool_idx={getattr(req, 'req_pool_idx', -1)} (already released)"
           #   )
           #   continue
-          assert req.req_pool_idx != -1, (
-            f"Pending release req_id={req.req_id} has invalid req_pool_idx={getattr(req, 'req_pool_idx', -1)}"
-          )
+          assert (
+            req.req_pool_idx != -1
+          ), f"Pending release req_id={req.req_id} has invalid req_pool_idx={getattr(req, 'req_pool_idx', -1)}"
           self.kv_cache_mgr.update_finished_req_radix_cache(req)
           req.req_pool_idx = -1
       finally:
@@ -831,9 +831,9 @@ class Scheduler:
         #     f"req_pool_idx={getattr(req, 'req_pool_idx', -1)} (already released)"
         #   )
         #   continue
-        assert req.req_pool_idx != -1, (
-          f"Pending release req_id={req.req_id} has invalid req_pool_idx={getattr(req, 'req_pool_idx', -1)}"
-        )
+        assert (
+          req.req_pool_idx != -1
+        ), f"Pending release req_id={req.req_id} has invalid req_pool_idx={getattr(req, 'req_pool_idx', -1)}"
         self.kv_cache_mgr.update_finished_req_radix_cache(req)
         req.req_pool_idx = -1
 

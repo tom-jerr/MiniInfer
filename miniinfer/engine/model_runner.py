@@ -22,8 +22,9 @@ from miniinfer.models.fused_qwen2 import Qwen2ForCausalLM
 from miniinfer.models.fused_qwen3 import Qwen3ForCausalLM
 from miniinfer.scheduler.scheduler_batch import ForwardBatch
 from miniinfer.layers.sample import Sampler, SamplingBatchInfo
-from miniinfer.layers.attention_backend.flashattention_backend import (
+from miniinfer.layers.attention_backend import (
   FlashAttention2Backend,
+  FlashInferBackend,
 )
 from miniinfer.engine.cuda_graph_runner import CudaGraphRunner
 from miniinfer.utils.profiler_utils import profile_methods
@@ -92,9 +93,12 @@ class ModelRunner:
       raise RuntimeError("Cannot initialize attn_backend without kv_cache_mgr")
 
     attn_backend = attn_backend or self._attn_backend_type
-    if attn_backend not in ["flash_attn"]:
+    if attn_backend not in ["flash_attn", "flashinfer"]:
       raise ValueError(f"Unsupported attention backend: {attn_backend}")
-    self.attn_backend = FlashAttention2Backend(self.kv_cache_mgr)
+    if attn_backend == "flashinfer":
+      self.attn_backend = FlashInferBackend(self.kv_cache_mgr)
+    else:
+      self.attn_backend = FlashAttention2Backend(self.kv_cache_mgr)
     logger.info(f"Using {self.attn_backend.type()} as attention backend.")
 
   def set_kv_cache_mgr(self, kv_cache_mgr: Any):

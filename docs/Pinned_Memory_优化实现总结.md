@@ -9,6 +9,7 @@
 ### 1. miniinfer/kvcache/kv_cache_manager.py
 
 **新增: Pinned Memory Buffer Pool 初始化**
+
 ```python
 # 在 __init__ 中预分配 pinned memory buffers
 self.pinned_seq_lens = torch.empty(max_requests, dtype=torch.int64, pin_memory=True)
@@ -19,6 +20,7 @@ self.pinned_input_ids = torch.empty(max_extend_tokens, dtype=torch.int64, pin_me
 ```
 
 **修改: prepare_for_extend() 使用 pinned buffer**
+
 ```python
 # Before (仍有隐式复制):
 extend_ids_cpu = torch.as_tensor(extend_ids_flat, dtype=torch.int64)
@@ -30,6 +32,7 @@ extend_ids_tensor = self.pinned_input_ids[:num_tokens].to(self.device, non_block
 ```
 
 应用到：
+
 - `seq_lens_tensor`
 - `prefix_lens_device`
 - `extend_lens_device`
@@ -39,6 +42,7 @@ extend_ids_tensor = self.pinned_input_ids[:num_tokens].to(self.device, non_block
 ### 2. miniinfer/scheduler/scheduler_batch.py
 
 **新增: 类级别 Pinned Memory Buffers**
+
 ```python
 from typing import ClassVar
 
@@ -49,7 +53,7 @@ class ForwardBatch:
     _pinned_top_ps: ClassVar[Optional[torch.Tensor]] = None
     _pinned_top_ks: ClassVar[Optional[torch.Tensor]] = None
     _max_buffer_size: ClassVar[int] = 256
-    
+
     @classmethod
     def _ensure_pinned_buffers(cls, max_bs: int):
         if cls._pinned_temperatures is None:
@@ -59,6 +63,7 @@ class ForwardBatch:
 ```
 
 **修改: init_new() 使用 pinned buffer**
+
 ```python
 # Before (仍有隐式复制):
 forward_batch.sampling_temperatures = torch.tensor(
@@ -74,6 +79,7 @@ forward_batch.sampling_temperatures = cls._pinned_temperatures[:bs].to(dev, non_
 ```
 
 应用到：
+
 - `sampling_temperatures`
 - `sampling_top_ps`
 - `sampling_top_ks`
@@ -114,16 +120,19 @@ tensor_gpu = self.pinned_buffer[:size].to(device, non_blocking=True)
 ## 性能预期
 
 ### Level 1: 消除 CUDA Sync（已完成）
+
 - 消除 20+ 个显式同步点
 - GPU 利用率: ~94%
 
 ### Level 2: Pinned Memory Pool（本次优化）
+
 - 消除隐式的临时 buffer 复制
 - 减少内存分配开销
 - **预计 GPU 利用率: ~95-96%**
 - **forward_batch_init 时间再减少 20-30%**
 
 ### Level 3: 多线程（不推荐）
+
 - 架构复杂度大幅增加
 - 受 Python GIL 限制
 - 边际收益: 95% → 99%
@@ -190,21 +199,25 @@ python benchmark/bench_simple.py --model Qwen/Qwen2-1.5B-Instruct
 ## 总结
 
 ✅ **已实现**:
+
 1. Level 1: 消除 CUDA 同步点（20+ 处）
 2. Level 2: Pinned Memory Buffer Pool（本PR）
    - KVCacheManager: 5 个 buffers
    - ForwardBatch: 3 个 class buffers
 
 ✅ **性能预期**:
+
 - CPU → GPU 传输：真正的零拷贝异步
 - forward_batch_init：再减少 20-30%
 - GPU 利用率：~95-96%
 
 ✅ **内存开销**:
+
 - 仅 76 KB pinned memory
 - 完全可接受
 
 ❌ **不推荐继续优化**:
+
 - 多线程预构建元数据（收益 <5%，复杂度 ×3）
 - 真正瓶颈在 GPU kernel、内存带宽、调度策略
 

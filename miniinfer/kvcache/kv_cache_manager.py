@@ -421,9 +421,7 @@ class KVCacheManager:
     # Evict if needed - check physical free pages
     if self.token_allocator.available_size() < total_new_tokens and self.prefix_cache is not None:
       needed_to_evict = total_new_tokens - self.token_allocator.available_size()
-      needed_to_evict = (
-        (needed_to_evict + self.page_size - 1) // self.page_size * self.page_size
-      )
+      needed_to_evict = (needed_to_evict + self.page_size - 1) // self.page_size * self.page_size
       logger.debug(
         "prepare_for_mixed: need to evict, "
         f"total_new_tokens={total_new_tokens}, available_size={self.token_allocator.available_size()}, needed_to_evict={needed_to_evict}"
@@ -461,7 +459,9 @@ class KVCacheManager:
     # Update request->kv_loc mapping for the newly allocated decode token:
     # new_pos = current_seq_len (0-indexed position of the new token)
     new_pos = decode_seq_lens
-    self.request_pool.req_to_token_pool()[decode_rpi, new_pos] = decode_out_cache_loc.to(torch.int32)
+    self.request_pool.req_to_token_pool()[decode_rpi, new_pos] = decode_out_cache_loc.to(
+      torch.int32
+    )
 
     # Increment decode seq_lens for forward (now includes the newly allocated token)
     decode_seq_lens.add_(1)
@@ -485,7 +485,9 @@ class KVCacheManager:
 
       # Prepare extend input_ids via pinned buffer (async H2D)
       if extend_num_tokens > 0:
-        self.pinned_input_ids[:extend_num_tokens] = torch.as_tensor(extend_ids_flat, dtype=torch.int64)
+        self.pinned_input_ids[:extend_num_tokens] = torch.as_tensor(
+          extend_ids_flat, dtype=torch.int64
+        )
         extend_ids_tensor = self.pinned_input_ids[:extend_num_tokens].to(
           self.device, non_blocking=True
         )
@@ -579,8 +581,12 @@ class KVCacheManager:
 
     # req_pool_indices: per-seq mapping
     all_req_pool_indices = extend_req_pool_indices + decode_req_pool_indices
-    self.pinned_req_pool_indices[:total_bs] = torch.as_tensor(all_req_pool_indices, dtype=torch.int64)
-    batch.req_pool_indices = self.pinned_req_pool_indices[:total_bs].to(self.device, non_blocking=True)
+    self.pinned_req_pool_indices[:total_bs] = torch.as_tensor(
+      all_req_pool_indices, dtype=torch.int64
+    )
+    batch.req_pool_indices = self.pinned_req_pool_indices[:total_bs].to(
+      self.device, non_blocking=True
+    )
 
     # out_cache_loc: per-token mapping aligned with input_ids
     if extend_num_tokens > 0:

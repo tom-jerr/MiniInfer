@@ -199,7 +199,13 @@ class LLMEngine:
     # 步骤 1: 先创建 ModelRunner 并加载模型（不传入 kv_cache_mgr）
     logger.info("Step 1: Loading model...")
     with stage("stage::LLMEngine.init.model_runner"):
-      self.model_runner = ModelRunner(self.config, kv_cache_mgr=None, rank=0, events=self.events)
+      self.model_runner = ModelRunner(
+        self.config,
+        kv_cache_mgr=None,
+        rank=0,
+        events=self.events,
+        attn_backend=config.attention_backend,
+      )
 
     # 步骤 2: 模型加载完成后，基于实际已分配显存计算 max_total_tokens
     logger.info("Step 2: Calculating max_total_tokens based on actual GPU memory usage...")
