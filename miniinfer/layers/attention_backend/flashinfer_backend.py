@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
 import torch
-import logging
+from miniinfer.utils import get_logger
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING, Tuple
 
@@ -17,7 +17,7 @@ from miniinfer.scheduler.scheduler_batch import ForwardBatch
 if TYPE_CHECKING:
   from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass

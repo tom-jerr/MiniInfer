@@ -2,12 +2,12 @@ import torch
 from enum import Enum
 import numpy as np
 from typing import Optional, Union, List, Tuple, Any
-import logging
+from miniinfer.utils import get_logger
 from .interface import IKVCacheStorage, ITokenAllocator, IRequestPool
 import triton
 import triton.language as tl
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 GB = 1024 * 1024 * 1024
 
 

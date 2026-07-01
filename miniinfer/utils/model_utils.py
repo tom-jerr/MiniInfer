@@ -42,31 +42,30 @@ def _print_progress(
   progress_cnt: int,
   start_time: datetime,
 ):
-  print(f"  --- {datetime.now() - start_time}")
+  from miniinfer.utils import get_logger
+  log = get_logger("miniinfer")
+  log.info(f"--- {datetime.now() - start_time}")
   animation_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
   animation_frame = animation_frames[progress_cnt % len(animation_frames)]
   for i in range(len(requests)):
     if is_idle[i]:
-      print(f"  Decode #{i}: idle", flush=True)
+      log.info(f"Decode #{i}: idle")
     else:
       text_preview = requests[i].text()[-80:].replace("\n", " ")
-      print(
+      log.info(
         f"{animation_frame} Decode [req {requests[i].prompt_idx}, {requests[i].offset}]: {text_preview}",
-        flush=True,
       )
   if pending_prefill_request is not None:
     if pending_prefill_request.is_prefill_done:
-      print(
-        f"  Prefill [req {pending_prefill_request.prompt_idx}]: done, waiting for slot, {queue_size} requests in queue",
-        flush=True,
+      log.info(
+        f"Prefill [req {pending_prefill_request.prompt_idx}]: done, waiting for slot, {queue_size} requests in queue",
       )
       return
     precentage = (
       pending_prefill_request.offset / pending_prefill_request.prefill_tokens.size(-1)
     ) * 100
-    print(
+    log.info(
       f"{animation_frame} Prefill [req {pending_prefill_request.prompt_idx}]: {precentage:.2f}% ({pending_prefill_request.prefill_tokens.size(-1) - pending_prefill_request.offset} remaining tokens)",
-      flush=True,
     )
   else:
-    print(f"  Prefill: idle, {queue_size} requests in queue", flush=True)
+    log.info(f"Prefill: idle, {queue_size} requests in queue")

@@ -4,14 +4,14 @@ import torch
 from dataclasses import dataclass
 from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 from typing import Optional, TYPE_CHECKING
-import logging
+from miniinfer.utils import get_logger
 
 if TYPE_CHECKING:
   from miniinfer.layers.attention import AttentionImpl
   from miniinfer.scheduler.scheduler_batch import ForwardBatch
   from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -277,9 +277,9 @@ class FlashAttention2Backend(AttentionBackend):
       kv_locs = self.kv_cache_mgr.get_page_table(forward_batch, max_seq_len_k)
       # Debug: check kv_locs
       if getattr(forward_batch, "debug_decode", False):
-        print(f"  [_build_block_table] max_seq_len_k: {max_seq_len_k}")
-        print(f"  [_build_block_table] kv_locs shape: {kv_locs.shape}")
-        print(f"  [_build_block_table] kv_locs[:, :5]: {kv_locs[:, :5].tolist()}")
+        logger.debug(f"[_build_block_table] max_seq_len_k: {max_seq_len_k}")
+        logger.debug(f"[_build_block_table] kv_locs shape: {kv_locs.shape}")
+        logger.debug(f"[_build_block_table] kv_locs[:, :5]: {kv_locs[:, :5].tolist()}")
       # Take the first token of each page to form the block table.
       # Flash Attention requires block_table to have contiguous last dimension.
       # Strided slicing (::page_size) creates non-contiguous memory, so we must
@@ -287,7 +287,7 @@ class FlashAttention2Backend(AttentionBackend):
       block_indices = kv_locs[:, :: self.page_size].contiguous()
       block_table = (block_indices // self.page_size).to(torch.int32).contiguous()
       if getattr(forward_batch, "debug_decode", False):
-        print(f"  [_build_block_table] block_table: {block_table.tolist()}")
+        logger.debug(f"[_build_block_table] block_table: {block_table.tolist()}")
       return block_table
 
     if forward_batch.forward_mode.is_decode():
@@ -428,11 +428,11 @@ class FlashAttention2Backend(AttentionBackend):
     # Debug: print shapes for first layer
     debug_decode = getattr(forward_batch, "debug_decode", False) and layer.layer_id == 0
     if debug_decode:
-      print("\n[FA2 forward_decode layer 0]")
-      print(f"  q shape: {q.shape}")
-      print(f"  k shape: {k.shape}")
-      print(f"  batch_size: {forward_batch.batch_size}")
-      print(f"  out_cache_loc: {forward_batch.out_cache_loc.tolist()}")
+      logger.debug("[FA2 forward_decode layer 0]")
+      logger.debug(f"q shape: {q.shape}")
+      logger.debug(f"k shape: {k.shape}")
+      logger.debug(f"batch_size: {forward_batch.batch_size}")
+      logger.debug(f"out_cache_loc: {forward_batch.out_cache_loc.tolist()}")
 
     if k is not None:
       assert v is not None
@@ -454,9 +454,9 @@ class FlashAttention2Backend(AttentionBackend):
     key_cache, value_cache = self.kv_cache_mgr.get_kv_buffer(layer.layer_id)
 
     if debug_decode:
-      print(f"  key_cache original shape: {key_cache.shape}")
-      print(f"  metadata.block_table: {metadata.block_table.tolist()}")
-      print(f"  metadata.cache_seqlens: {metadata.cache_seqlens_int32.tolist()}")
+      logger.debug(f"key_cache original shape: {key_cache.shape}")
+      logger.debug(f"metadata.block_table: {metadata.block_table.tolist()}")
+      logger.debug(f"metadata.cache_seqlens: {metadata.cache_seqlens_int32.tolist()}")
 
     key_cache = key_cache.view(
       -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -466,7 +466,7 @@ class FlashAttention2Backend(AttentionBackend):
     )  # [N_pages, page_size, nheads, headdim]
 
     if debug_decode:
-      print(f"  key_cache view shape: {key_cache.shape}")
+      logger.debug(f"key_cache view shape: {key_cache.shape}")
 
     block_table = metadata.block_table
     cache_seqlens = metadata.cache_seqlens_int32
@@ -477,7 +477,7 @@ class FlashAttention2Backend(AttentionBackend):
     q_reshaped = q.contiguous().view(batch_size, 1, layer.tp_q_head_num, layer.head_dim)
 
     if debug_decode:
-      print(f"  q_reshaped shape: {q_reshaped.shape}")
+      logger.debug(f"q_reshaped shape: {q_reshaped.shape}")
 
     # FA2 decode: use flash_attn_with_kvcache
     # Include cu_seqlens_q and max_seqlen_q for proper batch handling
@@ -493,7 +493,7 @@ class FlashAttention2Backend(AttentionBackend):
     )
 
     if debug_decode:
-      print(f"  output shape: {o.shape}")
+      logger.debug(f"output shape: {o.shape}")
 
     if isinstance(o, tuple):
       o = o[0]

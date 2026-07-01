@@ -15,9 +15,9 @@ Prefill 预算控制器
 
 from enum import Enum, auto
 from typing import Optional, List, Any
-import logging
+from miniinfer.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # 最大新 token 裁剪值，防止极端长输出请求过度预留 decode 空间
 CLIP_MAX_NEW_TOKENS = 1024

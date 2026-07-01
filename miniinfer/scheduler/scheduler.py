@@ -26,6 +26,7 @@ import logging
 import torch
 
 from miniinfer.config.engine.config import EngineConfig
+from miniinfer.utils import get_logger
 from miniinfer.utils.profiler_utils import profile_methods
 from miniinfer.scheduler.prefill_adder import PrefillAdder, AddReqResult
 from miniinfer.scheduler.scheduler_batch import (
@@ -40,7 +41,7 @@ from miniinfer.scheduler.scheduler_batch import (
 if TYPE_CHECKING:
   from miniinfer.kvcache.kv_cache_manager import KVCacheManager
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ======================= 常量 =======================
 # new_token_ratio 的初始/最小/最大值

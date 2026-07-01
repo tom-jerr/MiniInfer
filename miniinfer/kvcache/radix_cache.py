@@ -1,7 +1,7 @@
 from datetime import time
 from functools import partial
 import heapq
-import logging
+from miniinfer.utils import get_logger
 
 import torch
 from typing import List, Tuple, Any, Optional
@@ -10,7 +10,7 @@ import hashlib
 
 from .interface import IPrefixCache, ITokenAllocator
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _key_match_page_size1(key0: List[int], key1: List[int]) -> int:
@@ -207,7 +207,7 @@ class RadixCache(IPrefixCache):
 
   def pretty_print(self):
     self._print_helper(self.root, 0)
-    print(f"#tokens: {self.total_size()}")
+    logger.debug(f"#tokens: {self.total_size()}")
 
   def _align_len(self, length: int) -> int:
     """向下取整到 page_size 的倍数"""
@@ -283,11 +283,8 @@ class RadixCache(IPrefixCache):
     stack = [(node, indent)]
     while stack:
       current_node, current_indent = stack.pop()
-      print(
-        " " * current_indent,
-        len(current_node.key),
-        current_node.key[:10],
-        f"r={current_node.lock_ref}",
+      logger.debug(
+        f"{' ' * current_indent} {len(current_node.key)} {current_node.key[:10]} r={current_node.lock_ref}"
       )
       for key, child in current_node.children.items():
         stack.append((child, current_indent + 2))
@@ -315,9 +312,9 @@ if __name__ == "__main__":
   tree.insert([8, 9, 10, 11, 12])
   tree.pretty_print()
 
-  print(tree.match_prefix([1, 2, 3, 13, 14]))
-  print(tree.match_prefix([1, 2, 3]))
-  print(tree.match_prefix([8, 9, 10, 11, 12, 13]))
+  logger.info(tree.match_prefix([1, 2, 3, 13, 14]))
+  logger.info(tree.match_prefix([1, 2, 3]))
+  logger.info(tree.match_prefix([8, 9, 10, 11, 12, 13]))
 
   tree2 = RadixCache(token_allocator=None, page_size=1)
   tree2.insert([1, 2, 3])
@@ -325,6 +322,6 @@ if __name__ == "__main__":
   tree2.insert([1, 2, 4, 5, 6, 7])
   tree2.insert([8, 9, 10, 11, 12])
   # tree2.pretty_print()
-  print(tree2.match_prefix([1, 2, 3, 13, 14]))
-  print(tree2.match_prefix([1, 2, 3]))
-  print(tree2.match_prefix([8, 9, 10, 11, 12, 13]))
+  logger.info(tree2.match_prefix([1, 2, 3, 13, 14]))
+  logger.info(tree2.match_prefix([1, 2, 3]))
+  logger.info(tree2.match_prefix([8, 9, 10, 11, 12, 13]))

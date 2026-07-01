@@ -15,6 +15,12 @@ from .fused_qwen3 import (
   Qwen3Model,
   Qwen3TransformerBlock,
 )
+from .fused_qwen3_moe import (
+  Qwen3MoeDecoderLayer,
+  Qwen3MoeForCausalLM,
+  Qwen3MoeModel,
+  Qwen3MoeSparseMoeBlock,
+)
 
 __all__ = [
   "BaseModelOutput",
@@ -28,4 +34,8 @@ __all__ = [
   "Qwen3MLP",
   "Qwen3Model",
   "Qwen3TransformerBlock",
+  "Qwen3MoeDecoderLayer",
+  "Qwen3MoeForCausalLM",
+  "Qwen3MoeModel",
+  "Qwen3MoeSparseMoeBlock",
 ]

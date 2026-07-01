@@ -19,7 +19,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Callable, Any, Deque
 import torch
-import logging
+from miniinfer.utils import get_logger
 
 from miniinfer.scheduler.scheduler_batch import (
   ScheduledBatch,
@@ -28,7 +28,7 @@ from miniinfer.scheduler.scheduler_batch import (
 )
 from .future_map import FutureMap, FutureIndices
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass

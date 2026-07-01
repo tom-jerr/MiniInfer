@@ -15,7 +15,7 @@ Usage:
 """
 
 import atexit
-import logging
+from miniinfer.utils import get_logger
 import queue
 from dataclasses import dataclass, field, fields
 from time import perf_counter
@@ -40,9 +40,10 @@ from miniinfer.scheduler.scheduler_batch import (
 )
 
 from ..utils.sampling_params import SamplingParams
+from ..utils.crash_logger import log_inference_crash
 from .detokenizer import IncrementalDecoder
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -165,7 +166,7 @@ class LLMEngine:
         for val, tid in zip(top_vals[i].tolist(), top_ids[i].tolist()):
           text = self.tokenizer.decode([int(tid)], skip_special_tokens=False)
           candidates.append((int(tid), val, repr(text)))
-        print("req=%s top%d next_token candidates: %s", req.req_id, k, candidates)
+        logger.debug("req=%s top%d next_token candidates: %s", req.req_id, k, candidates)
 
   # ======== prompt encoding (compat) ========
   def _encode_prompt(self, prompt: str) -> List[int]:
@@ -465,8 +466,14 @@ class LLMEngine:
       self.scheduler.drain_pending_releases()
 
     # 1. 调度获取 batch
-    with stage("stage::LLMEngine.step.schedule"):
-      batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
+    try:
+      with stage("stage::LLMEngine.step.schedule"):
+        batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
+    except Exception as exc:
+      log_inference_crash(
+        exc, scheduler=self.scheduler, model_runner=self.model_runner, stage="schedule"
+      )
+      raise
     if batch is None or len(batch.reqs) == 0:
       # No work this round; make sure any deferred releases are flushed so memory isn't leaked.
       if getattr(self.scheduler, "pending_release_reqs", None):
@@ -474,17 +481,29 @@ class LLMEngine:
       return StepOutput(outputs=[])
 
     # 2. 执行 forward (compute stream)
-    with stage("stage::LLMEngine.step.forward_batch_init"):
-      forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+    forward_batch = None
+    try:
+      with stage("stage::LLMEngine.step.forward_batch_init"):
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
 
-    with stage("stage::LLMEngine.step.forward"):
-      output = self.model_runner.forward(forward_batch)
-      logits = output.logits
-    # if self.debug_logit_topk > 0:
-    # self._debug_print_topk_next_tokens(logits, forward_batch)
-    # 3. 采样
-    with stage("stage::LLMEngine.step.sample"):
-      next_tokens = self.model_runner.sample(logits, forward_batch)
+      with stage("stage::LLMEngine.step.forward"):
+        output = self.model_runner.forward(forward_batch)
+        logits = output.logits
+      # if self.debug_logit_topk > 0:
+      # self._debug_print_topk_next_tokens(logits, forward_batch)
+      # 3. 采样
+      with stage("stage::LLMEngine.step.sample"):
+        next_tokens = self.model_runner.sample(logits, forward_batch)
+    except Exception as exc:
+      log_inference_crash(
+        exc,
+        scheduler=self.scheduler,
+        model_runner=self.model_runner,
+        forward_batch=forward_batch,
+        scheduled_batch=batch,
+        stage="forward/sample",
+      )
+      raise
 
     # 4. 处理结果并增量解码
     with stage("stage::LLMEngine.step.process_result"):
@@ -609,7 +628,14 @@ class LLMEngine:
 
     if not can_use_placeholder and self.overlap_executor.has_pending():
       with stage("stage::LLMEngine.step_overlap.process_conservative"):
-        pending_step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        try:
+          pending_step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        except Exception as exc:
+          log_inference_crash(
+            exc, scheduler=self.scheduler, model_runner=self.model_runner,
+            stage="step_overlap.process_conservative",
+          )
+          raise
 
     # ===================================================================
     # Phase 3: Schedule（在 schedule_stream 上执行 CPU→GPU 数据准备）
@@ -618,21 +644,27 @@ class LLMEngine:
     # forward_stream 会等待 schedule_stream 完成后再启动 GPU 计算。
     # ===================================================================
     schedule_stream = getattr(self.overlap_executor, "schedule_stream", None)
-    if schedule_stream is not None:
-      with torch.cuda.stream(schedule_stream):
+    try:
+      if schedule_stream is not None:
+        with torch.cuda.stream(schedule_stream):
+          if can_use_placeholder:
+            with stage("stage::LLMEngine.step_overlap.schedule_placeholder"):
+              batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=True)
+          else:
+            with stage("stage::LLMEngine.step_overlap.schedule"):
+              batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
+      else:
         if can_use_placeholder:
           with stage("stage::LLMEngine.step_overlap.schedule_placeholder"):
             batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=True)
         else:
           with stage("stage::LLMEngine.step_overlap.schedule"):
             batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
-    else:
-      if can_use_placeholder:
-        with stage("stage::LLMEngine.step_overlap.schedule_placeholder"):
-          batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=True)
-      else:
-        with stage("stage::LLMEngine.step_overlap.schedule"):
-          batch = self.scheduler.schedule(self.model_runner.device, skip_decode_input_ids=False)
+    except Exception as exc:
+      log_inference_crash(
+        exc, scheduler=self.scheduler, model_runner=self.model_runner, stage="step_overlap.schedule"
+      )
+      raise
 
     # ===================================================================
     # Phase 3.5: 检测连续 prefill，决定是否禁用 overlap (SGLang 风格)
@@ -647,7 +679,14 @@ class LLMEngine:
     if disable_overlap_for_batch and self.overlap_executor.has_pending():
       # 连续 prefill 或其他禁用场景：立即处理上一批结果
       with stage("stage::LLMEngine.step_overlap.process_consecutive_prefill"):
-        step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        try:
+          step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        except Exception as exc:
+          log_inference_crash(
+            exc, scheduler=self.scheduler, model_runner=self.model_runner,
+            stage="step_overlap.process_consecutive_prefill",
+          )
+          raise
         if step_out:
           if pending_step_out is None:
             pending_step_out = step_out
@@ -669,21 +708,32 @@ class LLMEngine:
     if batch is not None and len(batch.reqs) > 0:
       # forward_batch_init 也在 schedule_stream 上执行（构建元数据）
       schedule_stream = getattr(self.overlap_executor, "schedule_stream", None)
-      if schedule_stream is not None:
-        with torch.cuda.stream(schedule_stream):
+      try:
+        if schedule_stream is not None:
+          with torch.cuda.stream(schedule_stream):
+            with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
+              current_forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
+        else:
           with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
             current_forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
-      else:
-        with stage("stage::LLMEngine.step_overlap.forward_batch_init"):
-          current_forward_batch = ForwardBatch.init_new(batch, self.model_runner.attn_backend)
 
-      with stage("stage::LLMEngine.step_overlap.run_forward_async"):
-        current_record = self.overlap_executor.run_forward_async(
-          batch,
-          current_forward_batch,
-          self.model_runner,
-          use_placeholder=use_placeholder,
+        with stage("stage::LLMEngine.step_overlap.run_forward_async"):
+          current_record = self.overlap_executor.run_forward_async(
+            batch,
+            current_forward_batch,
+            self.model_runner,
+            use_placeholder=use_placeholder,
+          )
+      except Exception as exc:
+        log_inference_crash(
+          exc,
+          scheduler=self.scheduler,
+          model_runner=self.model_runner,
+          forward_batch=current_forward_batch,
+          scheduled_batch=batch,
+          stage="step_overlap.forward_init/run_forward_async",
         )
+        raise
 
       if not batch.forward_mode.is_decode():
         # Propagate placeholder metadata for the next schedule() call.
@@ -709,7 +759,14 @@ class LLMEngine:
       can_use_placeholder and not disable_overlap_for_batch and self.overlap_executor.has_pending()
     ):
       with stage("stage::LLMEngine.step_overlap.process_overlap"):
-        pending_step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        try:
+          pending_step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        except Exception as exc:
+          log_inference_crash(
+            exc, scheduler=self.scheduler, model_runner=self.model_runner,
+            stage="step_overlap.process_overlap",
+          )
+          raise
 
     # 收集 pending 处理结果
     if pending_step_out is not None:
@@ -740,16 +797,38 @@ class LLMEngine:
               vocab_mask = vocab_mask.to(self.model_runner.device, non_blocking=True)
 
       with stage("stage::LLMEngine.step_overlap.launch_sample"):
-        current_record = self.overlap_executor.run_sample_async(
-          record=current_record,
-          model_runner=self.model_runner,
-          vocab_mask=vocab_mask,
-        )
+        try:
+          current_record = self.overlap_executor.run_sample_async(
+            record=current_record,
+            model_runner=self.model_runner,
+            vocab_mask=vocab_mask,
+          )
+        except Exception as exc:
+          log_inference_crash(
+            exc,
+            scheduler=self.scheduler,
+            model_runner=self.model_runner,
+            forward_batch=current_forward_batch,
+            scheduled_batch=batch,
+            stage="step_overlap.run_sample_async",
+          )
+          raise
 
     # Non-overlap mode: process immediately
     if batch is not None and current_record is not None:
       if not getattr(self.overlap_executor, "enable_overlap", True):
-        step_out = self._process_overlap_result(current_record.batch, current_record.batch_result)
+        try:
+          step_out = self._process_overlap_result(current_record.batch, current_record.batch_result)
+        except Exception as exc:
+          log_inference_crash(
+            exc,
+            scheduler=self.scheduler,
+            model_runner=self.model_runner,
+            forward_batch=current_forward_batch,
+            scheduled_batch=current_record.batch,
+            stage="step_overlap.process_immediate",
+          )
+          raise
         if step_out:
           outputs.extend(step_out.outputs)
           num_prefill += step_out.num_prefill_tokens
@@ -761,7 +840,17 @@ class LLMEngine:
     if (not self.config.enable_overlap or batch is None) and self.overlap_executor.has_pending():
       with stage("stage::LLMEngine.step_overlap.sync_pending"):
         while self.overlap_executor.has_pending():
-          step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+          try:
+            step_out = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+          except Exception as exc:
+            log_inference_crash(
+              exc,
+              scheduler=self.scheduler,
+              model_runner=self.model_runner,
+              scheduled_batch=batch,
+              stage="step_overlap.sync_pending",
+            )
+            raise
           if step_out:
             outputs.extend(step_out.outputs)
             num_prefill += step_out.num_prefill_tokens
@@ -861,7 +950,13 @@ class LLMEngine:
 
     # Flush any remaining pending batches from overlap executor
     while self.overlap_executor.has_pending():
-      step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+      try:
+        step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+      except Exception as exc:
+        log_inference_crash(
+          exc, scheduler=self.scheduler, model_runner=self.model_runner, stage="generate.flush_pending"
+        )
+        raise
       if step_output:
         for output in step_output.outputs:
           if output.request_id not in results:
@@ -1237,7 +1332,13 @@ class LLMEngine:
 
     # Flush any remaining pending batches from overlap executor
     while self.overlap_executor.has_pending():
-      step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+      try:
+        step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+      except Exception as exc:
+        log_inference_crash(
+          exc, scheduler=self.scheduler, model_runner=self.model_runner, stage="stream_generate.flush_pending"
+        )
+        raise
       if step_output:
         for output in step_output.outputs:
           yield output

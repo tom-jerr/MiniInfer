@@ -4,7 +4,7 @@ import triton.language as tl
 import triton
 from typing import Optional, Tuple
 import torch
-import logging
+from miniinfer.utils import get_logger
 
 from .interface import (
   IKVCacheStorage,
@@ -16,7 +16,7 @@ from .memory_pool import MHAKVCacheStorage, PagedTokenAllocator, RequestPool
 from .radix_cache import RadixCache
 from miniinfer.scheduler.scheduler_batch import ScheduledBatch, Req, ForwardMode, ForwardBatch
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class KVCacheManager:

@@ -7,7 +7,6 @@ ModelRunner - 模型推理执行器
 3. 采样生成 token
 """
 
-import logging
 from typing import Any
 
 import torch
@@ -16,10 +15,12 @@ from miniinfer.config.engine.config import EngineConfig
 from miniinfer.config.model.base import PretrainedConfig
 from miniinfer.config.model.qwen2 import Qwen2Config
 from miniinfer.config.model.qwen3 import Qwen3Config
+from miniinfer.config.model.qwen3_moe import Qwen3MoeConfig
 from miniinfer.loader.weight import load_hf_weight
 from miniinfer.models.base import BaseModelOutput
 from miniinfer.models.fused_qwen2 import Qwen2ForCausalLM
 from miniinfer.models.fused_qwen3 import Qwen3ForCausalLM
+from miniinfer.models.fused_qwen3_moe import Qwen3MoeForCausalLM
 from miniinfer.scheduler.scheduler_batch import ForwardBatch
 from miniinfer.layers.sample import Sampler, SamplingBatchInfo
 from miniinfer.layers.attention_backend import (
@@ -27,9 +28,10 @@ from miniinfer.layers.attention_backend import (
   FlashInferBackend,
 )
 from miniinfer.engine.cuda_graph_runner import CudaGraphRunner
+from miniinfer.utils import get_logger
 from miniinfer.utils.profiler_utils import profile_methods
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @profile_methods("ModelRunner")
@@ -57,7 +59,8 @@ class ModelRunner:
     self._attn_backend_type = attn_backend
 
     model_type = getattr(config.hf_config, "model_type", "").lower()
-    if model_type == "qwen2" or ("Qwen2" in config.model and model_type not in ("qwen3",)):
+    architectures = getattr(config.hf_config, "architectures", []) or []
+    if model_type == "qwen2" or ("Qwen2" in config.model and model_type not in ("qwen3", "qwen3_moe")):
       self.model_config: PretrainedConfig = Qwen2Config.from_pretrained(config.model)
       self.model = Qwen2ForCausalLM(self.model_config, device=self.device)
       logger.info("Initialized Qwen2Model")
@@ -65,6 +68,10 @@ class ModelRunner:
       self.model_config: PretrainedConfig = Qwen3Config.from_pretrained(config.model)
       self.model = Qwen3ForCausalLM(self.model_config, device=self.device)
       logger.info("Initialized Qwen3Model")
+    elif model_type == "qwen3_moe" or "Qwen3MoeForCausalLM" in architectures:
+      self.model_config: PretrainedConfig = Qwen3MoeConfig.from_pretrained(config.model)
+      self.model = Qwen3MoeForCausalLM(self.model_config, device=self.device)
+      logger.info("Initialized Qwen3MoeModel")
     else:
       self.model = None
     self.sampler = Sampler()
@@ -88,17 +95,23 @@ class ModelRunner:
     logger.info(f"Model loaded on device {self.device}.")
 
   def init_attn_backend(self, attn_backend: str = None):
-    """初始化 attention backend（需要先提供 kv_cache_mgr）"""
+    """初始化 attention backend（需要先提供 kv_cache_mgr）
+
+    接受多种别名：``flash_attn``/``flash_attention_2``/``flash_attention2``/``fa2``
+    → FlashAttention2；``flashinfer``/``flash_infer`` → FlashInfer。
+    """
     if self.kv_cache_mgr is None:
       raise RuntimeError("Cannot initialize attn_backend without kv_cache_mgr")
 
-    attn_backend = attn_backend or self._attn_backend_type
-    if attn_backend not in ["flash_attn", "flashinfer"]:
-      raise ValueError(f"Unsupported attention backend: {attn_backend}")
-    if attn_backend == "flashinfer":
+    attn_backend = (attn_backend or self._attn_backend_type or "").lower()
+    fa2_aliases = {"flash_attn", "flash_attention_2", "flash_attention2", "fa2", "flash-attn"}
+    fi_aliases = {"flashinfer", "flash_infer", "flash-infer"}
+    if attn_backend in fi_aliases:
       self.attn_backend = FlashInferBackend(self.kv_cache_mgr)
-    else:
+    elif attn_backend in fa2_aliases:
       self.attn_backend = FlashAttention2Backend(self.kv_cache_mgr)
+    else:
+      raise ValueError(f"Unsupported attention backend: {attn_backend}")
     logger.info(f"Using {self.attn_backend.type()} as attention backend.")
 
   def set_kv_cache_mgr(self, kv_cache_mgr: Any):
@@ -278,6 +291,7 @@ class ModelRunner:
         temperature=temps,
         top_ps=top_ps,
         top_ks=top_ks,
+        enable_top_k_top_p=getattr(batch, "sampling_enable_top_k_top_p", False),
         # max_top_k=getattr(batch, "sampling_max_top_k", None),
         vocab_size=logits.size(-1),
       )
@@ -288,23 +302,28 @@ class ModelRunner:
           "ForwardBatch is missing sampling tensors and `all_seqs`; "
           "cannot construct per-sequence SamplingBatchInfo."
         )
+      seqs = batch.all_seqs
       sampling_batch_info = SamplingBatchInfo(
         temperature=torch.tensor(
-          [seq.sampling_params.temperature for seq in batch.all_seqs],
+          [seq.sampling_params.temperature for seq in seqs],
           device=logits.device,
         ),
         top_ps=torch.tensor(
-          [seq.sampling_params.top_p for seq in batch.all_seqs],
+          [seq.sampling_params.top_p for seq in seqs],
           device=logits.device,
         ),
         top_ks=torch.tensor(
-          [seq.sampling_params.top_k for seq in batch.all_seqs],
+          [seq.sampling_params.top_k for seq in seqs],
           device=logits.device,
+        ),
+        enable_top_k_top_p=(
+          any(int(seq.sampling_params.top_k) > 0 for seq in seqs)
+          or any(float(seq.sampling_params.top_p) < 1.0 for seq in seqs)
         ),
         # max_top_k=max(
         #   1,
         #   max(
-        #     (int(seq.sampling_params.top_k) for seq in batch.all_seqs),
+        #     (int(seq.sampling_params.top_k) for seq in seqs),
         #     default=0,
         #   ),
         # ),

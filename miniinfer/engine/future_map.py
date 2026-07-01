@@ -15,9 +15,9 @@ Future Placeholder 机制：
 
 from dataclasses import dataclass
 import torch
-import logging
+from miniinfer.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass

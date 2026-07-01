@@ -2,12 +2,12 @@ import torch
 from typing import Callable
 from .linear import softmax
 import torch.nn as nn
-import logging
+from miniinfer.utils import get_logger
 from dataclasses import dataclass
 from typing import List, Optional
 import flashinfer.sampling as sampling
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _is_sm90_supported(device: torch.device) -> bool:
@@ -27,6 +27,10 @@ class SamplingBatchInfo:
   top_ks: torch.Tensor
   # Grammar-based sampling
   vocab_size: int
+  # CPU-side flag: True if ANY seq requests top-k (>0) or top-p (<1.0) filtering.
+  # When False the sampler takes the fast pure-temperature/greedy path (no GPU sync,
+  # no full-vocab sort). Computed on CPU in ForwardBatch.init_new to avoid sync.
+  enable_top_k_top_p: bool = False
   # Optional CPU-side maximum top-k used to avoid GPU->CPU sync in batched top-k.
   # If not provided, batched_sample may fall back to a sync to compute it.
   # max_top_k: Optional[int] = None
@@ -58,7 +62,7 @@ class Sampler(nn.Module):
         sampling_batch_info: 每个序列的采样信息
 
     Returns:
-        采样的 token ids: [num_seqs]
+        采样的 token ids: [num_seqs] (int64)
     """
     logits = self._preprocess_logits(logits, sampling_batch_info)
     return self._sample_impl(
@@ -66,6 +70,7 @@ class Sampler(nn.Module):
       sampling_batch_info.temperature,
       sampling_batch_info.top_ps,
       sampling_batch_info.top_ks,
+      enable_top_k_top_p=sampling_batch_info.enable_top_k_top_p,
       # max_top_k=sampling_batch_info.max_top_k,
     )
 
@@ -75,26 +80,39 @@ class Sampler(nn.Module):
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     top_k: torch.Tensor,
+    enable_top_k_top_p: bool = False,
     # max_top_k: Optional[int],
   ) -> torch.Tensor:
-    probs = sampling.softmax(
-      logits,
-      temperature,
-      enable_pdl=_is_sm90_supported(logits.device),
-    )
-    if top_k is None and top_p is None:
-      return sampling.sampling_from_probs(probs)
+    """批量采样。
 
-    if top_p is None:
-      assert top_k is not None
-      return sampling.top_k_sampling_from_probs(probs, top_k)
+    关键点：``flashinfer.sampling.softmax(logits, temperature)`` 在
+    ``temperature == 0`` 时返回**均匀分布**而非 one-hot，且
+    ``top_k_top_p_sampling_from_probs`` 在 ``top_k == 0``（表示「禁用 top-k」）
+    时会丢弃所有 token 返回 0。因此：
 
-    if top_k is None:
-      assert top_p is not None
-      return sampling.top_p_sampling_from_probs(probs, top_p)
+    1. 概率用 PyTorch 计算（``logits / temperature.clamp_min(eps)`` 再 softmax），
+       temperature=0 → inf → one-hot，正确表达 greedy。
+    2. 无 top-k/top-p 过滤时走 Gumbel-max（``probs / Exp(1)`` 的 argmax）：
+       greedy（one-hot）返回 argmax，temperature>0 是精确的分类采样。全程向量化、
+       无 GPU->CPU sync、无全词表排序。
+    3. 需要 top-k/top-p 过滤时用 flashinfer，但把 ``top_k<=0`` 的行 clamp 到
+       ``vocab_size``（= 不过滤），避免 flashinfer 的 top_k=0 丢弃 bug。
+    """
+    # 1. 用 PyTorch 算概率（正确处理 temperature=0）。
+    temp = temperature.clamp_min(1e-5).unsqueeze(-1)
+    probs = torch.softmax(logits.float() / temp, dim=-1)
 
-    assert top_k is not None and top_p is not None
-    return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+    V = probs.size(-1)
+    if not enable_top_k_top_p:
+      # 2. 纯 temperature / greedy 路径：Gumbel-max，无 sync、无排序。
+      noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
+      return (probs / noise).argmax(dim=-1).to(torch.int64)
+
+    # 3. top-k / top-p 过滤路径。clamp 禁用的 top_k (<=0) 到 vocab_size。
+    top_k = torch.where(top_k > 0, top_k, torch.full_like(top_k, V))
+    return sampling.top_k_top_p_sampling_from_probs(
+      probs.to(logits.dtype), top_k, top_p
+    ).to(torch.int64)
 
 
 def apply_custom_logits_processor(

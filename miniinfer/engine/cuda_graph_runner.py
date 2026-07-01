@@ -15,7 +15,7 @@ Usage:
 
 from __future__ import annotations
 
-import logging
+from miniinfer.utils import get_logger
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
   from miniinfer.models.base import BaseModelOutput
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass

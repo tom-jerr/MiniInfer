@@ -7,7 +7,10 @@ import torch
 from itertools import count
 from copy import copy
 from miniinfer.layers.attention_backend.base_backend import AttentionBackend
+from miniinfer.utils import get_logger
 from miniinfer.utils.sampling_params import SamplingParams
+
+logger = get_logger(__name__)
 
 
 class ForwardMode(IntEnum):
@@ -217,15 +220,15 @@ class ScheduledBatch:
     )
 
   def debug_metadata(self):
-    print("ScheduledBatch metadata:")
-    print(f"  forward_mode: {self.forward_mode}")
-    print(f"  input_ids: {self.input_ids}")
-    print(f"  output_ids: {self.output_ids}")
-    print(f"  req_pool_indices: {self.req_pool_indices}")
-    print(f"  out_cache_loc: {self.out_cache_loc}")
-    print(f"  seq_lens: {self.seq_lens}")
-    print(f"  prefix_lens: {self.prefix_lens}")
-    print(f"  extend_lens: {self.extend_lens}")
+    logger.debug("ScheduledBatch metadata:")
+    logger.debug(f"forward_mode: {self.forward_mode}")
+    logger.debug(f"input_ids: {self.input_ids}")
+    logger.debug(f"output_ids: {self.output_ids}")
+    logger.debug(f"req_pool_indices: {self.req_pool_indices}")
+    logger.debug(f"out_cache_loc: {self.out_cache_loc}")
+    logger.debug(f"seq_lens: {self.seq_lens}")
+    logger.debug(f"prefix_lens: {self.prefix_lens}")
+    logger.debug(f"extend_lens: {self.extend_lens}")
 
 
 @dataclass
@@ -367,6 +370,13 @@ class ForwardBatch:
       cls._pinned_top_ps[:bs] = torch.as_tensor(top_ps, dtype=torch.float32)
       cls._pinned_top_ks[:bs] = torch.as_tensor(top_ks, dtype=torch.int64)
 
+      # CPU-side flag: 是否任一序列请求了 top-k(>0) 或 top-p(<1.0) 过滤。
+      # 供 Sampler 选择快速 greedy/temperature 路径 vs flashinfer top-k/top-p 路径，
+      # 避免在 GPU 上做 .any() 触发 sync。
+      forward_batch.sampling_enable_top_k_top_p = any(
+        int(k) > 0 for k in top_ks
+      ) or any(float(p) < 1.0 for p in top_ps)
+
       # 异步传输到 GPU（真正的零拷贝，无临时 buffer）
       forward_batch.sampling_temperatures = cls._pinned_temperatures[:bs].to(dev, non_blocking=True)
       forward_batch.sampling_top_ps = cls._pinned_top_ps[:bs].to(dev, non_blocking=True)
@@ -413,16 +423,16 @@ class ForwardBatch:
     return forward_batch
 
   def debug_metadata(self):
-    print("ForwardBatch metadata:")
-    print(f"  forward_mode: {self.forward_mode}")
-    print(f"  attn_backend type: {self.attn_backend.type() if self.attn_backend else None}")
-    print(f"  batch_size: {self.batch_size}")
-    print(f"  input_ids: {self.input_ids}")
-    print(f"  req_pool_indices: {self.req_pool_indices}")
-    print(f"  out_cache_loc: {self.out_cache_loc}")
-    print(f"  seq_lens: {self.seq_lens}")
-    print(f"  extend_seq_lens: {self.extend_seq_lens}")
-    print(f"  extend_prefix_lens: {self.extend_prefix_lens}")
+    logger.debug("ForwardBatch metadata:")
+    logger.debug(f"forward_mode: {self.forward_mode}")
+    logger.debug(f"attn_backend type: {self.attn_backend.type() if self.attn_backend else None}")
+    logger.debug(f"batch_size: {self.batch_size}")
+    logger.debug(f"input_ids: {self.input_ids}")
+    logger.debug(f"req_pool_indices: {self.req_pool_indices}")
+    logger.debug(f"out_cache_loc: {self.out_cache_loc}")
+    logger.debug(f"seq_lens: {self.seq_lens}")
+    logger.debug(f"extend_seq_lens: {self.extend_seq_lens}")
+    logger.debug(f"extend_prefix_lens: {self.extend_prefix_lens}")
 
 
 @dataclass

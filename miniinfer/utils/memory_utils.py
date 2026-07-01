@@ -6,8 +6,9 @@ from typing import Optional
 import torch
 
 from miniinfer.config.engine.config import EngineConfig
+from miniinfer.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def get_available_gpu_memory(
