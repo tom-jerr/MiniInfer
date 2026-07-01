@@ -119,9 +119,17 @@ class LLMEngine:
     self._started = False
 
     if use_multiprocess:
-      raise NotImplementedError(
-        "Multiprocess mode is not implemented yet. Please use use_multiprocess=False."
-      )
+      # 多进程模式：本对象仅作 client 侧壳，推理在三个 worker 进程中完成。
+      # 委托公共 API 给 MultiProcessEngine；__enter__/__exit__ 仍走 self.start/stop。
+      from miniinfer.engine.multi_process_engine import MultiProcessEngine
+
+      self._mp_engine = MultiProcessEngine(model, engine_kwargs=config_kwargs)
+      self.start = self._mp_engine.start
+      self.stop = self._mp_engine.stop
+      self.generate = self._mp_engine.generate
+      self.stream_generate = self._mp_engine.stream_generate
+      atexit.register(self.stop)
+      return
 
     self._init_single_process_mode()
     self._req_by_id: Dict[int, Req] = {}
