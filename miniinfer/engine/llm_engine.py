@@ -644,6 +644,14 @@ class LLMEngine:
     # forward_stream 会等待 schedule_stream 完成后再启动 GPU 计算。
     # ===================================================================
     schedule_stream = getattr(self.overlap_executor, "schedule_stream", None)
+    # When CUDA graph is in use, schedule_stream's GPU prep (H2D copies, position
+    # compute, allocations) for step N+1 must not race with forward_stream's graph
+    # replay for step N. Make schedule_stream wait for the last forward_stream op
+    # (the graph replay) before issuing its own GPU work. This is non-blocking on
+    # the CPU (unlike forward_stream.synchronize()), preserving CPU post-processing
+    # overlap with GPU forward.
+    if schedule_stream is not None and self.model_runner.use_cuda_graph:
+      schedule_stream.wait_stream(self.overlap_executor.forward_stream)
     try:
       if schedule_stream is not None:
         with torch.cuda.stream(schedule_stream):
