@@ -134,7 +134,9 @@ class FutureMap:
     intv = future_indices.interval
     self.token_ids_buf[intv] = next_token_ids
 
-  def resolve_future_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+  def resolve_future_input_ids(
+    self, input_ids: torch.Tensor, all_placeholder: bool = False
+  ) -> torch.Tensor:
     """
     在 forward_stream 上替换 input_ids 中的占位符
 
@@ -144,6 +146,9 @@ class FutureMap:
 
     Args:
         input_ids: 可能包含占位符的 input_ids [batch_size]
+        all_placeholder: 调用方已知全部为占位符（纯 decode batch）时传 True，
+            走快速路径，避免 nonzero + boolean-index + index_put（profiler 显示
+            这组 op 每步占 CPU ~31%）。混合 batch 传 False 走通用路径。
 
     Returns:
         resolved_ids: 替换后的 input_ids（in-place；返回同一个 tensor 引用）
@@ -158,6 +163,13 @@ class FutureMap:
         f"input_ids.device={input_ids.device}, token_ids_buf.device={self.token_ids_buf.device}"
       )
 
+    nbuf = self.token_ids_buf.numel()
+    if all_placeholder:
+      # 快速路径：全部是占位符，直接 gather + copy_，无需 boolean mask。
+      future_indices = (-input_ids).to(torch.int64).clamp_(0, nbuf - 1)
+      input_ids.copy_(self.token_ids_buf[future_indices])
+      return input_ids
+
     # Find placeholder positions (negative ids) and replace only those.
     # NOTE: Do NOT call `.any().item()` here (it would introduce a device sync).
     is_placeholder = input_ids < 0
@@ -167,7 +179,7 @@ class FutureMap:
 
     # placeholder = -future_index (1-based). Convert to indices and clamp to buffer range defensively.
     future_indices = (-placeholder_ids).to(torch.int64)
-    future_indices.clamp_(0, self.token_ids_buf.numel() - 1)
+    future_indices.clamp_(0, nbuf - 1)
 
     # In-place writeback: avoids allocating a full-size output tensor (vs torch.where).
     input_ids[is_placeholder] = self.token_ids_buf[future_indices]

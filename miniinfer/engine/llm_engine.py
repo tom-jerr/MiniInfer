@@ -1078,11 +1078,23 @@ class LLMEngine:
 
     device = batch.output_ids.device
     idx_cpu = torch.as_tensor(idx_in_batch, dtype=torch.int64)
+
+    # 快速路径：running_batch.reqs 与 batch.reqs 完全同序同集（decode 步的常见情况）。
+    # 此时无需 nonzero + masked gather，直接 clone 即可，省掉 2 次 nonzero + 多次
+    # index/empty kernel（profiler 显示这两步 nonzero+index 占 CPU ~31%）。
+    bs = len(running_batch.reqs)
+    if (
+      bs == len(batch.reqs)
+      and all(i == j for i, j in zip(idx_in_batch, range(bs)))
+    ):
+      running_batch.output_ids = batch.output_ids.clone()
+      return
+
     idx_dev = idx_cpu.to(device, non_blocking=True)
     in_batch = idx_dev >= 0
 
     new_output_ids = torch.empty(
-      (len(running_batch.reqs),),
+      (bs,),
       dtype=batch.output_ids.dtype,
       device=device,
     )

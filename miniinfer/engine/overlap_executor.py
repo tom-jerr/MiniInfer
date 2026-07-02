@@ -323,7 +323,12 @@ class OverlapExecutor:
       # 如果 input_ids 包含 placeholder，在 forward 前 resolve
       # 这允许 schedule(N) 与 forward(N-1) 并行
       if use_placeholder and forward_batch.input_ids is not None:
-        forward_batch.input_ids = self.future_map.resolve_future_input_ids(forward_batch.input_ids)
+        # 纯 decode batch 的 input_ids 全是 placeholder，走快速路径省掉
+        # nonzero + boolean-index + index_put。
+        all_ph = batch.forward_mode.is_decode()
+        forward_batch.input_ids = self.future_map.resolve_future_input_ids(
+          forward_batch.input_ids, all_placeholder=all_ph
+        )
 
       # GPU forward pass
       output = model_runner.forward(forward_batch)
