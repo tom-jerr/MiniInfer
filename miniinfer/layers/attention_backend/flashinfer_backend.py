@@ -61,9 +61,13 @@ class FlashInferBackend(AttentionBackend):
     )
 
     self.forward_metadata: FlashInferMetadata = None
-    # 每个 cuda-graph capture batch size 一组静态 buffer（graph 冻结各自引用，
-    # 不能跨 batch size 复用同一个 buffer，否则后捕获的 batch 会覆盖前者）。
+    # 每个 cuda-graph capture batch size 一组静态 buffer + 一个 use_cuda_graph=True
+    # 的 wrapper（FlashInfer graph 模式要求 _fixed_batch_size 固定，故每 size 一个）。
     self._cg_buffers: dict = {}
+    self._cg_wrappers: dict = {}
+    # (num_qo_heads, num_kv_heads, head_dim, dtype)，首次 forward_decode 时缓存，
+    # 供 update_cuda_graph_metadata 调 plan() 用。
+    self._cg_heads = None
 
   def type(self) -> str:
     return "flashinfer"
@@ -143,22 +147,33 @@ class FlashInferBackend(AttentionBackend):
   ) -> None:
     """Initialize metadata for CUDA graph capture.
 
-    静态 buffer 存在 ``self._cg_*`` 上（而非 ``self.forward_metadata``），因为
-    prefill 步的 ``init_forward_metadata`` 会替换 ``forward_metadata``，若存在
-    ``forward_metadata`` 上会被清掉。capture 时把 ``forward_metadata.paged_kv_*``
-    指向这些静态 buffer，graph 冻结引用；replay 前 ``update_cuda_graph_metadata``
-    原地更新这些静态 buffer，graph 即读到新值。
+    用 FlashInfer 的 ``use_cuda_graph=True`` 模式：每个 capture batch size 一个
+    独立 wrapper（``_fixed_batch_size`` 固定），各自带预分配 indptr/indices/
+    last_page_len buffer。graph 冻结对这些 buffer 的引用；replay 前
+    ``update_cuda_graph_metadata`` 调 ``plan()`` 把新元数据 copy 进 buffer 并重建
+    plan，graph 即读到新值。
+
+    静态结构存在 ``self._cg_buffers``/``self._cg_wrappers`` 上（按 batch_size），
+    不放 ``forward_metadata``——prefill 步的 ``init_forward_metadata`` 会替换它。
     """
     max_blocks_per_req = block_table.shape[1]
     max_total_pages = batch_size * max_blocks_per_req
     device = self.device
 
-    # 静态 buffer（CudaGraphRunner.replay 会原地把实际 block_table / cache_seqlens
-    # copy 进 block_table / cache_seqlens 这两个传入的 buffer）。按 batch_size 存，
-    # 每个 capture size 的 graph 冻结各自一组。
     indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     indices = torch.zeros(max_total_pages, dtype=torch.int32, device=device)
     last_page_len = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+    # 每个 batch size 一个 use_cuda_graph=True 的 wrapper。
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+      self.workspace_buffer,
+      kv_layout="NHD",
+      use_cuda_graph=True,
+      paged_kv_indptr_buffer=indptr,
+      paged_kv_indices_buffer=indices,
+      paged_kv_last_page_len_buffer=last_page_len,
+    )
+    self._cg_wrappers[batch_size] = wrapper
     self._cg_buffers[batch_size] = {
       "block_table": block_table,  # [BS, MaxBlocks] page indices
       "cache_seqlens": cache_seqlens,  # [BS]
@@ -167,14 +182,14 @@ class FlashInferBackend(AttentionBackend):
       "paged_kv_last_page_len": last_page_len,
     }
 
-    # forward_metadata 指向本 batch_size 的静态 buffer，供 capture 冻结引用。
+    # forward_metadata 指向本 batch_size 的 buffer，供 forward_decode 在 capture
+    # 时找到 wrapper（forward_decode 用 q.shape[0] 选 wrapper）。
     self.forward_metadata = FlashInferMetadata()
     self.forward_metadata.block_table = block_table
     self.forward_metadata.cache_seqlens = cache_seqlens
     self.forward_metadata.paged_kv_indptr = indptr
     self.forward_metadata.paged_kv_indices = indices
     self.forward_metadata.paged_kv_last_page_len = last_page_len
-    # cu_seqlens_q for decode (0..BS)
     self.forward_metadata.cu_seqlens_q = torch.arange(
       0, batch_size + 1, dtype=torch.int32, device=device
     )
@@ -186,12 +201,14 @@ class FlashInferBackend(AttentionBackend):
   ) -> None:
     """Update metadata before graph replay.
 
-    用对应 batch_size 的静态 buffer（``self._cg_buffers[batch_size]``），从
-    block_table + cache_seqlens 重建 CSR，原地写回 paged_kv_*。graph capture 时
-    冻结的就是该 batch_size 的 buffer，故能读到新值。
+    从 block_table + cache_seqlens 重建 CSR (indptr/indices/last_page_len)，然后
+    调 ``wrapper.plan()``——FlashInfer graph 模式下 ``plan`` 会把这些 copy 进
+    wrapper 的内部 buffer 并重建 plan，graph 冻结的正是这些 buffer，故 replay
+    能读到新值。``plan`` 在 graph 外调用（CPU 规划），合法。
     """
     batch_size = cache_seqlens.shape[0]
     bufs = self._cg_buffers[batch_size]
+    wrapper = self._cg_wrappers[batch_size]
     block_table = bufs["block_table"]
 
     # Convert BlockTable + SeqLens -> CSR (IndPtr, Indices, LastPageLen)
@@ -213,13 +230,29 @@ class FlashInferBackend(AttentionBackend):
     col_indices = torch.arange(max_blocks, device=self.device).expand(batch_size, -1)
     mask = col_indices < num_pages.unsqueeze(1)
     valid_indices = block_table[mask].contiguous()
-
-    count = valid_indices.numel()
+    # tail zero (indptr 已限定范围，非必须，但更稳妥)
     idx_buf = bufs["paged_kv_indices"]
+    count = valid_indices.numel()
     idx_buf[:count].copy_(valid_indices)
-    # 清掉尾部残留（indptr 已限定范围，非必须，但更稳妥）。
     if count < idx_buf.numel():
       idx_buf[count:].zero_()
+
+    # 5. 调 plan()：FlashInfer graph 模式下 plan 把 indptr/indices/last_page_len
+    #    copy 进 wrapper 内部 buffer 并重建 plan（split-K 等）。graph 冻结的是内部
+    #    buffer，故 replay 能读到新值。heads/dim 在 forward_decode 首次调用时缓存。
+    heads = self._cg_heads
+    if heads is not None:
+      num_qo, num_kv, hdim, dt = heads
+      wrapper.plan(
+        bufs["paged_kv_indptr"],
+        idx_buf,
+        bufs["paged_kv_last_page_len"],
+        num_qo_heads=num_qo,
+        num_kv_heads=num_kv,
+        head_dim=hdim,
+        page_size=self.page_size,
+        q_data_type=dt,
+      )
 
   def forward_decode(
     self,
@@ -247,19 +280,27 @@ class FlashInferBackend(AttentionBackend):
       )
 
     metadata = self.forward_metadata
+    bs = q.shape[0]
 
-    # Prepare Batch plan
-    # We need to call begin_forward.
-    # Note: In a multi-layer loop, calling this repeatedly with same args is overhead but
-    # necessary if we don't assume layers are identical (though they usually are).
-    # We can try to optimize by checking if plan is already valid?
-    # wrappers check internally? 0.5.x wrappers are stateful.
-    # We will call it every time to be safe.
+    # 选 wrapper：cuda-graph 路径用对应 batch_size 的 use_cuda_graph=True wrapper；
+    # eager 路径用 self.decode_wrapper。graph 开启时 _cg_wrappers 非空。
+    cg_wrapper = self._cg_wrappers.get(bs) if self._cg_wrappers else None
+    wrapper = cg_wrapper if cg_wrapper is not None else self.decode_wrapper
 
-    # During CUDA graph capture, we must not call begin_forward as it may involve CPU ops
-    # We rely on the warmup run (executed just before capture) to have set up the wrapper state correctly
+    # 缓存 heads/dim/dtype，供 update_cuda_graph_metadata 调 plan() 用。
+    if self._cg_heads is None:
+      self._cg_heads = (
+        layer.tp_q_head_num,
+        layer.tp_k_head_num,
+        layer.head_dim,
+        q.dtype,
+      )
+
+    # graph 模式：replay 前 update_cuda_graph_metadata 已调 plan()；warmup（未捕获）
+    # 时这里调一次 plan 建立 wrapper 状态；capture 时跳过（plan 含 CPU 规划）。
+    # eager 模式：每步调 plan（decode_wrapper 非 graph，stateful）。
     if not torch.cuda.is_current_stream_capturing():
-      self.decode_wrapper.begin_forward(
+      wrapper.plan(
         metadata.paged_kv_indptr,
         metadata.paged_kv_indices,
         metadata.paged_kv_last_page_len,
@@ -267,7 +308,7 @@ class FlashInferBackend(AttentionBackend):
         num_kv_heads=layer.tp_k_head_num,
         head_dim=layer.head_dim,
         page_size=self.page_size,
-        data_type=q.dtype,  # assuming q dtype matches kv
+        q_data_type=q.dtype,
       )
 
     # Get KV buffers
@@ -279,7 +320,7 @@ class FlashInferBackend(AttentionBackend):
     key_cache = key_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
     value_cache = value_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim)
 
-    output = self.decode_wrapper.forward(
+    output = wrapper.forward(
       q.view(-1, layer.tp_q_head_num, layer.head_dim),
       (key_cache, value_cache),
       sm_scale=layer.scaling,

@@ -19,7 +19,11 @@ class EngineConfig:
 
   model_path: str
   dtype: torch.dtype = torch.float16
-  attention_backend: str = "flash_attention_2"
+  # 默认 flashinfer：无 flash_attn 的 page_size-必须被 256 整除约束，且是 vLLM-grade
+  # paged decode attention。如需切回 FA2，传 attention_backend="flash_attn"。
+  # 注：benchmark 显示二者在 page_size=256 下吞吐接近（见
+  # docs/性能优化_FA2对比_与长序列attention瓶颈.md §8）。
+  attention_backend: str = "flashinfer"
 
   # ============ 显存管理配置 ============
   # GPU 显存利用率，用于自动计算 KV cache 容量

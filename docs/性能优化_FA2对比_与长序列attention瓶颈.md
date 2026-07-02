@@ -142,6 +142,42 @@ FlashInfer backend 从「任意规模都崩」修到「eager + 小 batch graph �
 
 ---
 
+## 8. FlashInfer `use_cuda_graph=True` 集成（完成）+ 默认 backend 切换
+
+### 集成
+按 §7 的「下一步」用 FlashInfer 的 `use_cuda_graph=True` 模式正确集成 cuda graph：
+
+- **每个 capture batch size 一个独立 wrapper**：FlashInfer graph 模式要求 `_fixed_batch_size` 固定（`plan` 内 `if batch_size != self._fixed_batch_size: raise`），而 MiniInfer 的 `CudaGraphRunner` 按 power-of-2 捕获多张图。故 `init_cuda_graph_metadata` 为每个 batch size 创建一个 `use_cuda_graph=True` 的 wrapper + 预分配 `paged_kv_indptr/indices/last_page_len` buffer，存 `self._cg_wrappers[bs]` / `self._cg_buffers[bs]`。
+- **`plan()` 每 replay 调一次**：FlashInfer graph 模式下 `plan(indptr, indices, last_page_len, ...)` 把元数据 **copy 进 wrapper 内部 buffer** 并重建 split-K plan；graph 冻结的正是这些内部 buffer。故 `update_cuda_graph_metadata` 重建 CSR 后调 `plan()`（在 graph 外，CPU 规划合法），replay 即读到新值。heads/dim/dtype 在 `forward_decode` 首次调用缓存（`self._cg_heads`）供 `plan` 用。
+- **`forward_decode` 选 wrapper**：graph 路径按 `q.shape[0]` 选 `self._cg_wrappers[bs]`；eager 路径用 `self.decode_wrapper`（非 graph）。capture 时 `is_current_stream_capturing()` 为 True 跳过 `plan`（含 CPU 规划），依赖 warmup 建立 wrapper 状态。
+
+### 效果
+FlashInfer + cuda graph 从「32+ seqs 崩 / overlap 出 garbage」修到**全规模正确**：
+- 256×1024：**6984 tok/s**（无崩溃，greedy 与 HF 逐 token 一致）。
+- 32 seqs decode-heavy：0 bad reqs（此前 garbage/crash）。
+
+### Benchmark 结论：FlashInfer ≈ FA2，**未闭合长序列 gap**
+
+| 负载 | FA2 (page=256) | FlashInfer (page=256) | vLLM (FA2) |
+|---|---|---|---|
+| 256×256 | 10552 | 10010 | 10050 |
+| 256×1024 | 6838 | 6984 | 10050 |
+
+- FlashInfer 与 FA2 在 `page_size=256` 下吞吐**基本持平**（FlashInfer 略慢 ~5%，其 decode kernel 450ms vs FA2 splitkv 426ms @128seq）。
+- **更小 page_size 反而更慢**：FlashInfer page_size=64 → 7980、=16 → 8106（@256×256），因为页数增多 → page indirection 开销增大。FlashInfer 虽无 256 约束，但小 page 在此配置下不划算。
+- **长序列 gap 不是 attention-bound**：FA2 与 FlashInfer 在 256×1024 都 ~6800–7000，vLLM 10050。两个 backend 都随 seq len 掉速，vLLM 不掉。说明 gap 在 MiniInfer 整体 pipeline（KV 布局/调度/overlap 效率等），**非换 attention backend 能解决**。
+
+### 默认 backend 切换
+`EngineConfig.attention_backend` 默认改为 `"flashinfer"`（无 page_size-256 约束、vLLM-grade、全规模正确）。`model_runner` 的别名归一化仍支持 `flash_attn`/`flash_attention_2` 等切回 FA2。benchmark 显示二者吞吐接近，故默认 FlashInfer 不损失明显性能，且获得布局灵活性。
+
+### 仍未闭合的长序列 gap（后续方向）
+256×1024 下 MiniInfer ~6900 vs vLLM 10050。既然非 attention backend，候选方向：
+- KV cache 布局/分配效率（vLLM block_size=16 + 更优分配器）。
+- overlap 在长序列下的 CPU 隐藏效率（`plan()` 每 replay 调用、scheduler 开销）。
+- decode GEMM（lm_head `[B,1024]@[1024,151936]`）在长序列下的占比与融合。
+
+---
+
 ## 6. 产物
 
 - `benchmark/bench_miniinfer.py`：对齐 vLLM 方法论的吞吐 bench，支持 `--page-size` A/B。
