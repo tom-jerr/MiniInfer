@@ -211,6 +211,36 @@ decode 已追平，剩余差距在**均衡负载的 prefill 阶段**（256 seq �
 
 ---
 
+## 10. KV 利用率 + prefill 效率排查
+
+### KV 利用率：默认 0.6 → 0.9
+- 256×1024 **均衡**：0.6 → 0.9 吞吐不变（8425 → 8449，此负载在 0.6 下无 retraction）。
+- 256×1024 **decode-heavy**（input 100, output 1024）：0.6 下 **KV 耗尽崩溃**（`Failed to allocate KV cache`），0.9 下正常运行 → **17369 tok/s**（> vLLM 16333，反超）。
+- 结论：0.6 在 256 seq × 长序列下容量不足。默认改为 **0.9**（与 vLLM 一致），容量足够、吞吐不损、长序列 decode-heavy 反超 vLLM。
+
+### prefill 效率：MiniInfer 65% of vLLM（剩余 gap 主因）
+prefill-heavy 对比（128 seq × input 1024 × output 8，input tokens/time）：
+- MiniInfer：**87939 in_tok/s**
+- vLLM（FA2, block256, max_num_batched_tokens=8192）：**134443 in_tok/s**
+- MiniInfer 是 vLLM 的 65%（1.53× 慢）。
+
+profile prefill-heavy：
+- `forward_extend` 占 CUDA 94%，其中 **GEMM（aten::mm + ampere gemm）占 ~64%**，attention（flash_attn_varlen）占 ~10%。
+- prefill 是 **GEMM-bound**，且 MiniInfer prefill 走 **eager**（无 cuda graph），`cudaLaunchKernel` 8572 次（11 batch × ~779 launches/batch）。vLLM 用 **piecewise cuda graph（cuDAG）** 捕获 prefill，消除 launch 开销 + 更好 CPU/GPU overlap。
+
+### 结论
+- **decode 已追平/反超 vLLM**（decode-heavy 256×1024：17369 > 16333）。
+- **剩余 256×1024 均衡负载的 83%→100% gap 全在 prefill**（prefill 65% of vLLM）。根因：prefill eager 无 cuda graph + GEMM/launch 开销。闭合需 **piecewise cuda graph for prefill**（vLLM cuDAG 做法）——这是一块独立的较大工程。
+
+### 当前状态（FA2, Qwen3-0.6B, 默认 0.9）
+| 负载 | MiniInfer | vLLM (FA2,block256) | 相对 |
+|---|---|---|---|
+| 256×1024 decode-heavy | 17369 | 16333 | **106%** ✅反超 |
+| 128×1024 decode-heavy | 14053 | 14359 | 98% |
+| 256×1024 均衡 | 8420 | 10136 | 83%（prefill gap） |
+
+---
+
 ## 6. 产物
 
 - `benchmark/bench_miniinfer.py`：对齐 vLLM 方法论的吞吐 bench，支持 `--page-size` A/B。

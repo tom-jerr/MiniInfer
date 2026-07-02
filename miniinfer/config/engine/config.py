@@ -27,8 +27,9 @@ class EngineConfig:
 
   # ============ 显存管理配置 ============
   # GPU 显存利用率，用于自动计算 KV cache 容量
-  # 默认 0.6 更保守，避免 OOM。生产环境可根据实际情况调整到 0.7-0.8
-  gpu_memory_utilization: float = 0.6
+  # 默认 0.9（与 vLLM 一致）：长序列/大 batch 下避免 KV 不足导致 retraction 或
+  # 分配失败。0.6 在 256 seq × 长序列下会 KV 耗尽。如需保守可下调。
+  gpu_memory_utilization: float = 0.9
   # 每页 token 数
   page_size: int = 256
 
