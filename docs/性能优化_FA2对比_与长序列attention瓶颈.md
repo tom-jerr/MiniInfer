@@ -178,6 +178,39 @@ FlashInfer + cuda graph 从「32+ seqs 崩 / overlap 出 garbage」修到**全�
 
 ---
 
+## 9. 真正的根因：每步 O(seq_len) detokenization（已修复，gap 基本闭合）
+
+### 公平对比确认 gap 仍在
+vLLM 强制 FA2 + `block_size=256`（与 MiniInfer 完全同 backend 同 page）：**10136 tok/s**。
+MiniInfer FA2 page_size=256：6838 tok/s。**同配置下仍 1.48× 慢** → 排除 page_size / attention backend。
+
+### 定位
+profile decode-heavy（128 seq × output 512）：
+- `stage::LLMEngine._process_step_result` = **4.58s CPU（63%！）**，8.91ms/step。
+- 根因：`IncrementalDecoder._incremental_decode` 每步调 `_decode_with_cache(state.token_ids)` 对**全量 token** decode（O(seq_len)）；其 LRU 缓存以全量 tuple 为 key，每步 tuple 增长 → 永不命中 → 每步都全量 decode。长序列下 128 seq × decode(512 tokens) × num_steps 占满 CPU。
+- vLLM/SGLang 把 detokenization 放到**独立进程**（off critical path）；MiniInfer 单进程在关键路径上。
+
+### 修复
+单进程下 BPE 边界让「真增量 O(1) decode」复杂，故采用更直接的方案：**非流式路径跳过每步 detok**，仅用 token 判 eos/finished，结束时对每个请求 decode 一次全量 token（O(Σ seq_len)，每请求一次，远小于 O(seq_len × num_steps)）。
+- 新增 `LLMEngine._streaming` flag：`generate`（非流式）跳过每步 detok；`stream_generate` 仍每步 detok（流式必需 delta_text）。
+- `_process_step_result`：非流式时 `decoded = [("", is_eos_from_token, "")]`，不调 `decode_batch`。
+- `generate` 结束后对每个请求 `detokenizer._decode(output_token_ids)` 一次。
+
+### 效果（FA2，Qwen3-0.6B）
+| 负载 | 修复前 | 修复后 | vLLM (FA2, block256) |
+|---|---|---|---|
+| 256×1024（均衡） | 6838 | **8425** | 10136 |
+| 128×input100×out1024（decode-heavy） | 7233 | **14053** | 14359 |
+
+- decode-heavy 从 vLLM 的 50% → **98%**（基本追平）。
+- 256×1024 从 vLLM 的 67% → **83%**。
+- 正确性：greedy `generate` 文本与 HF 一致；`stream_generate` 增量 delta 正常（"three, four, five, six,"）。
+
+### 剩余 gap（256×1024 的 83%→100%）
+decode 已追平，剩余差距在**均衡负载的 prefill 阶段**（256 seq × avg 562 input = 144k prefill tokens）与 256 seq 下的 KV 压力（MiniInfer 默认 `gpu_memory_utilization=0.6` vs vLLM 0.9 → 更小 KV、更多 retraction）。后续可查 prefill 效率与 KV 利用率。
+
+---
+
 ## 6. 产物
 
 - `benchmark/bench_miniinfer.py`：对齐 vLLM 方法论的吞吐 bench，支持 `--page-size` A/B。

@@ -117,6 +117,10 @@ class LLMEngine:
 
     self.use_multiprocess = use_multiprocess
     self._started = False
+    # 流式模式下每步 detokenize 产出 delta_text；非流式（generate）跳过每步 detok
+    # （避免 O(seq_len) × num_steps 的开销，长序列下占 CPU ~60%），改为结束时对
+    # 每个请求 decode 一次全量 token。
+    self._streaming = False
 
     if use_multiprocess:
       # 多进程模式：本对象仅作 client 侧壳，推理在三个 worker 进程中完成。
@@ -990,6 +994,14 @@ class LLMEngine:
     if pbar:
       pbar.close()
 
+    # 非流式：每步跳过了 detok，这里对每个请求的 output_token_ids 一次性 decode。
+    # 总开销 O(sum seq_len)（每请求一次），远小于每步 decode 的 O(seq_len × num_steps)。
+    if not self._streaming:
+      for rid in request_ids:
+        entry = results[rid]
+        toks = entry["token_ids"]
+        entry["text"] = self.detokenizer._decode(list(toks)) if toks else ""
+
     # 按请求 ID 顺序返回结果
     return [results[rid] for rid in sorted(request_ids)]
 
@@ -1192,12 +1204,19 @@ class LLMEngine:
       active_token_ids.append(token_id)
 
     if active_reqs:
-      decoded = self.detokenizer.decode_batch(
-        req_ids=active_req_ids,
-        token_ids=active_token_ids,
-        eos_token_id=self.scheduler.eos_token_id,
-        return_full_text=True,
-      )
+      eos_id = self.scheduler.eos_token_id
+      if self._streaming:
+        # 流式：每步 detokenize 产出 delta_text（O(seq_len)/step，流式必需）。
+        decoded = self.detokenizer.decode_batch(
+          req_ids=active_req_ids,
+          token_ids=active_token_ids,
+          eos_token_id=eos_id,
+          return_full_text=True,
+        )
+      else:
+        # 非流式：跳过每步 detok（仅用 token 判 eos/finished），结束时一次性 decode。
+        # decoded = [(delta_text, is_eos, full_text)]
+        decoded = [("", (tid == eos_id), "") for tid in active_token_ids]
       for req, token_id, (delta_text, is_eos, full_text) in zip(
         active_reqs, active_token_ids, decoded
       ):
@@ -1351,22 +1370,27 @@ class LLMEngine:
     # 添加所有初始请求（batch tokenize）
     self.add_requests(prompts, sampling_params)
 
-    # 持续推理直到所有请求完成
-    while self.scheduler.has_unfinished():
-      step_output = self.step_overlap()
+    # 流式：每步 detokenize 产出 delta_text
+    self._streaming = True
+    try:
+      # 持续推理直到所有请求完成
+      while self.scheduler.has_unfinished():
+        step_output = self.step_overlap()
 
-      for output in step_output.outputs:
-        yield output
-
-    # Flush any remaining pending batches from overlap executor
-    while self.overlap_executor.has_pending():
-      try:
-        step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
-      except Exception as exc:
-        log_inference_crash(
-          exc, scheduler=self.scheduler, model_runner=self.model_runner, stage="stream_generate.flush_pending"
-        )
-        raise
-      if step_output:
         for output in step_output.outputs:
           yield output
+
+      # Flush any remaining pending batches from overlap executor
+      while self.overlap_executor.has_pending():
+        try:
+          step_output = self.overlap_executor.process_pending_batch(self._process_overlap_result)
+        except Exception as exc:
+          log_inference_crash(
+            exc, scheduler=self.scheduler, model_runner=self.model_runner, stage="stream_generate.flush_pending"
+          )
+          raise
+        if step_output:
+          for output in step_output.outputs:
+            yield output
+    finally:
+      self._streaming = False
