@@ -376,6 +376,12 @@ class ForwardBatch:
       forward_batch.sampling_enable_top_k_top_p = any(
         int(k) > 0 for k in top_ks
       ) or any(float(p) < 1.0 for p in top_ps)
+      # CPU-side temperature 路由 flag：
+      #   all_greedy = 全部 temperature<=0；all_non_greedy = 全部 temperature>0。
+      #   让 Sampler 对纯 greedy 走 argmax、对纯 temp>0 走 flashinfer 融合采样，
+      #   仅 mixed 才回落到 float32 Gumbel-max（约 10× 慢）。
+      forward_batch.sampling_all_greedy = all(float(t) <= 0 for t in temps)
+      forward_batch.sampling_all_non_greedy = all(float(t) > 0 for t in temps)
 
       # 异步传输到 GPU（真正的零拷贝，无临时 buffer）
       forward_batch.sampling_temperatures = cls._pinned_temperatures[:bs].to(dev, non_blocking=True)

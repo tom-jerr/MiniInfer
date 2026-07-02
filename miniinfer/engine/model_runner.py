@@ -292,6 +292,8 @@ class ModelRunner:
         top_ps=top_ps,
         top_ks=top_ks,
         enable_top_k_top_p=getattr(batch, "sampling_enable_top_k_top_p", False),
+        all_greedy=getattr(batch, "sampling_all_greedy", False),
+        all_non_greedy=getattr(batch, "sampling_all_non_greedy", True),
         # max_top_k=getattr(batch, "sampling_max_top_k", None),
         vocab_size=logits.size(-1),
       )
@@ -303,11 +305,9 @@ class ModelRunner:
           "cannot construct per-sequence SamplingBatchInfo."
         )
       seqs = batch.all_seqs
+      _temps = [seq.sampling_params.temperature for seq in seqs]
       sampling_batch_info = SamplingBatchInfo(
-        temperature=torch.tensor(
-          [seq.sampling_params.temperature for seq in seqs],
-          device=logits.device,
-        ),
+        temperature=torch.tensor(_temps, device=logits.device),
         top_ps=torch.tensor(
           [seq.sampling_params.top_p for seq in seqs],
           device=logits.device,
@@ -320,6 +320,8 @@ class ModelRunner:
           any(int(seq.sampling_params.top_k) > 0 for seq in seqs)
           or any(float(seq.sampling_params.top_p) < 1.0 for seq in seqs)
         ),
+        all_greedy=all(float(t) <= 0 for t in _temps),
+        all_non_greedy=all(float(t) > 0 for t in _temps),
         # max_top_k=max(
         #   1,
         #   max(

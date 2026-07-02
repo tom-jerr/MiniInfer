@@ -31,6 +31,12 @@ class SamplingBatchInfo:
   # When False the sampler takes the fast pure-temperature/greedy path (no GPU sync,
   # no full-vocab sort). Computed on CPU in ForwardBatch.init_new to avoid sync.
   enable_top_k_top_p: bool = False
+  # CPU-side flags for temperature routing (computed in ForwardBatch.init_new):
+  #   all_greedy      — every seq has temperature <= 0  -> 直接 argmax（最快）
+  #   all_non_greedy  — every seq has temperature > 0   -> flashinfer 融合采样（快）
+  #   否则（mixed）走 Gumbel-max 兼容路径（慢，但正确处理混合）。
+  all_greedy: bool = False
+  all_non_greedy: bool = False
   # Optional CPU-side maximum top-k used to avoid GPU->CPU sync in batched top-k.
   # If not provided, batched_sample may fall back to a sync to compute it.
   # max_top_k: Optional[int] = None
@@ -71,6 +77,8 @@ class Sampler(nn.Module):
       sampling_batch_info.top_ps,
       sampling_batch_info.top_ks,
       enable_top_k_top_p=sampling_batch_info.enable_top_k_top_p,
+      all_greedy=sampling_batch_info.all_greedy,
+      all_non_greedy=sampling_batch_info.all_non_greedy,
       # max_top_k=sampling_batch_info.max_top_k,
     )
 
@@ -81,38 +89,43 @@ class Sampler(nn.Module):
     top_p: torch.Tensor,
     top_k: torch.Tensor,
     enable_top_k_top_p: bool = False,
+    all_greedy: bool = False,
+    all_non_greedy: bool = False,
     # max_top_k: Optional[int],
   ) -> torch.Tensor:
     """批量采样。
 
-    关键点：``flashinfer.sampling.softmax(logits, temperature)`` 在
-    ``temperature == 0`` 时返回**均匀分布**而非 one-hot，且
-    ``top_k_top_p_sampling_from_probs`` 在 ``top_k == 0``（表示「禁用 top-k」）
-    时会丢弃所有 token 返回 0。因此：
+    路由（CPU 端 flag 决定，避免 GPU sync）：
+      - all_greedy（全部 temperature<=0）→ torch.argmax，最快，无需 softmax。
+      - all_non_greedy（全部 temperature>0）→ flashinfer 融合 softmax+sampling，
+        比 float32 Gumbel-max 快 ~10×（避免 [B,V] logits 上转 float32 的 4× 显存与算力）。
+        有 top-k/top-p 过滤时用 flashinfer.top_k_top_p（禁用的 top_k clamp 到 V）。
+      - mixed（greedy 与 temp>0 混合）→ Gumbel-max 兼容路径（float32，慢但正确）。
 
-    1. 概率用 PyTorch 计算（``logits / temperature.clamp_min(eps)`` 再 softmax），
-       temperature=0 → inf → one-hot，正确表达 greedy。
-    2. 无 top-k/top-p 过滤时走 Gumbel-max（``probs / Exp(1)`` 的 argmax）：
-       greedy（one-hot）返回 argmax，temperature>0 是精确的分类采样。全程向量化、
-       无 GPU->CPU sync、无全词表排序。
-    3. 需要 top-k/top-p 过滤时用 flashinfer，但把 ``top_k<=0`` 的行 clamp 到
-       ``vocab_size``（= 不过滤），避免 flashinfer 的 top_k=0 丢弃 bug。
+    历史 bug：flashinfer.sampling.softmax(temperature=0) 返回均匀分布而非 one-hot，
+    故 greedy 必须走 argmax；temp>0 下 flashinfer softmax 正常，用融合路径。
     """
-    # 1. 用 PyTorch 算概率（正确处理 temperature=0）。
+    V = logits.size(-1)
+
+    # 1. 全 greedy：直接 argmax。
+    if all_greedy:
+      return torch.argmax(logits, dim=-1).to(torch.int64)
+
+    # 2. 全非 greedy（temp>0）：flashinfer 融合路径。
+    if all_non_greedy:
+      probs = sampling.softmax(
+        logits, temperature, enable_pdl=_is_sm90_supported(logits.device)
+      )
+      if enable_top_k_top_p:
+        top_k = torch.where(top_k > 0, top_k, torch.full_like(top_k, V))
+        return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p).to(torch.int64)
+      return sampling.sampling_from_probs(probs).to(torch.int64)
+
+    # 3. mixed：Gumbel-max 兼容路径（float32，正确处理 greedy one-hot 与 temp>0）。
     temp = temperature.clamp_min(1e-5).unsqueeze(-1)
     probs = torch.softmax(logits.float() / temp, dim=-1)
-
-    V = probs.size(-1)
-    if not enable_top_k_top_p:
-      # 2. 纯 temperature / greedy 路径：Gumbel-max，无 sync、无排序。
-      noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
-      return (probs / noise).argmax(dim=-1).to(torch.int64)
-
-    # 3. top-k / top-p 过滤路径。clamp 禁用的 top_k (<=0) 到 vocab_size。
-    top_k = torch.where(top_k > 0, top_k, torch.full_like(top_k, V))
-    return sampling.top_k_top_p_sampling_from_probs(
-      probs.to(logits.dtype), top_k, top_p
-    ).to(torch.int64)
+    noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
+    return (probs / noise).argmax(dim=-1).to(torch.int64)
 
 
 def apply_custom_logits_processor(
