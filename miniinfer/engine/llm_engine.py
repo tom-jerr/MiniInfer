@@ -931,6 +931,15 @@ class LLMEngine:
 
     pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True) if use_tqdm else None
 
+    # 清理上一轮残留的 running_batch（overlap 延迟处理可能留下 stale finished reqs，
+    # 导致 _append_running_batch_metadata 的 torch.cat device 不匹配）。
+    self.scheduler._filter_batch(self.scheduler.running_batch)
+    if not self.scheduler.running_batch.reqs:
+      self.scheduler.running_batch.req_pool_indices = None
+      self.scheduler.running_batch.seq_lens = None
+      self.scheduler.running_batch.seq_lens_cpu = None
+      self.scheduler.running_batch.output_ids = None
+
     # 添加所有请求（batch tokenize）
     self.add_requests(prompts, sampling_params)
 
@@ -1142,8 +1151,8 @@ class LLMEngine:
       # In overlap mode, next_token_ids is already on CPU (cloned from pinned buffer).
       # Check device to avoid unnecessary .cpu() call which could disguise issues.
       if next_token_ids.device.type != "cpu":
-        logger.error(
-          "Expected next_token_ids to be on CPU, but got device: %s", next_token_ids.device
+        logger.debug(
+          "next_token_ids on %s (non-overlap path does .cpu() here)", next_token_ids.device
         )
         next_token_ids = next_token_ids.cpu()
       next_token_ids = next_token_ids.tolist()

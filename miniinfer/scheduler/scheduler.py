@@ -658,10 +658,13 @@ class Scheduler:
     seq_len = batch.seq_lens[idx_device]
     seq_len_cpu = batch.seq_lens_cpu[idx_cpu] if batch.seq_lens_cpu is not None else None
 
-    if self.running_batch.req_pool_indices is None:
+    if self.running_batch.req_pool_indices is None or len(self.running_batch.reqs) == 0:
+      # running_batch 为空（新初始化或上一轮 reqs 已全部完成但 overlap 延迟处理
+      # 可能留下 stale req_pool_indices），直接赋值，不做 cat（避免 device 不匹配）。
       self.running_batch.req_pool_indices = req_pool_idx
       self.running_batch.seq_lens = seq_len
       self.running_batch.seq_lens_cpu = seq_len_cpu
+      self.running_batch.output_ids = None
     else:
       self.running_batch.req_pool_indices = torch.cat(
         [self.running_batch.req_pool_indices, req_pool_idx]
