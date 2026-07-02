@@ -20,6 +20,7 @@ def main():
   p.add_argument("--max-output-len", type=int, default=1024)
   p.add_argument("--max-num-seqs", type=int, default=256)
   p.add_argument("--max-model-len", type=int, default=4096)
+  p.add_argument("--page-size", type=int, default=256)
   p.add_argument("--eager", action="store_true")
   args = p.parse_args()
 
@@ -39,6 +40,7 @@ def main():
     max_num_seqs=args.max_num_seqs,
     max_model_len=args.max_model_len,
     attention_backend="flash_attn",
+    page_size=args.page_size,
     enforce_eager=args.eager,
   )
   engine.start()
