@@ -352,6 +352,44 @@ class FlashAttention2Backend(AttentionBackend):
 
     self.forward_metadata = metadata
 
+  # ------------------------------------------------------------------
+  # extend (prefill) cuda-graph metadata —— 供 PiecewiseCudaGraphRunner 使用
+  # ------------------------------------------------------------------
+  def init_extend_cuda_graph_metadata(self, forward_batch, bucket: int, max_nseq: int) -> None:
+    """为 prefill cuda graph capture 建立静态 metadata。
+
+    forward_extend（无 prefix 命中）只读 cu_seqlens_q/k + max_seq_len_q/k。
+    每个 bucket 分配静态 cu_seqlens buffer（按 bucket 存，避免后捕获覆盖前者），
+    max_seq_len 冻结为 bucket（实际 ≤ bucket，作为 kernel 上界）。
+    """
+    device = self.kv_cache_mgr.device
+    if not hasattr(self, "_eg_buffers"):
+      self._eg_buffers = {}
+    cu_q = torch.zeros(max_nseq + 2, dtype=torch.int32, device=device)
+    cu_k = torch.zeros(max_nseq + 2, dtype=torch.int32, device=device)
+    self._eg_buffers[bucket] = {"cu_q": cu_q, "cu_k": cu_k}
+    self.forward_metadata = FlashAttention2Metadata()
+    self.forward_metadata.cu_seqlens_q = cu_q
+    self.forward_metadata.cu_seqlens_k = cu_k
+    self.forward_metadata.max_seq_len_q = bucket
+    self.forward_metadata.max_seq_len_k = bucket
+
+  def update_extend_cuda_graph_metadata(self, forward_batch, bucket: int, static_buffers) -> None:
+    """replay 前更新本 bucket 的静态 cu_seqlens（actual seqs + 1 dummy padding seq）。
+
+    无 prefix 命中时 cu_seqlens_q = cu_seqlens_k = pad(cumsum(seq_lens))。
+    加一个长度 (bucket - actual) 的 dummy padding seq 凑到 bucket，其 KV 写 page 0。
+    """
+    bufs = self._eg_buffers[bucket]
+    nseq = forward_batch.batch_size
+    actual = forward_batch.input_ids.shape[0]
+    ext = list(forward_batch.extend_seq_lens_cpu) + [bucket - actual]
+    ext_t = torch.tensor(ext, dtype=torch.int32, device=self.kv_cache_mgr.device)
+    cu = torch.zeros(nseq + 2, dtype=torch.int32, device=self.kv_cache_mgr.device)
+    torch.cumsum(ext_t, dim=0, dtype=torch.int32, out=cu[1:])
+    bufs["cu_q"][: nseq + 2].copy_(cu)
+    bufs["cu_k"][: nseq + 2].copy_(cu)  # 无 prefix: K = extend tokens
+
   def forward_extend(
     self,
     q: torch.Tensor,

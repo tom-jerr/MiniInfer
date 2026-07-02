@@ -79,6 +79,7 @@ class ModelRunner:
 
     # CUDA Graph support
     self.cuda_graph_runner: CudaGraphRunner = None
+    self.piecewise_graph_runner = None  # prefill piecewise cuda graph（MoE-extensible）
     self.use_cuda_graph: bool = not config.enforce_eager
 
     # 如果提供了 kv_cache_mgr，立即初始化 attn_backend
@@ -142,6 +143,17 @@ class ModelRunner:
     forward_batch: ForwardBatch,
     return_hidden_states: bool = False,
   ) -> BaseModelOutput:
+    # Piecewise cuda graph for prefill（无 prefix 命中时）。命中 prefix 或超 bucket
+    # 回落 eager。return_hidden_states 时也回落 eager（graph 未捕获 hidden）。
+    if (
+      self.use_cuda_graph
+      and self.piecewise_graph_runner is not None
+      and self.piecewise_graph_runner.is_available()
+      and not return_hidden_states
+    ):
+      out = self.piecewise_graph_runner.replay(forward_batch)
+      if out is not None:
+        return out
     self.attn_backend.init_forward_metadata(forward_batch)
     return self.model.forward(
       forward_batch.input_ids,
@@ -222,6 +234,36 @@ class ModelRunner:
     # Warmup: capture all graphs
     self.cuda_graph_runner.warmup()
     logger.info("CUDA Graph warmup complete")
+
+    # Piecewise cuda graph for prefill（MoE-extensible）。v1：capture 仍有 capture-
+    # unsafe op + last-token 索引待修，默认关闭（回落 eager prefill，无回归）。
+    # 设 MINIINFER_PREFILL_CG=1 开启尝试（失败自动回落 eager）。
+    import os as _os
+    if (
+      self.use_cuda_graph
+      and _os.getenv("MINIINFER_PREFILL_CG", "0") == "1"
+      and hasattr(self.attn_backend, "init_extend_cuda_graph_metadata")
+    ):
+      try:
+        from miniinfer.engine.piecewise_cuda_graph import (
+          PiecewiseCudaGraphRunner,
+          Segment,
+        )
+        self.piecewise_graph_runner = PiecewiseCudaGraphRunner(self)
+        # v1 dense：单 captured segment。MoE 扩展点：后续注册 eager segment
+        # （router/grouped-GEMM），框架按顺序串联。
+        self.piecewise_graph_runner.register_segment(
+          Segment(name="dense_forward", eager=False, run=lambda ctx: None)
+        )
+        self.piecewise_graph_runner.capture()
+        if not self.piecewise_graph_runner.is_available():
+          logger.info("Piecewise cuda graph: no bucket captured; prefill uses eager")
+          self.piecewise_graph_runner = None
+      except Exception as e:
+        logger.warning(f"Piecewise cuda graph init failed ({e!r}); prefill uses eager")
+        self.piecewise_graph_runner = None
+    else:
+      self.piecewise_graph_runner = None
 
   def sample(
     self,
